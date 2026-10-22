@@ -1,0 +1,3482 @@
+#include "CrashDump.h"
+#include "GuideFiles.h"
+#include "NarrowText.h"
+#include "NeuralWorker.h"
+#include "NeuralWorkerProtocol.h"
+#include "ResidentWorkerLoop.h"
+#include "TestSupport.h"
+#include "TestEnvironment.h"
+#include "GpuTestGate.h"
+
+#include <windows.h>
+#include <tlhelp32.h>
+
+#include <algorithm>
+#include <ranges>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <iostream>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
+#include <stop_token>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+using namespace std::chrono_literals;
+
+namespace {
+
+using namespace neural_worker_protocol;
+
+constexpr uint16_t kProtocolVersion = kVersion;
+constexpr uint32_t kProtocolMagic = kMagic;
+
+std::filesystem::path CurrentExecutable()
+{
+    std::wstring value(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, value.data(), static_cast<DWORD>(value.size()));
+    CHECK(length > 0 && length < value.size());
+    value.resize(length);
+    return value;
+}
+
+NeuralRenderRequest TestRequest(std::wstring_view sourceName)
+{
+    NeuralRenderRequest request;
+    request.sourcePath = std::filesystem::path(sourceName);
+    request.stagingVideoPath = L"staging-output.mkv";
+    request.width = 1920;
+    request.height = 1080;
+    request.fps = 60.0;
+    request.durationSeconds = 1.0;
+    return request;
+}
+
+// 60 fps: the duration the helper derives from the request's frame rate.
+constexpr int64_t kTestFrameDuration100ns = 166'667;
+
+std::wstring SegmentFileName(uint64_t index)
+{
+    std::wstring digits = std::to_wstring(index);
+    if (digits.size() < 5) digits.insert(0, 5 - digits.size(), L'0');
+    return L"neural-" + digits + L".mkv";
+}
+
+NeuralRenderSegment TestSegment(uint64_t index, uint64_t frames)
+{
+    NeuralRenderSegment segment;
+    segment.index = index;
+    segment.firstFrameNumber = index * frames;
+    segment.firstTimestamp100ns = static_cast<int64_t>(index * frames) * kTestFrameDuration100ns;
+    segment.frameCount = frames;
+    segment.end100ns = segment.firstTimestamp100ns + static_cast<int64_t>(frames) * kTestFrameDuration100ns;
+    segment.fileName = SegmentFileName(index);
+    return segment;
+}
+
+// A name one character past the cap, which EncodeSegment would truncate.
+std::vector<std::byte> OversizedSegmentPayload(const NeuralRenderSegment& segment)
+{
+    const std::wstring name(kMaximumSegmentNameBytes / sizeof(wchar_t) + 1, L'n');
+    WireSegment wire{};
+    wire.index = segment.index;
+    wire.firstFrameNumber = segment.firstFrameNumber;
+    wire.firstTimestamp100ns = segment.firstTimestamp100ns;
+    wire.frameCount = segment.frameCount;
+    wire.frameDuration100ns = kTestFrameDuration100ns;
+    wire.nameBytes = static_cast<uint32_t>(name.size() * sizeof(wchar_t));
+    std::vector<std::byte> payload(sizeof(wire) + wire.nameBytes);
+    std::memcpy(payload.data(), &wire, sizeof(wire));
+    std::memcpy(payload.data() + sizeof(wire), name.data(), wire.nameBytes);
+    return payload;
+}
+
+template <class T>
+std::span<const std::byte> AsBytes(const T& value)
+{
+    return std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), sizeof(value));
+}
+
+void AppendMessage(std::vector<std::byte>& stream, uint16_t version, WireKind kind,
+                   std::span<const std::byte> payload)
+{
+    const WireHeader header{kProtocolMagic, version, static_cast<uint16_t>(kind),
+                            static_cast<uint32_t>(payload.size())};
+    const auto* first = reinterpret_cast<const std::byte*>(&header);
+    stream.insert(stream.end(), first, first + sizeof(header));
+    stream.insert(stream.end(), payload.begin(), payload.end());
+}
+
+void AppendMessage(std::vector<std::byte>& stream, WireKind kind, std::span<const std::byte> payload)
+{
+    AppendMessage(stream, kProtocolVersion, kind, payload);
+}
+
+// How many stamped progress messages latency-source.mkv writes.
+constexpr uint64_t kLatencyMessages = 20;
+
+NeuralRenderResult ValidFakeResult(uint64_t jobId)
+{
+    NeuralRenderResult result;
+    result.ok = true;
+    result.encoder = EncoderKind::H264Software;
+    result.feature18ArmedBeforeCapture = true;
+    result.evidence = {true, true, true, true, false, 75};
+    result.frameCount = 48;
+    result.duration100ns = 8'000'000;
+    result.nativeEvaluations = 48;
+    result.verifiedNeuralFrames = 48;
+    result.jobId = jobId;
+    return result;
+}
+
+// The five phases only a helper can see, with the orders of magnitude the
+// handoff's cold-start table records so a transposed field is obvious.
+NeuralColdStartTimeline FakeHelperTimeline()
+{
+    NeuralColdStartTimeline timeline;
+    timeline.Record(NeuralColdStartPhase::HelperStart, 712000us);
+    timeline.Record(NeuralColdStartPhase::RuntimeReady, 94000us);
+    timeline.Record(NeuralColdStartPhase::NeuralInit, 1511000us);
+    timeline.Record(NeuralColdStartPhase::FeatureArm, 631000us);
+    timeline.Record(NeuralColdStartPhase::FirstOutput, 1780000us);
+    return timeline;
+}
+
+// --- Failure injection for a helper that must die mid-job -------------------
+//
+// A relaunched helper is a brand-new process handed the identical job, so
+// "fail the first attempt and complete the second" cannot be written into the
+// job: the two attempts share nothing but the machine. This file is that one
+// shared thing. One helper runs at a time - the launcher starts the
+// replacement only after the previous process is gone - so appending a byte
+// and reading the size back is a race-free attempt counter.
+//
+// Which failure is injected is selected by the job's source file name, the way
+// every other case in RunFakeWorker is selected, so the hook needs no build
+// flag and no second code path in the shipped launcher.
+//
+// The name carries the pid of the test run, which every helper inherits from
+// it through DLSSVIDEOPLAYER_TEST_RUN: with one fixed name, two concurrent runs
+// of this suite (another worktree, a CI shard) reset and counted each other's
+// attempts.
+constexpr wchar_t kTestRunVariable[] = L"DLSSVIDEOPLAYER_TEST_RUN";
+
+std::filesystem::path FailureInjectionCounterPath(std::wstring_view token)
+{
+    std::error_code error;
+    const std::filesystem::path directory = std::filesystem::temp_directory_path(error);
+    wchar_t run[16]{};
+    const DWORD length = GetEnvironmentVariableW(kTestRunVariable, run, static_cast<DWORD>(std::size(run)));
+    const std::wstring owner = length > 0 && length < std::size(run)
+        ? std::wstring(run, length) : std::to_wstring(GetCurrentProcessId());
+    return (error ? std::filesystem::path(L".") : directory) /
+           (L"dlss5-neural-worker-" + owner + L"-" + std::wstring(token) + L".attempts");
+}
+
+uint64_t RecordFailureInjectionAttempt(std::wstring_view token)
+{
+    const std::filesystem::path path = FailureInjectionCounterPath(token);
+    {
+        std::ofstream counter(path, std::ios::binary | std::ios::app);
+        counter.put('.');
+    }
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    return error ? 0 : static_cast<uint64_t>(size);
+}
+
+void ResetFailureInjection(std::wstring_view token)
+{
+    std::error_code error;
+    std::filesystem::remove(FailureInjectionCounterPath(token), error);
+}
+
+// Dies the way a helper dies: no unwinding, no result, a non-zero exit code.
+[[noreturn]] void KillThisHelper()
+{
+    TerminateProcess(GetCurrentProcess(), 0xC0000005u & 0xFF);
+    // TerminateProcess does not return for the calling process, but the
+    // compiler cannot know that.
+    ExitProcess(0xC0000005u & 0xFF);
+}
+
+// A fake resident helper: the production command channel and the production
+// loop, with a runner that answers a job instead of rendering one. Everything
+// the parent's recovery depends on is real - the framing, the Hello/Ready
+// exchange, the idle grace, and a process that dies with a job in its hands -
+// and only the render is not, which is what lets the launcher's relaunch-once
+// path be exercised on a machine with no GPU.
+struct FakeResidentRunner {
+    HANDLE metadata{};
+    resident_helper::IdleVramPolicy policy{resident_helper::kDefaultIdleVramPolicy};
+    // Set by a job that asks for its process to throw once it has gone idle.
+    bool throwWhenIdle{};
+
+    // Invented figures, chosen so a transposed sample or a policy that never
+    // crossed the launch line shows up. What this exercises is the transport
+    // and the attribution of the two samples; the runtime's actual memory
+    // behaviour is a property of the GPU and cannot be asserted without one.
+    static constexpr uint64_t kParkedMiB = 1408;
+    static constexpr uint64_t kFreedMiB = 406;
+
+    bool Write(WireKind kind, const void* payload, uint32_t bytes)
+    {
+        return WriteMessage(metadata, kind, payload, bytes);
+    }
+
+    bool Ready() { return Write(WireKind::Ready, nullptr, 0); }
+
+    bool Refuse(std::wstring_view detail)
+    {
+        NeuralRenderResult refused;
+        refused.failure = NeuralRenderFailure::Protocol;
+        refused.detail = std::wstring(detail);
+        const auto bytes = EncodeResult(refused);
+        return Write(WireKind::Result, bytes.data(), static_cast<uint32_t>(bytes.size()));
+    }
+
+    // The free arm hands the workset back, so it reports an unarmed feature
+    // and a smaller footprint; the keep arm reports what it is still holding.
+    void Idle()
+    {
+        if (throwWhenIdle) throw std::runtime_error("fake helper threw while idle");
+        const bool frees = policy == resident_helper::IdleVramPolicy::FreeFeature;
+        const WireMemory wire = EncodeMemory(
+            MemorySample{MemoryStage::Idle, policy, !frees, frees ? kFreedMiB : kParkedMiB});
+        Write(WireKind::Memory, &wire, sizeof(wire));
+    }
+
+    resident_worker::JobOutcome Job(std::span<const std::wstring> argv, std::stop_token)
+    {
+        std::vector<std::wstring_view> values(argv.begin(), argv.end());
+        const auto parsed = neural_worker_detail::ParseWorkerArguments(values);
+        if (!parsed || parsed->preflight || parsed->command) {
+            return Refuse(L"The fake helper rejected the job's argument vector.")
+                ? resident_worker::JobOutcome::Refused : resident_worker::JobOutcome::WriteFailed;
+        }
+        const std::wstring source = parsed->request.sourcePath.wstring();
+        if (source == L"resident-crash-always-source.mkv" ||
+            (source == L"resident-crash-once-source.mkv" &&
+             RecordFailureInjectionAttempt(L"crash-once") == 1)) {
+            KillThisHelper();
+        }
+        // An exception out of the job, which the real helper's session catches
+        // on its way out (NeuralWorkerMain); RunFakeResidentWorker does the same.
+        if (source == L"resident-threw-once-source.mkv" && RecordFailureInjectionAttempt(L"threw-once") == 1)
+            throw std::runtime_error("fake helper threw mid-job");
+        if (source == L"resident-threw-when-idle-source.mkv") throwWhenIdle = true;
+        if (source == L"resident-progress-then-slow-source.mkv") {
+            // Progress first, then a second of work before the result, so a
+            // parent that stops reading after the progress leaves this job
+            // still running - and its Result still to come.
+            NeuralRenderProgress progress;
+            progress.phase = NeuralRenderPhase::NeuralRendering;
+            progress.completedFrames = 1;
+            progress.totalFrames = 60;
+            const WireProgress wire = EncodeProgress(progress);
+            if (!Write(WireKind::Progress, &wire, sizeof(wire))) return resident_worker::JobOutcome::WriteFailed;
+            std::this_thread::sleep_for(1s);
+        }
+        if (source == L"resident-preflight-answer-source.mkv") {
+            // A well-formed preflight receipt where the job's result belongs:
+            // the answer to a question this job never asked.
+            const auto bytes = EncodePreflight(PreflightPayload{true, "{\"ok\":true,\"gpu\":\"fake\"}"});
+            return Write(WireKind::Preflight, bytes.data(), static_cast<uint32_t>(bytes.size()))
+                ? resident_worker::JobOutcome::Completed : resident_worker::JobOutcome::WriteFailed;
+        }
+        const WireMemory parked =
+            EncodeMemory(MemorySample{MemoryStage::PostJob, policy, true, kParkedMiB});
+        if (!Write(WireKind::Memory, &parked, sizeof(parked)))
+            return resident_worker::JobOutcome::WriteFailed;
+        const auto bytes = EncodeResult(ValidFakeResult(parsed->request.jobId));
+        if (!Write(WireKind::Result, bytes.data(), static_cast<uint32_t>(bytes.size())))
+            return resident_worker::JobOutcome::WriteFailed;
+        // A finished job after which the helper retires, as the real one does
+        // when its session log has outgrown the evidence read.
+        if (source == L"resident-retire-source.mkv") return resident_worker::JobOutcome::Invalidated;
+        return resident_worker::JobOutcome::Completed;
+    }
+};
+
+int RunFakeResidentWorker(const neural_worker_detail::WorkerArguments& arguments)
+{
+    FakeResidentRunner runner{arguments.metadata, arguments.idleVramPolicy};
+    resident_worker::CommandChannel channel(arguments.command, arguments.parentProcess);
+    // 150 ms of grace instead of the shipped five seconds: the boundary under
+    // test is "a job, then quiet", not how long quiet has to last.
+    resident_worker::ResidentExit reason{};
+    try {
+        reason = resident_worker::RunResidentLoop(channel, runner, 10s, 150ms);
+    } catch (const std::exception&) {
+        // What the real helper does with a session thread that threw: no
+        // Result, and the exit code its parent treats as a crash. It is still
+        // alive for a moment first, as the real one is while its device tears
+        // down, so a job sent then is written and never read.
+        std::this_thread::sleep_for(600ms);
+        return static_cast<int>(kWorkerThrewExitCode);
+    }
+    // The real helper tears its device down after deciding to retire, alive
+    // and with its command pipe still open; a job sent in that window is
+    // written and never read. Long enough here that the next job lands in it.
+    if (reason == resident_worker::ResidentExit::JobInvalidated) std::this_thread::sleep_for(600ms);
+    return static_cast<int>(resident_worker::ResidentExitCode(reason));
+}
+
+int RunFakeWorker(int argc, wchar_t** argv)
+{
+    std::vector<std::wstring_view> values;
+    for (int index = 0; index < argc; ++index) values.emplace_back(argv[index]);
+    const auto parsed = neural_worker_detail::ParseWorkerArguments(values);
+    if (!parsed) return 9;
+    const HANDLE handle = parsed->metadata;
+    // Resident mode is the command handle's presence, exactly as it is for the
+    // real helper: jobs arrive as command frames rather than on argv.
+    if (parsed->Resident()) return RunFakeResidentWorker(*parsed);
+    if (parsed->preflight) {
+        // The parent picks the receipt shape: a refusal carrying a diagnosis,
+        // a refusal without one, or the normal success.
+        std::array<wchar_t, 16> mode{};
+        const DWORD length = GetEnvironmentVariableW(L"DLSSVIDEOPLAYER_FAKE_PREFLIGHT", mode.data(),
+                                                     static_cast<DWORD>(mode.size()));
+        const std::wstring_view shape(mode.data(), length < mode.size() ? length : 0);
+        PreflightPayload payload;
+        if (shape == L"refused") {
+            payload.json = "{\"schema\":2,\"ok\":false,\"feature18\":{\"carrierCreateResult\":\"0x00000001\","
+                           "\"createResult\":\"0xbad00002\"},\"diagnosis\":{\"cause\":\"driverBelowFloor\","
+                           "\"detail\":\"NVIDIA driver 566.14 is below the 610.47 minimum for neural rendering. "
+                           "Update to 616.64 or newer, then try again.\"}}";
+        } else if (shape == L"bare") {
+            payload.json = "{\"schema\":2,\"ok\":false}";
+        } else if (shape == L"result") {
+            // A render's result where the receipt belongs.
+            const auto bytes = EncodeResult(ValidFakeResult(0));
+            return WriteMessage(handle, WireKind::Result, bytes.data(), static_cast<uint32_t>(bytes.size())) ? 0 : 15;
+        } else {
+            payload.ok = !parsed->configurationRestarted;
+            payload.json = parsed->configurationRestarted ? "{\"ok\":false,\"restarted\":true}" : "{\"ok\":true,\"gpu\":\"fake\"}";
+        }
+        const auto bytes = EncodePreflight(payload);
+        return WriteMessage(handle, WireKind::Preflight, bytes.data(), static_cast<uint32_t>(bytes.size())) ? 0 : 15;
+    }
+    const std::wstring source = parsed->request.sourcePath.wstring();
+    if (source == L"configure-once-source.mkv" && !parsed->configurationRestarted) return 75;
+    if (source == L"configure-always-source.mkv") return 75;
+    if (source == L"hang-source.mkv") {
+        std::this_thread::sleep_for(20s);
+        return 0;
+    }
+    if (source == L"malformed-then-hang-source.mkv") {
+        // Garbage, then stays alive. The pump gives up on the stream while
+        // the process is still running, which is the state that used to be
+        // reported as "exited with code 259".
+        const WireHeader wrong{kProtocolMagic + 1, kProtocolVersion,
+            static_cast<uint16_t>(WireKind::Result), 8};
+        WriteAll(handle, &wrong, sizeof(wrong));
+        std::this_thread::sleep_for(20s);
+        return 0;
+    }
+    if (source == L"flood-source.mkv") {
+        // Writes progress as fast as the pipe will take it, for far longer
+        // than the test's patience. The parent's drain must still hand control
+        // back so its stop token is checked.
+        NeuralRenderProgress progress;
+        progress.phase = NeuralRenderPhase::NeuralRendering;
+        progress.totalFrames = 1000000;
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        for (uint64_t frame = 0; std::chrono::steady_clock::now() < deadline; ++frame) {
+            progress.completedFrames = frame;
+            const WireProgress wire = EncodeProgress(progress);
+            if (!WriteMessage(handle, WireKind::Progress, &wire, sizeof(wire))) break;
+        }
+        return 0;
+    }
+    if (source == L"latency-source.mkv") {
+        // Messages spaced wider than any poll interval, each stamped with the
+        // moment it was written, so the parent can measure how long each one
+        // sat in the pipe. steady_clock is QueryPerformanceCounter, one clock
+        // for every process on the machine.
+        NeuralRenderProgress progress;
+        progress.phase = NeuralRenderPhase::NeuralRendering;
+        progress.totalFrames = kLatencyMessages;
+        for (uint64_t index = 0; index < kLatencyMessages; ++index) {
+            std::this_thread::sleep_for(25ms);
+            progress.completedFrames = index;
+            progress.bytes = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            const WireProgress wire = EncodeProgress(progress);
+            if (!WriteMessage(handle, WireKind::Progress, &wire, sizeof(wire))) return 13;
+        }
+        const auto bytes = EncodeResult(ValidFakeResult(parsed->request.jobId));
+        return WriteMessage(handle, WireKind::Result, bytes.data(), static_cast<uint32_t>(bytes.size())) ? 0 : 14;
+    }
+    if (source == L"truncated-source.mkv") {
+        const WireHeader truncated{kProtocolMagic, kProtocolVersion,
+            static_cast<uint16_t>(WireKind::Result), sizeof(WireResult)};
+        return WriteAll(handle, &truncated, sizeof(truncated)) ? 0 : 12;
+    }
+    if (source == L"relaunch-staging-source.mkv") {
+        // Dies under the first launch's staging name and succeeds under any
+        // other, reporting the name it was given.
+        const std::wstring staging = parsed->request.stagingVideoPath.filename().wstring();
+        if (staging == L"staging-output.mkv") return 0xC0000005u & 0xFF;
+        NeuralRenderResult named;
+        named.ok = true;
+        named.encoder = EncoderKind::H264Software;
+        named.feature18ArmedBeforeCapture = true;
+        named.evidence = {true, true, true, true, false, 75};
+        named.frameCount = 60;
+        named.duration100ns = 10'000'000;
+        named.nativeEvaluations = 60;
+        named.verifiedNeuralFrames = 60;
+        named.jobId = parsed->request.jobId;
+        named.timing = {60, 1.5, 2.5, 4.0, 0.7, 0.3, 2048};
+        named.detail = staging;
+        const auto bytes = EncodeResult(named);
+        return WriteMessage(handle, WireKind::Result, bytes.data(), static_cast<uint32_t>(bytes.size())) ? 0 : 14;
+    }
+    if (source == L"crash-source.mkv") {
+        // Report progress, then die without a result: the parent must treat
+        // this as a crash and relaunch from zero at most once.
+        NeuralRenderProgress progress;
+        progress.phase = NeuralRenderPhase::NeuralRendering;
+        progress.completedFrames = 3;
+        progress.totalFrames = 60;
+        const WireProgress wire = EncodeProgress(progress);
+        WriteMessage(handle, WireKind::Progress, &wire, sizeof(wire));
+        return 0xC0000005u & 0xFF;
+    }
+    if (source == L"device-removed-source.mkv") {
+        NeuralRenderResult failed;
+        failed.failure = NeuralRenderFailure::DeviceRemoved;
+        failed.jobId = parsed->request.jobId;
+        failed.detail = L"fake device removal";
+        const auto bytes = EncodeResult(failed);
+        return WriteMessage(handle, WireKind::Result, bytes.data(), static_cast<uint32_t>(bytes.size())) ? 0 : 14;
+    }
+    if (source == L"preflight-answer-source.mkv") {
+        const auto bytes = EncodePreflight(PreflightPayload{true, "{\"ok\":true,\"gpu\":\"fake\"}"});
+        return WriteMessage(handle, WireKind::Preflight, bytes.data(), static_cast<uint32_t>(bytes.size())) ? 0 : 14;
+    }
+    if (source == L"threw-once-source.mkv" && RecordFailureInjectionAttempt(L"threw-once") == 1) {
+        // What the real helper writes when its job thread throws mid-render.
+        const auto bytes = EncodeResult(neural_worker_detail::WorkerThrewResult(parsed->request.jobId));
+        return WriteMessage(handle, WireKind::Result, bytes.data(), static_cast<uint32_t>(bytes.size())) ? 0 : 14;
+    }
+    if (source == L"result-then-exit-nonzero-source.mkv" || source == L"result-then-linger-source.mkv") {
+        // A valid result, and then either a failure only the exit code tells -
+        // the real helper's own `WriteResult(...) ? 0 : 3`, or a crash in
+        // teardown - or a teardown that never finishes.
+        const auto bytes = EncodeResult(ValidFakeResult(parsed->request.jobId));
+        if (!WriteMessage(handle, WireKind::Result, bytes.data(), static_cast<uint32_t>(bytes.size()))) return 14;
+        if (source == L"result-then-exit-nonzero-source.mkv") return 3;
+        std::this_thread::sleep_for(20s);
+        return 0;
+    }
+    if (source == L"progress-then-hang-source.mkv") {
+        NeuralRenderProgress progress;
+        progress.phase = NeuralRenderPhase::NeuralRendering;
+        progress.completedFrames = 1;
+        progress.totalFrames = 60;
+        const WireProgress wire = EncodeProgress(progress);
+        WriteMessage(handle, WireKind::Progress, &wire, sizeof(wire));
+        std::this_thread::sleep_for(20s);
+        return 0;
+    }
+    if (source == L"wrong-job-source.mkv") {
+        NeuralRenderResult failed;
+        failed.failure = NeuralRenderFailure::Source;
+        failed.jobId = parsed->request.jobId + 1;
+        const auto bytes = EncodeResult(failed);
+        return WriteMessage(handle, WireKind::Result, bytes.data(), static_cast<uint32_t>(bytes.size())) ? 0 : 14;
+    }
+
+    NeuralRenderProgress progress;
+    progress.phase = NeuralRenderPhase::NeuralRendering;
+    progress.completedFrames = 17;
+    progress.totalFrames = 60;
+    progress.bytes = 4096;
+    progress.elapsed = 125ms;
+    progress.estimatedRemaining = 200ms;
+    const WireProgress wireProgress = EncodeProgress(progress);
+    if (!WriteMessage(handle, WireKind::Progress, &wireProgress, sizeof(wireProgress))) return 13;
+    if (source == L"segment-source.mkv") {
+        // Two finalized files announced while the job is still running.
+        for (uint64_t index = 0; index < 2; ++index) {
+            const auto payload = EncodeSegment(TestSegment(index, 24), kTestFrameDuration100ns);
+            if (!WriteMessage(handle, WireKind::Segment, payload.data(),
+                              static_cast<uint32_t>(payload.size()))) return 16;
+        }
+    }
+    if (source == L"timeline-source.mkv") {
+        // Non-terminal and ahead of the result, the way the real helper sends it.
+        const WireTimeline wire = EncodeTimeline(FakeHelperTimeline());
+        if (!WriteMessage(handle, WireKind::Timeline, &wire, sizeof(wire))) return 17;
+    }
+    NeuralRenderResult result;
+    result.ok = true;
+    result.encoder = EncoderKind::H264Software;
+    result.feature18ArmedBeforeCapture = true;
+    result.evidence = {true, true, true, true, false, 75};
+    result.frameCount = 60;
+    result.duration100ns = 10'000'000;
+    result.nativeEvaluations = 60;
+    result.verifiedNeuralFrames = 60;
+    result.jobId = parsed->request.jobId;
+    result.historyResets = 2;
+    result.frameRetries = 1;
+    result.sceneCuts = {.acceptedStrong = 3, .acceptedWeak = 5, .suppressed = 7};
+    result.firstTimestamp100ns = parsed->request.range.start100ns;
+    result.timing = {60, 1.5, 2.5, 4.0, 0.7, 0.3, 2048};
+    result.detail = L"validated fake helper result";
+    if (source == L"echo-request-source.mkv") {
+        // Encode the parsed request in the detail so the round trip is provable.
+        const std::string guides = CanonicalGuideControls(parsed->request.guides);
+        result.detail = L"guides=" + std::wstring(guides.begin(), guides.end()) +
+                        L" preroll=" + std::to_wstring(parsed->request.prerollFrames) +
+                        L" retry=" + std::to_wstring(parsed->request.frameRetryLimit) +
+                        L" segments=" + std::to_wstring(parsed->request.segmentFrames) +
+                        L" range=" + std::to_wstring(parsed->request.range.start100ns) + L"-" +
+                        std::to_wstring(parsed->request.range.end100ns) +
+                        L" pause=" + (parsed->request.pauseEvent ? L"1" : L"0");
+    }
+    const auto bytes = EncodeResult(result);
+    if (!WriteMessage(handle, WireKind::Result, bytes.data(), static_cast<uint32_t>(bytes.size()))) return 14;
+    return 0;
+}
+
+bool ParseUnsigned32(std::wstring_view text, uint32_t& value)
+{
+    if (text.empty()) return false;
+    uint64_t parsed = 0;
+    for (const wchar_t character : text) {
+        if (character < L'0' || character > L'9') return false;
+        parsed = parsed * 10 + static_cast<uint64_t>(character - L'0');
+        if (parsed > UINT32_MAX) return false;
+    }
+    value = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+bool ParsePositiveDouble(std::wstring_view text, double& value)
+{
+    if (text.empty() || text.size() >= 128) return false;
+    std::wstring copy(text);
+    wchar_t* end = nullptr;
+    value = std::wcstod(copy.c_str(), &end);
+    return end == copy.c_str() + copy.size() && std::isfinite(value) && value > 0.0;
+}
+
+// The preflight probe against the real helper, the real add-on and this GPU.
+//
+// It existed as a hand-run mode for a long time before it was a ctest, and the
+// gap is what let a runtime bump ship: every automated neural test renders long
+// enough to pass RenoDX 6.x's injection warm-up, so nothing exercised the one
+// code path that stops after two frames. The player calls this before its first
+// render and latches the answer, so a probe that fails here turns neural
+// rendering off for the whole session.
+int RunRealPreflight(int argc, wchar_t** argv)
+{
+    if (const int skip = gpu_test_gate::SkipWithoutGpu()) return skip;
+    if (argc != 3) {
+        std::wcerr << L"Usage: NeuralWorkerTests --real-preflight <workerexe>\n";
+        return EXIT_FAILURE;
+    }
+    const NeuralPreflightResult result = RunNeuralPreflight(argv[2]);
+    std::wcout << L"ok=" << result.ok << L" cancelled=" << result.cancelled << L" detail=" << result.detail << L'\n';
+    std::cout << result.json << '\n';
+    return result.ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int RunRealWorker(int argc, wchar_t** argv)
+{
+    if (argc != 9 && argc != 12 && argc != 13) {
+        std::wcerr << L"Usage: NeuralWorkerTests --real-worker <workerexe> <sourcevideo> <outputvideo> <width> <height> <fps> <seconds> [rangeStartSec rangeEndSec mv=1,depth=1 [segmentFrames]]\n";
+        return EXIT_FAILURE;
+    }
+    NeuralRenderRequest request;
+    request.sourcePath = argv[3];
+    request.stagingVideoPath = argv[4];
+    request.jobId = static_cast<uint64_t>(GetTickCount64());
+    if (!ParseUnsigned32(argv[5], request.width) || !ParseUnsigned32(argv[6], request.height) ||
+        !request.width || !request.height || !ParsePositiveDouble(argv[7], request.fps) ||
+        !ParsePositiveDouble(argv[8], request.durationSeconds)) {
+        std::wcerr << L"Invalid --real-worker dimensions, FPS, or duration.\n";
+        return EXIT_FAILURE;
+    }
+    if (argc >= 12) {
+        double start = 0.0, end = 0.0;
+        std::wstring copy(argv[9]);
+        wchar_t* stop = nullptr;
+        start = std::wcstod(copy.c_str(), &stop);
+        if (!ParsePositiveDouble(argv[10], end) || start < 0.0 || end <= start) {
+            std::wcerr << L"Invalid --real-worker range.\n";
+            return EXIT_FAILURE;
+        }
+        request.range = {static_cast<int64_t>(std::llround(start * 1e7)), static_cast<int64_t>(std::llround(end * 1e7))};
+        std::string guidesText;
+        for (const wchar_t character : std::wstring_view(argv[11])) {
+            if (character > 0x7F) { std::wcerr << L"Invalid --real-worker guides.\n"; return EXIT_FAILURE; }
+            guidesText.push_back(static_cast<char>(character));
+        }
+        const auto guides = ParseGuideControls(guidesText);
+        if (!guides) {
+            std::wcerr << L"Invalid --real-worker guides.\n";
+            return EXIT_FAILURE;
+        }
+        request.guides = *guides;
+    }
+    if (argc == 13) {
+        uint32_t segmentFrames = 0;
+        if (!ParseUnsigned32(argv[12], segmentFrames)) {
+            std::wcerr << L"Invalid --real-worker segment frames.\n";
+            return EXIT_FAILURE;
+        }
+        request.segmentFrames = segmentFrames;
+    }
+    NeuralRenderPhase lastPhase = NeuralRenderPhase::CheckingCache;
+    uint64_t lastReportedFrames = 0;
+    std::vector<std::chrono::steady_clock::time_point> segmentTimes;
+    const auto jobStart = std::chrono::steady_clock::now();
+    NeuralSegmentSink segmentSink;
+    segmentSink.onSegment = [&](const NeuralRenderSegment& segment) {
+        segmentTimes.push_back(std::chrono::steady_clock::now());
+        std::wcout << L"segment index=" << segment.index << L" frames=" << segment.frameCount
+            << L" atMs=" << std::chrono::duration_cast<std::chrono::milliseconds>(segmentTimes.back() - jobStart).count() << L'\n';
+    };
+    const NeuralRenderResult result = RunNeuralWorker(argv[2], request,
+        [&](const NeuralRenderProgress& progress) {
+            if (progress.phase != lastPhase || progress.completedFrames == progress.totalFrames ||
+                progress.completedFrames >= lastReportedFrames + 120) {
+                std::wcout << L"progress phase=" << static_cast<unsigned>(progress.phase)
+                    << L" frames=" << progress.completedFrames << L'/' << progress.totalFrames
+                    << L" bytes=" << progress.bytes << L" elapsedMs=" << progress.elapsed.count()
+                    << L" remainingMs=" << progress.estimatedRemaining.count() << L'\n';
+                lastPhase = progress.phase;
+                lastReportedFrames = progress.completedFrames;
+            }
+        }, {}, segmentSink);
+    std::wcout << L"result ok=" << result.ok << L" cancelled=" << result.cancelled
+        << L" encoder=" << static_cast<unsigned>(result.encoder) << L" frames=" << result.frameCount
+        << L" duration100ns=" << result.duration100ns << L" nativeEvaluations=" << result.nativeEvaluations
+        << L" verifiedNeuralFrames=" << result.verifiedNeuralFrames
+        << L" armed=" << result.feature18ArmedBeforeCapture
+        << L" evidence={nativeResolution=" << result.evidence.nativeResolution
+        << L", inline=" << result.evidence.inlineInterceptionContract
+        << L", created=" << result.evidence.feature18Created
+        << L", evaluated=" << result.evidence.feature18Evaluated
+        << L", laterFailure=" << result.evidence.laterFailure
+        << L", highest=" << result.evidence.highestObservedEvaluation << L"}"
+        << L" failure=" << std::string(NeuralRenderFailureName(result.failure)).c_str()
+        << L" jobId=" << result.jobId << L" historyResets=" << result.historyResets << L" frameRetries=" << result.frameRetries
+        << L" firstTimestamp100ns=" << result.firstTimestamp100ns
+        << L" timing={samples=" << result.timing.samples << L", neuralGpuMsP50=" << result.timing.neuralGpuMsP50
+        << L", p95=" << result.timing.neuralGpuMsP95 << L", max=" << result.timing.neuralGpuMsMax
+        << L", guideMsMean=" << result.timing.guideMsMean << L", captureMsMean=" << result.timing.captureMsMean
+        << L", peakLocalVramMiB=" << result.timing.peakLocalVramMiB
+        // The idle-VRAM pair. This harness drives one single-shot helper, so
+        // idleLocalVramMiB is always 0 here - the process exits instead of
+        // idling - and postJobLocalVramMiB is what that render left resident.
+        << L", postJobLocalVramMiB=" << result.timing.postJobLocalVramMiB
+        << L", idleLocalVramMiB=" << result.timing.idleLocalVramMiB
+        << L", idleVramPolicy=" << resident_helper::IdleVramPolicyName(result.timing.idleVramPolicy)
+        << L"} detail=" << result.detail << L'\n';
+    // The helper's own share of the cold start, in microseconds, as it arrived
+    // over the pipe. An absent phase prints "-": this harness launches the
+    // helper directly, so the player's four phases never exist here.
+    std::wcout << L"coldStart={";
+    for (uint32_t index = 0; index < kNeuralColdStartPhaseCount; ++index) {
+        const auto phase = static_cast<NeuralColdStartPhase>(index);
+        const auto elapsed = result.coldStart.Phase(phase);
+        const std::string name(NeuralColdStartPhaseName(phase));
+        if (index) std::wcout << L", ";
+        std::wcout << name.c_str() << L'=';
+        if (elapsed) std::wcout << elapsed->count() << L"us";
+        else std::wcout << L'-';
+    }
+    std::wcout << L"}\n";
+    return result.ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+void nonexistent_helper_fails_test()
+{
+    size_t progressCount = 0;
+    const NeuralRenderResult result = RunNeuralWorker(L"definitely-not-a-neural-helper.exe",
+        TestRequest(L"valid-source.mkv"), [&](const NeuralRenderProgress&) { ++progressCount; });
+    CHECK(!result.ok);
+    CHECK(!result.cancelled);
+    CHECK(progressCount == 0);
+}
+
+// The temporal settings reach the helper as one canonical pair, and only when
+// they leave the defaults: a default job's command line stays the one every
+// earlier helper accepts, and a value this build cannot name is refused.
+// P1.33. --fps went out at six decimals (to_wstring), so NTSC's 30000/1001
+// reached the helper as 29.970030. It reads back as the very same double.
+void the_frame_rate_reaches_the_helper_exactly_test()
+{
+    const HANDLE metadata = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(123));
+    for (const double fps : {30000.0 / 1001.0, 24000.0 / 1001.0, 60000.0 / 1001.0, 25.0, 59.94, 1.0 / 3.0}) {
+        NeuralRenderRequest request = TestRequest(L"source.mkv");
+        request.fps = fps;
+        const auto arguments = neural_worker_detail::BuildWorkerArguments(request, metadata, nullptr, false);
+        std::vector<std::wstring_view> values{L"NeuralWorker.exe"};
+        for (const auto& argument : arguments) values.emplace_back(argument);
+        const auto parsed = neural_worker_detail::ParseWorkerArguments(values);
+        CHECK(parsed.has_value());
+        if (parsed) CHECK(parsed->request.fps == fps);
+    }
+}
+
+void temporal_settings_reach_the_helper_only_off_their_defaults_test()
+{
+    NeuralRenderRequest request = TestRequest(L"source.mkv");
+    const HANDLE metadata = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(123));
+    auto view = [](const std::vector<std::wstring>& arguments) {
+        std::vector<std::wstring_view> values{L"NeuralWorker.exe"};
+        for (const auto& argument : arguments) values.emplace_back(argument);
+        return values;
+    };
+    const auto plain = neural_worker_detail::BuildWorkerArguments(request, metadata, nullptr, false);
+    for (const auto& argument : plain) CHECK(argument != L"--temporal");
+    const auto plainView = view(plain);
+    const auto parsedPlain = neural_worker_detail::ParseWorkerArguments(plainView);
+    CHECK(parsedPlain.has_value());
+    if (parsedPlain) CHECK(parsedPlain->request.temporal == TemporalSettings{});
+
+    request.temporal.sceneCuts = scene_cut::Sensitivity::Off;
+    const auto tuned = neural_worker_detail::BuildWorkerArguments(request, metadata, nullptr, false);
+    const auto flag = std::find(tuned.begin(), tuned.end(), L"--temporal");
+    CHECK(flag != tuned.end() && flag + 1 != tuned.end());
+    if (flag != tuned.end() && flag + 1 != tuned.end())
+        CHECK_EQ(std::wstring(L"cuts=off,stability=off"), *(flag + 1));
+    const auto tunedView = view(tuned);
+    const auto parsedTuned = neural_worker_detail::ParseWorkerArguments(tunedView);
+    CHECK(parsedTuned.has_value());
+    if (parsedTuned) CHECK(parsedTuned->request.temporal == request.temporal);
+    // Stability alone is also off the default and travels the same way.
+    request.temporal = {};
+    request.temporal.stability = TemporalStability::High;
+    const auto stable = neural_worker_detail::BuildWorkerArguments(request, metadata, nullptr, false);
+    const auto stableView = view(stable);
+    const auto parsedStable = neural_worker_detail::ParseWorkerArguments(stableView);
+    CHECK(parsedStable.has_value());
+    if (parsedStable) CHECK(parsedStable->request.temporal.stability == TemporalStability::High);
+
+    auto unknown = tuned;
+    for (size_t index = 0; index + 1 < unknown.size(); ++index)
+        if (unknown[index] == L"--temporal") unknown[index + 1] = L"cuts=sometimes,stability=off";
+    const auto unknownView = view(unknown);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(unknownView).has_value());
+}
+
+// The benchmark's guide sources (P2.4) come off the helper's line before the shared
+// parser runs, which then sees only the canonical guide string: a line without them
+// is untouched, and nothing the player could send reaches a file.
+void benchmark_guide_sources_leave_the_shared_parser_canonical_test()
+{
+    NeuralRenderRequest request = TestRequest(L"source.mkv");
+    const HANDLE metadata = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(123));
+    const auto plain = neural_worker_detail::BuildWorkerArguments(request, metadata, nullptr, false);
+    std::vector<std::wstring_view> plainView{L"NeuralWorker.exe"};
+    for (const auto& argument : plain) plainView.emplace_back(argument);
+    std::vector<std::wstring> rewritten;
+    guide_files::Sources sources;
+    CHECK(guide_files::ExtractBenchmarkArguments(plainView, rewritten, sources));
+    CHECK(!sources.Active());
+    CHECK(std::ranges::equal(rewritten, plainView));
+
+    auto withGuides = [&](std::wstring spec, std::vector<std::wstring> extra = {}) {
+        std::vector<std::wstring> line{L"NeuralWorker.exe"};
+        line.insert(line.end(), plain.begin(), plain.end());
+        for (size_t index = 0; index + 1 < line.size(); ++index)
+            if (line[index] == L"--guides") line[index + 1] = spec;
+        line.insert(line.end(), extra.begin(), extra.end());
+        return line;
+    };
+    auto extract = [&](const std::vector<std::wstring>& line, guide_files::Sources& out) {
+        std::vector<std::wstring_view> view(line.begin(), line.end());
+        return guide_files::ExtractBenchmarkArguments(view, rewritten, out);
+    };
+    const auto files = withGuides(L"mv=file:C:\\g\\a,b\\mv,depth=file:D:\\depth dir",
+                                  {L"--guide-dump", L"C:\\dump"});
+    CHECK(extract(files, sources));
+    CHECK(sources.motion == guide_files::MotionSource::File);
+    CHECK(sources.motionDirectory == std::filesystem::path(L"C:\\g\\a,b\\mv"));
+    CHECK(sources.depthFromFile);
+    CHECK(sources.depthDirectory == std::filesystem::path(L"D:\\depth dir"));
+    CHECK(sources.dumpDirectory == std::filesystem::path(L"C:\\dump"));
+    CHECK(std::ranges::find(rewritten, std::wstring(L"--guide-dump")) == rewritten.end());
+    CHECK(std::ranges::find(rewritten, std::wstring(L"mv=1,depth=1")) != rewritten.end());
+    std::vector<std::wstring_view> rewrittenView(rewritten.begin(), rewritten.end());
+    const auto parsed = neural_worker_detail::ParseWorkerArguments(rewrittenView);
+    CHECK(parsed.has_value());
+    if (parsed) CHECK(parsed->request.guides == GuideControls{});
+
+    CHECK(extract(withGuides(L"mv=cpu,depth=0"), sources));
+    CHECK(sources.motion == guide_files::MotionSource::Cpu && !sources.depthFromFile);
+    CHECK(std::ranges::find(rewritten, std::wstring(L"mv=1,depth=0")) != rewritten.end());
+    CHECK(extract(withGuides(L"mv=0,depth=1"), sources) && !sources.Active());
+    for (const wchar_t* bad : {L"mv=2,depth=1", L"mv=file:,depth=1", L"mv=1,depth=cpu", L"mv=1",
+                               L"depth=1,mv=1", L"mv=1,depth=file:"})
+        CHECK(!extract(withGuides(bad), sources));
+    CHECK(!extract(withGuides(L"mv=1,depth=1", {L"--guide-dump"}), sources));
+    CHECK(!extract(withGuides(L"mv=1,depth=1", {L"--guide-dump", L"a", L"--guide-dump", L"b"}), sources));
+
+    // The zero-motion A/B's arm (NeuralMotionPolicy.h): off the line before the shared
+    // parser, which has no such key and would refuse the job, and kept whichever side
+    // of --guides it arrives on. Only 0 and 1, and only once.
+    CHECK(extract(withGuides(L"mv=1,depth=1", {L"--zero-motion-test", L"0"}), sources));
+    CHECK(sources.Active() && sources.zeroMotionTest == std::optional<bool>(false));
+    CHECK(sources.motion == guide_files::MotionSource::Estimator && sources.dumpDirectory.empty());
+    CHECK(std::ranges::find(rewritten, std::wstring(L"--zero-motion-test")) == rewritten.end());
+    {
+        std::vector<std::wstring_view> zeroView(rewritten.begin(), rewritten.end());
+        CHECK(neural_worker_detail::ParseWorkerArguments(zeroView).has_value());
+    }
+    {
+        auto first = withGuides(L"mv=cpu,depth=1");
+        first.insert(first.begin() + 2, {L"--zero-motion-test", L"1"});
+        CHECK(extract(first, sources));
+        CHECK(sources.zeroMotionTest == std::optional<bool>(true) && sources.motion == guide_files::MotionSource::Cpu);
+    }
+    CHECK(extract(withGuides(L"mv=1,depth=1"), sources) && !sources.zeroMotionTest.has_value());
+    for (const wchar_t* bad : {L"2", L"on", L""})
+        CHECK(!extract(withGuides(L"mv=1,depth=1", {L"--zero-motion-test", bad}), sources));
+    CHECK(!extract(withGuides(L"mv=1,depth=1", {L"--zero-motion-test"}), sources));
+    CHECK(!extract(withGuides(L"mv=1,depth=1", {L"--zero-motion-test", L"1", L"--zero-motion-test", L"1"}), sources));
+}
+
+// A dump of the estimator's grid, fed back as files, restores the grid bit for bit:
+// the property the byte-identical render proof in docs/measurements rests on. A
+// file that is missing fails the frame instead of falling back to the estimator,
+// and motion from anywhere but the estimator keeps the hardware flow off.
+void guide_files_round_trip_the_estimator_grid_bit_for_bit_test()
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"dlss-guide-files-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+    GuideFrame estimator;
+    estimator.gridW = 7;
+    estimator.gridH = 5;
+    estimator.guideGridRGBA32F.resize(size_t(7) * 5 * 4);
+    uint32_t state = 12345u;
+    for (float& value : estimator.guideGridRGBA32F) {
+        state = state * 1664525u + 1013904223u;
+        value = (static_cast<float>(state >> 8) / 16777216.0f - 0.5f) * 37.0f;
+    }
+    guide_files::Sources dump;
+    dump.dumpDirectory = root;
+    GuideFrame dumped = estimator;
+    std::string error;
+    CHECK(guide_files::Apply(dump, 41, dumped, &error));
+    CHECK(dumped.guideGridRGBA32F == estimator.guideGridRGBA32F);
+    CHECK(dumped.motionVectors);
+    CHECK(std::filesystem::exists(root / L"mv" / L"000041.pfm"));
+    CHECK(std::filesystem::exists(root / L"depth" / L"000041.pfm"));
+
+    guide_files::Sources replay;
+    replay.motion = guide_files::MotionSource::File;
+    replay.motionDirectory = root / L"mv";
+    replay.depthFromFile = true;
+    replay.depthDirectory = root / L"depth";
+    GuideFrame blank = estimator;
+    for (size_t cell = 0; cell < size_t(7) * 5; ++cell) {
+        blank.guideGridRGBA32F[cell * 4] = blank.guideGridRGBA32F[cell * 4 + 1] = 0.0f;
+        blank.guideGridRGBA32F[cell * 4 + 2] = 0.75f;
+    }
+    CHECK(guide_files::Apply(replay, 41, blank, &error));
+    CHECK(std::memcmp(blank.guideGridRGBA32F.data(), estimator.guideGridRGBA32F.data(),
+                      estimator.guideGridRGBA32F.size() * sizeof(float)) == 0);
+    CHECK(!blank.motionVectors);
+    GuideFrame missing = estimator;
+    CHECK(!guide_files::Apply(replay, 42, missing, &error));
+    CHECK(error.find("000042.pfm") != std::string::npos);
+
+    // PFM rows are stored bottom first: the first data row on disk is the grid's last.
+    const guide_files::Plane ramp{2, 2, 1, {1.0f, 2.0f, 3.0f, 4.0f}};
+    const auto encoded = guide_files::EncodePfm(ramp);
+    float firstStored = 0.0f;
+    std::memcpy(&firstStored, encoded.data() + (encoded.size() - 4 * sizeof(float)), sizeof(float));
+    CHECK_EQ(3.0f, firstStored);
+    const auto decoded = guide_files::ParsePfm(encoded);
+    CHECK(decoded.has_value() && decoded->values == ramp.values);
+    // The same map written big-endian: a positive scale and every float byte-swapped.
+    auto bigEndian = encoded;
+    const size_t scaleAt = encoded.size() - 4 * sizeof(float) - 5;
+    bigEndian[scaleAt] = '+';
+    for (size_t offset = bigEndian.size() - 4 * sizeof(float); offset < bigEndian.size(); offset += 4)
+        std::reverse(bigEndian.begin() + static_cast<std::ptrdiff_t>(offset),
+                     bigEndian.begin() + static_cast<std::ptrdiff_t>(offset + 4));
+    const auto swapped = guide_files::ParsePfm(bigEndian);
+    CHECK(swapped.has_value() && swapped->values == ramp.values);
+    auto truncated = encoded;
+    truncated.pop_back();
+    CHECK(!guide_files::ParsePfm(truncated).has_value());
+    const std::string notPfm = "P6\n2 2\n255\n";
+    CHECK(!guide_files::ParsePfm(std::span(reinterpret_cast<const uint8_t*>(notPfm.data()), notPfm.size()))
+               .has_value());
+
+    // Any other size is area-averaged onto the grid.
+    const guide_files::Plane fine{4, 2, 1, {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f}};
+    const auto coarse = guide_files::ResampleArea(fine, 2, 1);
+    CHECK(coarse.width == 2 && coarse.height == 1);
+    CHECK(coarse.values == std::vector<float>({2.5f, 4.5f}));
+    std::filesystem::remove_all(root, ignored);
+}
+
+void helper_main_parser_accepts_normal_and_restarted_contracts_test()
+{
+    NeuralRenderRequest request = TestRequest(L"source.mkv");
+    request.jobId = 77;
+    request.range = {10'000'000, 30'000'000};
+    request.prerollFrames = 12;
+    request.frameRetryLimit = 5;
+    request.guides = {true, false};
+    request.segmentFrames = 96;
+    const HANDLE metadata = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(123));
+    const HANDLE pause = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(456));
+    auto view = [](const std::vector<std::wstring>& arguments) {
+        std::vector<std::wstring_view> values{L"NeuralWorker.exe"};
+        for (const auto& argument : arguments) values.emplace_back(argument);
+        return values;
+    };
+    const auto normal = neural_worker_detail::BuildWorkerArguments(request, metadata, pause, false);
+    const auto normalView = view(normal);
+    const auto parsedNormal = neural_worker_detail::ParseWorkerArguments(normalView);
+    CHECK(parsedNormal.has_value());
+    if (parsedNormal) {
+        CHECK(!parsedNormal->preflight);
+        CHECK(!parsedNormal->configurationRestarted);
+        CHECK(parsedNormal->metadata == metadata);
+        CHECK(parsedNormal->request.pauseEvent == pause);
+        CHECK(parsedNormal->request.sourcePath == request.sourcePath);
+        CHECK(parsedNormal->request.stagingVideoPath == request.stagingVideoPath);
+        CHECK(parsedNormal->request.width == 1920);
+        CHECK(parsedNormal->request.height == 1080);
+        CHECK(parsedNormal->request.fps == 60.0);
+        CHECK(parsedNormal->request.durationSeconds == 1.0);
+        CHECK(parsedNormal->request.jobId == 77);
+        CHECK(parsedNormal->request.range == request.range);
+        CHECK(parsedNormal->request.prerollFrames == 12);
+        CHECK(parsedNormal->request.frameRetryLimit == 5);
+        CHECK(parsedNormal->request.guides == request.guides);
+        CHECK(parsedNormal->request.segmentFrames == 96);
+    }
+    const auto restarted = neural_worker_detail::BuildWorkerArguments(request, metadata, nullptr, true);
+    const auto restartedView = view(restarted);
+    const auto parsedRestarted = neural_worker_detail::ParseWorkerArguments(restartedView);
+    CHECK(parsedRestarted.has_value());
+    if (parsedRestarted) {
+        CHECK(parsedRestarted->configurationRestarted);
+        CHECK(parsedRestarted->request.pauseEvent == nullptr);
+    }
+    // Absent --segment-frames means one output file for the whole range.
+    NeuralRenderRequest single = request;
+    single.segmentFrames = 0;
+    const auto unsegmented = neural_worker_detail::BuildWorkerArguments(single, metadata, nullptr, false);
+    for (const auto& argument : unsegmented) CHECK(argument != L"--segment-frames");
+    const auto unsegmentedView = view(unsegmented);
+    const auto parsedSingle = neural_worker_detail::ParseWorkerArguments(unsegmentedView);
+    CHECK(parsedSingle.has_value());
+    if (parsedSingle) {
+        CHECK(parsedSingle->request.segmentFrames == 0);
+    }
+    auto malformed = restarted;
+    malformed.back() = L"--unexpected";
+    const auto malformedView = view(malformed);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(malformedView).has_value());
+    // The GPU colour conversion is opt-in and travels as its own optional pair, so an
+    // older parent that never sends it still parses into the CPU-conversion default.
+    for (const auto& argument : normal) CHECK(argument != L"--gpu-color-conversion");
+    if (parsedNormal) CHECK(!parsedNormal->request.gpuColorConversion);
+    NeuralRenderRequest converted = request;
+    converted.gpuColorConversion = true;
+    const auto convertedArguments =
+        neural_worker_detail::BuildWorkerArguments(converted, metadata, pause, false);
+    const auto convertedView = view(convertedArguments);
+    const auto parsedConverted = neural_worker_detail::ParseWorkerArguments(convertedView);
+    CHECK(parsedConverted.has_value());
+    if (parsedConverted) {
+        CHECK(parsedConverted->request.gpuColorConversion);
+        CHECK(parsedConverted->request.segmentFrames == 96);
+        CHECK(parsedConverted->request.pauseEvent == pause);
+    }
+    auto badConversion = convertedArguments;
+    for (size_t index = 0; index + 1 < badConversion.size(); ++index) {
+        if (badConversion[index] == L"--gpu-color-conversion") badConversion[index + 1] = L"2";
+    }
+    const auto badConversionView = view(badConversion);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(badConversionView).has_value());
+    // The NVENC preset travels as its own optional pair, and ABSENT MEANS 7.
+    // That 7 is a VERSION contract, not the product default: an older parent
+    // that never sends the flag has to drive a newer helper exactly as an older
+    // helper ran, and every older helper encoded at p7. So the omission is
+    // tested with a request that asks for 7, and the shipping default - p5, on
+    // the measurement recorded beside EncoderSpec::nvencPreset - is a value the
+    // parent states rather than one a missing flag implies.
+    NeuralRenderRequest legacyPreset = request;
+    legacyPreset.nvencPreset = 7;
+    const auto legacyPresetArguments =
+        neural_worker_detail::BuildWorkerArguments(legacyPreset, metadata, pause, false);
+    for (const auto& argument : legacyPresetArguments) CHECK(argument != L"--nvenc-preset");
+    const auto legacyPresetView = view(legacyPresetArguments);
+    const auto parsedLegacyPreset = neural_worker_detail::ParseWorkerArguments(legacyPresetView);
+    CHECK(parsedLegacyPreset.has_value());
+    if (parsedLegacyPreset) CHECK(parsedLegacyPreset->request.nvencPreset == 7);
+    // The default request carries p5, so it does put the pair on the wire.
+    CHECK(std::ranges::find(normal, std::wstring(L"--nvenc-preset")) != normal.end());
+    if (parsedNormal) CHECK(parsedNormal->request.nvencPreset == 5);
+    NeuralRenderRequest presetRequest = request;
+    // Neither the default nor the absent-value, so the round trip below proves
+    // the pair travels rather than agreeing with either by accident.
+    presetRequest.nvencPreset = 3;
+    const auto presetArguments =
+        neural_worker_detail::BuildWorkerArguments(presetRequest, metadata, pause, false);
+    const auto presetView = view(presetArguments);
+    const auto parsedPreset = neural_worker_detail::ParseWorkerArguments(presetView);
+    CHECK(parsedPreset.has_value());
+    if (parsedPreset) {
+        CHECK(parsedPreset->request.nvencPreset == 3);
+    }
+    auto badPresetHigh = presetArguments;
+    for (size_t index = 0; index + 1 < badPresetHigh.size(); ++index) {
+        if (badPresetHigh[index] == L"--nvenc-preset") badPresetHigh[index + 1] = L"8";
+    }
+    const auto badPresetHighView = view(badPresetHigh);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(badPresetHighView).has_value());
+    auto badPresetZero = presetArguments;
+    for (size_t index = 0; index + 1 < badPresetZero.size(); ++index) {
+        if (badPresetZero[index] == L"--nvenc-preset") badPresetZero[index + 1] = L"0";
+    }
+    const auto badPresetZeroView = view(badPresetZero);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(badPresetZeroView).has_value());
+    // GPU source conversion is opt-in and travels as its own optional pair, so an
+    // older parent that never sends it still parses into the CPU conversion every
+    // earlier helper performed - a missing flag can never switch the decode path.
+    for (const auto& argument : normal) CHECK(argument != L"--gpu-source-conversion");
+    if (parsedNormal) CHECK(!parsedNormal->request.gpuSourceConversion);
+    NeuralRenderRequest gpuSource = request;
+    gpuSource.gpuSourceConversion = true;
+    const auto gpuSourceArguments =
+        neural_worker_detail::BuildWorkerArguments(gpuSource, metadata, pause, false);
+    const auto gpuSourceView = view(gpuSourceArguments);
+    const auto parsedGpuSource = neural_worker_detail::ParseWorkerArguments(gpuSourceView);
+    CHECK(parsedGpuSource.has_value());
+    if (parsedGpuSource) {
+        CHECK(parsedGpuSource->request.gpuSourceConversion);
+        CHECK(parsedGpuSource->request.segmentFrames == 96);
+        CHECK(parsedGpuSource->request.pauseEvent == pause);
+    }
+    auto badSourceConversion = gpuSourceArguments;
+    for (size_t index = 0; index + 1 < badSourceConversion.size(); ++index) {
+        if (badSourceConversion[index] == L"--gpu-source-conversion") badSourceConversion[index + 1] = L"2";
+    }
+    const auto badSourceConversionView = view(badSourceConversion);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(badSourceConversionView).has_value());
+    // The processing scale travels only off its default, so every job that
+    // predates the rungs has the command line it always had; a value that is
+    // not a rung, and a reduced scale beside an upscaling output, are refused.
+    for (const auto& argument : normal) CHECK(argument != L"--processing-scale");
+    if (parsedNormal) CHECK_EQ(uint32_t{100}, parsedNormal->request.processingScale);
+    NeuralRenderRequest reduced = request;
+    reduced.processingScale = 50;
+    const auto reducedArguments = neural_worker_detail::BuildWorkerArguments(reduced, metadata, pause, false);
+    const auto reducedView = view(reducedArguments);
+    const auto parsedReduced = neural_worker_detail::ParseWorkerArguments(reducedView);
+    CHECK(parsedReduced.has_value());
+    if (parsedReduced) CHECK_EQ(uint32_t{50}, parsedReduced->request.processingScale);
+    for (const wchar_t* notARung : {L"60", L"150", L"0", L"-50", L"50%"}) {
+        auto badScale = reducedArguments;
+        for (size_t index = 0; index + 1 < badScale.size(); ++index) {
+            if (badScale[index] == L"--processing-scale") badScale[index + 1] = notARung;
+        }
+        const auto badScaleView = view(badScale);
+        CHECK(!neural_worker_detail::ParseWorkerArguments(badScaleView).has_value());
+    }
+    NeuralRenderRequest reducedAndUpscaled = reduced;
+    reducedAndUpscaled.outputWidth = 3840;
+    reducedAndUpscaled.outputHeight = 2160;
+    const auto upscaledArguments =
+        neural_worker_detail::BuildWorkerArguments(reducedAndUpscaled, metadata, pause, false);
+    const auto upscaledView = view(upscaledArguments);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(upscaledView).has_value());
+    // Super Resolution's history travels only off Temporal, so every job before the
+    // choice keeps its command line. Per-frame belongs to an upscaling job without
+    // the model - the export's SR stage on its own - and is refused anywhere else,
+    // because the model runs on the carrier's frames.
+    for (const auto& argument : normal) CHECK(argument != L"--sr-history");
+    if (parsedNormal) CHECK(parsedNormal->request.upscalingHistory == UpscalingHistory::Temporal);
+    NeuralRenderRequest perFrame = request;
+    perFrame.outputWidth = request.width * 2;
+    perFrame.outputHeight = request.height * 2;
+    perFrame.requireNeural = false;
+    perFrame.upscalingHistory = UpscalingHistory::PerFrame;
+    const auto perFrameArguments = neural_worker_detail::BuildWorkerArguments(perFrame, metadata, pause, false);
+    CHECK(std::ranges::find(perFrameArguments, std::wstring(L"per-frame")) != perFrameArguments.end());
+    const auto perFrameView = view(perFrameArguments);
+    const auto parsedPerFrame = neural_worker_detail::ParseWorkerArguments(perFrameView);
+    CHECK(parsedPerFrame.has_value());
+    if (parsedPerFrame) {
+        CHECK(parsedPerFrame->request.upscalingHistory == UpscalingHistory::PerFrame);
+        CHECK(!parsedPerFrame->request.requireNeural);
+    }
+    auto badHistory = perFrameArguments;
+    for (size_t index = 0; index + 1 < badHistory.size(); ++index)
+        if (badHistory[index] == L"--sr-history") badHistory[index + 1] = L"perframe";
+    const auto badHistoryView = view(badHistory);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(badHistoryView).has_value());
+    for (const bool neural : {true, false}) {
+        NeuralRenderRequest refused = perFrame;
+        refused.requireNeural = neural;
+        if (!neural) refused.outputWidth = refused.outputHeight = 0;
+        const auto refusedArguments = neural_worker_detail::BuildWorkerArguments(refused, metadata, pause, false);
+        const auto refusedView = view(refusedArguments);
+        CHECK(!neural_worker_detail::ParseWorkerArguments(refusedView).has_value());
+    }
+    // The capture dither changes the bytes of every captured frame, so absent must
+    // mean off: an older parent cannot get dithered frames it did not key for.
+    for (const auto& argument : normal) CHECK(argument != L"--capture-dither");
+    if (parsedNormal) CHECK(!parsedNormal->request.captureDither);
+    NeuralRenderRequest dithered = request;
+    dithered.captureDither = true;
+    const auto ditheredArguments =
+        neural_worker_detail::BuildWorkerArguments(dithered, metadata, pause, false);
+    const auto ditheredView = view(ditheredArguments);
+    const auto parsedDithered = neural_worker_detail::ParseWorkerArguments(ditheredView);
+    CHECK(parsedDithered.has_value());
+    if (parsedDithered) CHECK(parsedDithered->request.captureDither);
+    auto badDither = ditheredArguments;
+    for (size_t index = 0; index + 1 < badDither.size(); ++index) {
+        if (badDither[index] == L"--capture-dither") badDither[index + 1] = L"2";
+    }
+    const auto badDitherView = view(badDither);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(badDitherView).has_value());
+    // The deband pre-pass changes what the model is shown, so absent must mean off.
+    for (const auto& argument : normal) CHECK(argument != L"--deband");
+    if (parsedNormal) CHECK(!parsedNormal->request.sourceDeband);
+    NeuralRenderRequest debanded = request;
+    debanded.sourceDeband = true;
+    const auto debandedArguments = neural_worker_detail::BuildWorkerArguments(debanded, metadata, pause, false);
+    const auto debandedView = view(debandedArguments);
+    const auto parsedDebanded = neural_worker_detail::ParseWorkerArguments(debandedView);
+    CHECK(parsedDebanded.has_value());
+    if (parsedDebanded) CHECK(parsedDebanded->request.sourceDeband);
+    auto badDeband = debandedArguments;
+    for (size_t index = 0; index + 1 < badDeband.size(); ++index) {
+        if (badDeband[index] == L"--deband") badDeband[index + 1] = L"2";
+    }
+    const auto badDebandView = view(badDeband);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(badDebandView).has_value());
+    // The supplied exposure changes the feature's creation flags and what the model
+    // produces; absent means DLSS meters its own, as every earlier helper let it.
+    for (const auto& argument : normal) CHECK(argument != L"--supplied-exposure");
+    if (parsedNormal) CHECK(!parsedNormal->request.suppliedExposure);
+    NeuralRenderRequest exposed = request;
+    exposed.suppliedExposure = true;
+    const auto exposedArguments = neural_worker_detail::BuildWorkerArguments(exposed, metadata, pause, false);
+    const auto exposedView = view(exposedArguments);
+    const auto parsedExposed = neural_worker_detail::ParseWorkerArguments(exposedView);
+    CHECK(parsedExposed.has_value());
+    if (parsedExposed) CHECK(parsedExposed->request.suppliedExposure);
+    auto badExposure = exposedArguments;
+    for (size_t index = 0; index + 1 < badExposure.size(); ++index) {
+        if (badExposure[index] == L"--supplied-exposure") badExposure[index + 1] = L"2";
+    }
+    const auto badExposureView = view(badExposure);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(badExposureView).has_value());
+    // The encoder path is the benchmark's and the identity tests' switch (EncoderPath):
+    // absent means Auto, which is every line the player builds, both named paths
+    // survive the round trip, and neither an unknown name nor the default spelled
+    // out is accepted.
+    for (const auto& argument : normal) CHECK(argument != L"--encoder-path");
+    if (parsedNormal) CHECK(parsedNormal->request.encoderPath == EncoderPath::Auto);
+    for (const EncoderPath path : {EncoderPath::Direct, EncoderPath::Ffmpeg}) {
+        NeuralRenderRequest pathed = request;
+        pathed.encoderPath = path;
+        const auto pathedArguments = neural_worker_detail::BuildWorkerArguments(pathed, metadata, pause, false);
+        const auto pathedView = view(pathedArguments);
+        const auto parsedPathed = neural_worker_detail::ParseWorkerArguments(pathedView);
+        CHECK(parsedPathed.has_value());
+        if (parsedPathed) CHECK(parsedPathed->request.encoderPath == path);
+        for (const wchar_t* bad : {L"auto", L"nvenc", L""}) {
+            auto badPath = pathedArguments;
+            for (size_t index = 0; index + 1 < badPath.size(); ++index) {
+                if (badPath[index] == L"--encoder-path") badPath[index + 1] = bad;
+            }
+            const auto badPathView = view(badPath);
+            CHECK(!neural_worker_detail::ParseWorkerArguments(badPathView).has_value());
+        }
+    }
+    // The quality rung travels by name, absent meaning Standard - the only rung an
+    // older parent can ask for - and a name this build does not know is refused
+    // rather than read as the default the parent did not key for.
+    for (const auto& argument : normal) CHECK(argument != L"--cache-quality");
+    if (parsedNormal) CHECK(parsedNormal->request.quality == EncoderQuality::Standard);
+    for (const EncoderQuality rung : {EncoderQuality::High, EncoderQuality::Lossless}) {
+        NeuralRenderRequest laddered = request;
+        laddered.quality = rung;
+        const auto ladderedArguments = neural_worker_detail::BuildWorkerArguments(laddered, metadata, pause, false);
+        const auto ladderedView = view(ladderedArguments);
+        const auto parsedLaddered = neural_worker_detail::ParseWorkerArguments(ladderedView);
+        CHECK(parsedLaddered.has_value());
+        if (parsedLaddered) CHECK(parsedLaddered->request.quality == rung);
+    }
+    NeuralRenderRequest high = request;
+    high.quality = EncoderQuality::High;
+    const auto highArguments = neural_worker_detail::BuildWorkerArguments(high, metadata, pause, false);
+    for (const wchar_t* refused : {L"standard", L"best", L"High", L""}) {
+        auto bad = highArguments;
+        for (size_t index = 0; index + 1 < bad.size(); ++index) {
+            if (bad[index] == L"--cache-quality") bad[index + 1] = refused;
+        }
+        const auto badView = view(bad);
+        CHECK(!neural_worker_detail::ParseWorkerArguments(badView).has_value());
+    }
+    auto duplicated = normal;
+    duplicated.emplace_back(L"--width");
+    duplicated.emplace_back(L"1920");
+    const auto duplicatedView = view(duplicated);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(duplicatedView).has_value());
+    auto badGuides = normal;
+    for (size_t index = 0; index + 1 < badGuides.size(); ++index) {
+        if (badGuides[index] == L"--guides") badGuides[index + 1] = L"mv=2,depth=1";
+    }
+    const auto badGuidesView = view(badGuides);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(badGuidesView).has_value());
+    auto retiredGuides = normal;
+    for (size_t index = 0; index + 1 < retiredGuides.size(); ++index) {
+        if (retiredGuides[index] == L"--guides") retiredGuides[index + 1] = L"mv=1,depth=1,mask=1";
+    }
+    const auto retiredGuidesView = view(retiredGuides);
+    // The mask field was deleted: a stale argv carrying it is not a valid contract.
+    CHECK(!neural_worker_detail::ParseWorkerArguments(retiredGuidesView).has_value());
+    auto badRange = normal;
+    for (size_t index = 0; index + 1 < badRange.size(); ++index) {
+        if (badRange[index] == L"--range-end-100ns") badRange[index + 1] = L"5000000";
+    }
+    const auto badRangeView = view(badRange);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(badRangeView).has_value());
+
+    const auto preflight = neural_worker_detail::BuildPreflightArguments(metadata, true);
+    const auto preflightView = view(preflight);
+    const auto parsedPreflight = neural_worker_detail::ParseWorkerArguments(preflightView);
+    CHECK(parsedPreflight.has_value());
+    if (parsedPreflight) {
+        CHECK(parsedPreflight->preflight);
+        CHECK(parsedPreflight->configurationRestarted);
+        CHECK(parsedPreflight->metadata == metadata);
+    }
+    auto preflightWithSource = preflight;
+    preflightWithSource.insert(preflightWithSource.end() - 1, {L"--source", L"x.mkv"});
+    const auto preflightWithSourceView = view(preflightWithSource);
+    CHECK(!neural_worker_detail::ParseWorkerArguments(preflightWithSourceView).has_value());
+}
+
+// Timed from the stop request, not from the launch: starting a child copy of
+// this executable is what a loaded runner (or a virus scanner looking at a new
+// .exe) slows down, and it is not what this test is about. The bound is
+// generous because the failure it guards against is not slowness: a parent
+// that ignores the stop waits out the helper's 20 s hang.
+void cancellation_of_running_child_is_bounded_test()
+{
+    std::stop_source stop;
+    std::chrono::steady_clock::time_point stopRequested{};
+    std::jthread cancel([&] {
+        std::this_thread::sleep_for(100ms);
+        stopRequested = std::chrono::steady_clock::now();
+        stop.request_stop();
+    });
+    const NeuralRenderResult result = RunNeuralWorker(CurrentExecutable(), TestRequest(L"hang-source.mkv"),
+        {}, stop.get_token());
+    const auto returned = std::chrono::steady_clock::now();
+    cancel.join();
+    CHECK(!result.ok);
+    CHECK(result.cancelled);
+    CHECK(returned - stopRequested < 10s);
+}
+
+// GetExitCodeProcess succeeds on a LIVE process and answers STILL_ACTIVE
+// (259). LaunchHelper called it unconditionally, so a helper the parent gave
+// up on while it was still running was reported as "exited with code 259" -
+// which classifies as WorkerCrashed and buries the real reason.
+void a_still_running_helper_is_not_reported_as_exit_code_259_test()
+{
+    const NeuralRenderResult result = RunNeuralWorker(CurrentExecutable(),
+        TestRequest(L"malformed-then-hang-source.mkv"));
+    CHECK(!result.ok);
+    CHECK(!result.cancelled);
+    // The diagnosis must name the malformed stream, not a fictional exit.
+    CHECK(result.detail.find(L"259") == std::wstring::npos);
+    CHECK(result.failure != NeuralRenderFailure::WorkerCrashed);
+    CHECK(!result.detail.empty());
+}
+
+// EndHelper wrote the shutdown frame inline, ahead of TerminateJobObject.
+// WriteCommand is a synchronous WriteFile on an anonymous pipe, so a helper
+// that had stopped reading - the one that actually needs ending - let the
+// pipe fill and the write never returned. Shutdown hung instead of happening.
+//
+// A real pipe nobody reads is the whole fixture: fill it, then ask.
+void a_shutdown_frame_to_an_unread_pipe_gives_up_instead_of_hanging_test()
+{
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    HANDLE readEnd = nullptr, writeEnd = nullptr;
+    REQUIRE(CreatePipe(&readEnd, &writeEnd, &security, 4096) != 0);
+
+    // Fill the buffer exactly, so the next write is the one that blocks.
+    const std::vector<std::byte> filler(4096, std::byte{0});
+    DWORD wrote = 0;
+    CHECK(WriteFile(writeEnd, filler.data(), static_cast<DWORD>(filler.size()), &wrote, nullptr) != 0);
+    CHECK_EQ(DWORD{4096}, wrote);
+
+    const auto budget = neural_worker_detail::kShutdownWriteBudget;
+    const auto started = std::chrono::steady_clock::now();
+    // Takes ownership of writeEnd and closes it on every path.
+    const bool asked = neural_worker_detail::SendShutdownAndCloseBounded(writeEnd, budget);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    CHECK(!asked);
+    // Two budgets: one to notice, one to let the cancelled write unwind.
+    CHECK(elapsed < budget * 4);
+
+    CloseHandle(readEnd);
+}
+
+// The ordinary path still works, and still reports that the frame was taken.
+void a_shutdown_frame_to_a_reading_pipe_is_taken_test()
+{
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    HANDLE readEnd = nullptr, writeEnd = nullptr;
+    REQUIRE(CreatePipe(&readEnd, &writeEnd, &security, 4096) != 0);
+
+    const bool asked = neural_worker_detail::SendShutdownAndCloseBounded(
+        writeEnd, neural_worker_detail::kShutdownWriteBudget);
+    CHECK(asked);
+
+    DWORD available = 0;
+    CHECK(PeekNamedPipe(readEnd, nullptr, 0, nullptr, &available, nullptr) != 0);
+    CHECK_EQ(DWORD{sizeof(WireHeader)}, available);
+
+    CloseHandle(readEnd);
+}
+
+// The flood test above is a safety net, not a proof: whether an unbounded
+// drain actually traps the pump depends on how the writer and reader happen to
+// be scheduled, and on this machine the pipe runs dry often enough to let it
+// out. The bound itself is what has to be asserted, against a real pipe with
+// data still in it.
+void one_metadata_drain_pass_stops_on_its_budget_test()
+{
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    HANDLE readEnd = nullptr, writeEnd = nullptr;
+    // A pipe buffer larger than the budget, so the writer below never blocks
+    // and the drain always has more waiting when its budget runs out.
+    REQUIRE(CreatePipe(&readEnd, &writeEnd,
+                       &security,
+                       static_cast<DWORD>(neural_worker_detail::kMetadataDrainByteBudget * 4)) != 0);
+
+    NeuralRenderProgress progress;
+    progress.phase = NeuralRenderPhase::NeuralRendering;
+    progress.totalFrames = 1000000;
+    // Three budgets, not two: the pass's read-ahead thread keeps pulling up to
+    // one more budget into its own buffer after the pass returns, so with two
+    // the pipe could be empty by the check below. Under AddressSanitizer on CI
+    // it was: the check raced the thread. With three, at least one budget minus
+    // a chunk is still in the pipe whatever the thread has done.
+    size_t written = 0;
+    for (uint64_t frame = 0; written < neural_worker_detail::kMetadataDrainByteBudget * 3; ++frame) {
+        progress.completedFrames = frame;
+        const WireProgress wire = EncodeProgress(progress);
+        if (!WriteMessage(writeEnd, WireKind::Progress, &wire, sizeof(wire))) break;
+        written += sizeof(WireHeader) + sizeof(wire);
+    }
+    CHECK(written >= neural_worker_detail::kMetadataDrainByteBudget * 3);
+
+    const auto pass = neural_worker_detail::DrainMetadataPipeOnce(readEnd);
+    CHECK(!pass.malformed);
+    // It came back with work left rather than reading until the pipe was dry.
+    CHECK(pass.budgetSpent);
+    CHECK(pass.bytesRead >= neural_worker_detail::kMetadataDrainByteBudget);
+    // One chunk of overshoot is the most it may take past the budget.
+    CHECK(pass.bytesRead < neural_worker_detail::kMetadataDrainByteBudget + 8192);
+
+    // And the data it did not read is still there for the next pass.
+    DWORD remaining = 0;
+    CHECK(PeekNamedPipe(readEnd, nullptr, 0, nullptr, &remaining, nullptr) != 0);
+    CHECK(remaining > 0);
+
+    CloseHandle(writeEnd);
+    CloseHandle(readEnd);
+}
+
+// An empty pipe is not a spent budget: the pump has to be able to tell "no
+// more work" from "come back after checking your stop token".
+void an_empty_metadata_pipe_is_not_a_spent_budget_test()
+{
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    HANDLE readEnd = nullptr, writeEnd = nullptr;
+    REQUIRE(CreatePipe(&readEnd, &writeEnd, &security, 4096) != 0);
+
+    const auto pass = neural_worker_detail::DrainMetadataPipeOnce(readEnd);
+    CHECK(!pass.malformed);
+    CHECK(!pass.budgetSpent);
+    CHECK_EQ(size_t{0}, pass.bytesRead);
+
+    CloseHandle(writeEnd);
+    CloseHandle(readEnd);
+}
+
+// MetadataReader::ReadAvailable looped until the pipe ran dry, and it is the
+// FIRST statement of every Pump iteration - ahead of the stop check. A helper
+// that writes faster than the parent reads therefore made the render
+// uncancellable: the user pressed stop and nothing happened until the helper
+// chose to go quiet.
+//
+// hang-source above cannot catch this; it is silent, so the drain returns
+// immediately and the stop check is reached on the next line. Only a chatty
+// helper reaches the loop that did not terminate.
+void cancellation_is_bounded_even_when_the_helper_floods_the_pipe_test()
+{
+    std::stop_source stop;
+    std::chrono::steady_clock::time_point stopRequested{};
+    std::jthread cancel([&] {
+        std::this_thread::sleep_for(300ms);
+        stopRequested = std::chrono::steady_clock::now();
+        stop.request_stop();
+    });
+    const NeuralRenderResult result = RunNeuralWorker(CurrentExecutable(),
+        TestRequest(L"flood-source.mkv"), {}, stop.get_token());
+    const auto returned = std::chrono::steady_clock::now();
+    cancel.join();
+    CHECK(!result.ok);
+    CHECK(result.cancelled);
+    // The helper writes for 30 s. Anything near that means the drain, not the
+    // cancellation, decided when this returned. Timed from the stop request,
+    // with room for a loaded runner, for the reason given above.
+    CHECK(returned - stopRequested < 15s);
+}
+
+// P1.13: the parent used to poll its metadata pipe every 20 ms, so each
+// message - including the Segment that makes a finished segment playable -
+// reached it up to a poll interval (and a timer tick) late. A reader blocked
+// in ReadFile wakes the pump as the bytes land.
+void helper_messages_reach_the_parent_without_a_poll_interval_test()
+{
+    std::vector<int64_t> latencies;
+    const NeuralRenderResult result = RunNeuralWorker(CurrentExecutable(), TestRequest(L"latency-source.mkv"),
+        [&](const NeuralRenderProgress& progress) {
+            if (progress.totalFrames != kLatencyMessages) return;
+            const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            latencies.push_back(now - static_cast<int64_t>(progress.bytes));
+        });
+    CHECK(result.ok);
+    CHECK_EQ(size_t{kLatencyMessages}, latencies.size());
+    if (latencies.empty()) return;
+    std::sort(latencies.begin(), latencies.end());
+    const int64_t median = latencies[latencies.size() / 2];
+    // Polling put the median near half the interval - 10 ms and up - on every
+    // run. Woken by the read, it is a context switch.
+    CHECK(median < 3000);
+}
+
+void malformed_or_truncated_results_are_rejected_test()
+{
+    const NeuralRenderResult result = RunNeuralWorker(CurrentExecutable(),
+        TestRequest(L"truncated-source.mkv"));
+    CHECK(!result.ok);
+    CHECK(!result.cancelled);
+    CHECK(!result.detail.empty());
+}
+
+void valid_result_preserves_all_verification_fields_test()
+{
+    NeuralRenderProgress observed{};
+    size_t progressCount = 0;
+    NeuralRenderRequest request = TestRequest(L"valid-source.mkv");
+    request.jobId = 9001;
+    request.range = {20'000'000, 0};
+    const NeuralRenderResult result = RunNeuralWorker(CurrentExecutable(), request,
+        [&](const NeuralRenderProgress& progress) { observed = progress; ++progressCount; });
+    CHECK(result.ok);
+    CHECK(!result.cancelled);
+    CHECK(result.failure == NeuralRenderFailure::None);
+    CHECK(result.encoder == EncoderKind::H264Software);
+    CHECK(result.frameCount == 60);
+    CHECK(result.duration100ns == 10'000'000);
+    CHECK(result.nativeEvaluations == 60);
+    CHECK(result.verifiedNeuralFrames == 60);
+    CHECK(result.feature18ArmedBeforeCapture);
+    CHECK(result.evidence.nativeResolution);
+    CHECK(result.evidence.inlineInterceptionContract);
+    CHECK(result.evidence.feature18Created);
+    CHECK(result.evidence.feature18Evaluated);
+    CHECK(!result.evidence.laterFailure);
+    CHECK(result.evidence.highestObservedEvaluation == 75);
+    CHECK(result.evidence.Valid());
+    CHECK(result.jobId == 9001);
+    CHECK(result.historyResets == 2);
+    CHECK(result.frameRetries == 1);
+    const SceneCutAccounting expectedCuts{.acceptedStrong = 3, .acceptedWeak = 5, .suppressed = 7};
+    CHECK(result.sceneCuts == expectedCuts);
+    CHECK(result.firstTimestamp100ns == 20'000'000);
+    const NeuralRenderTiming expectedTiming{60, 1.5, 2.5, 4.0, 0.7, 0.3, 2048};
+    CHECK(result.timing == expectedTiming);
+    CHECK(progressCount == 1);
+    CHECK(observed.phase == NeuralRenderPhase::NeuralRendering);
+    CHECK(observed.completedFrames == 17);
+    CHECK(observed.totalFrames == 60);
+}
+
+void request_fields_reach_the_helper_intact_test()
+{
+    NeuralRenderRequest request = TestRequest(L"echo-request-source.mkv");
+    request.guides = {false, true};
+    request.prerollFrames = 7;
+    request.frameRetryLimit = 2;
+    request.segmentFrames = 90;
+    request.range = {30'000'000, 50'000'000};
+    HANDLE pause = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    request.pauseEvent = pause;
+    const NeuralRenderResult result = RunNeuralWorker(CurrentExecutable(), request);
+    CloseHandle(pause);
+    CHECK(result.ok);
+    if (!result.ok) std::wcerr << L"detail: " << result.detail << L" failure=" << static_cast<int>(result.failure) << L'\n';
+    CHECK(result.detail == L"guides=mv=0,depth=1 preroll=7 retry=2 segments=90 range=30000000-50000000 pause=1");
+}
+
+// A relaunched helper numbers its segments from 0 again. Under the first
+// helper's names it truncated files the player's decoder still held open, so
+// each relaunch of a segmented job writes under a stem of its own. A
+// single-file job's staging path is its output, so it is left alone.
+void relaunched_helper_writes_its_segments_under_a_name_of_its_own_test()
+{
+    NeuralRenderRequest segmented = TestRequest(L"relaunch-staging-source.mkv");
+    segmented.segmentFrames = 24;
+    size_t restarts = 0;
+    NeuralSegmentSink sink;
+    sink.onRestart = [&] { ++restarts; };
+    const NeuralRenderResult relaunched = RunNeuralWorker(CurrentExecutable(), segmented, {}, {}, sink);
+    CHECK(relaunched.ok);
+    CHECK(relaunched.detail == L"staging-output-l1.mkv");
+    CHECK(restarts == 1);
+
+    const NeuralRenderResult single = RunNeuralWorker(CurrentExecutable(),
+                                                      TestRequest(L"relaunch-staging-source.mkv"));
+    CHECK(!single.ok);
+    CHECK(single.failure == NeuralRenderFailure::RetryExhausted);
+}
+
+void crashed_helper_is_relaunched_at_most_once_test()
+{
+    std::vector<NeuralRenderProgress> progress;
+    size_t restarts = 0;
+    NeuralSegmentSink sink;
+    sink.onRestart = [&] { ++restarts; };
+    const NeuralRenderResult crashed = RunNeuralWorker(CurrentExecutable(), TestRequest(L"crash-source.mkv"),
+        [&](const NeuralRenderProgress& update) { progress.push_back(update); }, {}, sink);
+    CHECK(!crashed.ok);
+    CHECK(!crashed.cancelled);
+    CHECK(crashed.failure == NeuralRenderFailure::RetryExhausted);
+    CHECK(!crashed.detail.empty());
+    // progress(3/60), Recovering(1), progress(3/60): one relaunch, then exhaustion.
+    size_t recovering = 0, rendering = 0;
+    for (const auto& update : progress) {
+        if (update.phase == NeuralRenderPhase::Recovering) {
+            ++recovering;
+            CHECK(update.recovering == NeuralRenderFailure::WorkerCrashed);
+            CHECK(update.retries == 1);
+        } else if (update.phase == NeuralRenderPhase::NeuralRendering) {
+            ++rendering;
+        }
+    }
+    CHECK(recovering == 1);
+    CHECK(rendering == 2);
+    // The relaunch renders from frame zero: any published segment is invalid.
+    CHECK(restarts == 1);
+
+    const NeuralRenderResult removed = RunNeuralWorker(CurrentExecutable(),
+        TestRequest(L"device-removed-source.mkv"), {}, {}, {}, 0);
+    CHECK(!removed.ok);
+    CHECK(removed.failure == NeuralRenderFailure::RetryExhausted);
+    CHECK(removed.detail.find(L"fake device removal") != std::wstring::npos);
+
+    const NeuralRenderResult wrongJob = RunNeuralWorker(CurrentExecutable(), TestRequest(L"wrong-job-source.mkv"));
+    CHECK(!wrongJob.ok);
+    CHECK(wrongJob.failure == NeuralRenderFailure::Identity);
+}
+
+void preflight_receipt_round_trips_and_restarts_once_test()
+{
+    const NeuralPreflightResult preflight = RunNeuralPreflight(CurrentExecutable());
+    CHECK(preflight.ok);
+    CHECK(!preflight.cancelled);
+    CHECK(preflight.json == "{\"ok\":true,\"gpu\":\"fake\"}");
+    const NeuralPreflightResult missing = RunNeuralPreflight(L"definitely-not-a-neural-helper.exe");
+    CHECK(!missing.ok);
+    CHECK(!missing.detail.empty());
+}
+
+void preflight_failure_detail_comes_from_the_receipt_diagnosis_test()
+{
+    const auto withShape = [](const wchar_t* shape) {
+        CHECK(SetEnvironmentVariableW(L"DLSSVIDEOPLAYER_FAKE_PREFLIGHT", shape) != FALSE);
+        const NeuralPreflightResult result = RunNeuralPreflight(CurrentExecutable());
+        CHECK(SetEnvironmentVariableW(L"DLSSVIDEOPLAYER_FAKE_PREFLIGHT", nullptr) != FALSE);
+        return result;
+    };
+
+    // The classified sentence and its cause survive the receipt round trip.
+    const NeuralPreflightResult refused = withShape(L"refused");
+    CHECK(!refused.ok);
+    CHECK(!refused.cancelled);
+    CHECK(refused.cause == NeuralPreflightCause::DriverBelowFloor);
+    CHECK(refused.detail.find(L"566.14") != std::wstring::npos);
+    CHECK(refused.detail.find(L"610.47") != std::wstring::npos);
+    CHECK(refused.detail.find(L"616.64") != std::wstring::npos);
+
+    // A receipt without a diagnosis still says something, unclassified.
+    const NeuralPreflightResult bare = withShape(L"bare");
+    CHECK(!bare.ok);
+    CHECK(bare.cause == NeuralPreflightCause::None);
+    CHECK_EQ(std::wstring(L"The neural runtime preflight did not arm feature 18."), bare.detail);
+}
+
+// Injectivity is the property every identity built on this depends on, so it
+// is asserted directly rather than only through the preflight receipt.
+void identity_encoding_keeps_different_names_different_test()
+{
+    using narrow_text::IdentityEncoded;
+
+    // ASCII is untouched, so existing identities read the same as before.
+    CHECK_EQ(std::string("NVIDIA GeForce RTX 5090"), IdentityEncoded(L"NVIDIA GeForce RTX 5090"));
+
+    // The case that collided: two names differing only outside ASCII.
+    CHECK(IdentityEncoded(L"RTX™ 4080") != IdentityEncoded(L"RTX™ 5090"));
+    CHECK(IdentityEncoded(L"RTX™") != IdentityEncoded(L"RTX–"));
+    // And differing only in where the non-ASCII character sits.
+    CHECK(IdentityEncoded(L"™RTX") != IdentityEncoded(L"RTX™"));
+
+    // The escape character cannot be used to forge another name's encoding.
+    CHECK(IdentityEncoded(L"%2122") != IdentityEncoded(L"™"));
+    CHECK_EQ(std::string("%%2122"), IdentityEncoded(L"%2122"));
+
+    // Nothing maps to empty except empty, or every unrepresentable name would
+    // share an identity again.
+    CHECK(IdentityEncoded(L"™").empty() == false);
+    CHECK(IdentityEncoded(L"").empty());
+}
+
+// PreflightIdentity narrowed the GPU and driver names with a converter that
+// returns an EMPTY string for anything outside ASCII. Two different cards
+// whose names carry a non-ASCII character - a trademark sign, a localized
+// model name - therefore collapsed to the same identity, and a verdict probed
+// on one was served for the other. A stored "this GPU cannot do neural
+// rendering" would be believed on a card that can.
+//
+// Same family as the cache-key bug: a lossy identity is worse than no
+// identity, because it compares equal.
+void a_preflight_verdict_is_not_shared_by_two_non_ascii_gpu_names_test()
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"preflight-identity-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+
+    // Two genuinely different cards. The only ASCII-representable part of
+    // each name is what the old converter threw away.
+    const NeuralPreflightKey first{L"NVIDIA GeForce RTX™ 4080", L"32.0.15.6614", "digest-a"};
+    const NeuralPreflightKey second{L"NVIDIA GeForce RTX™ 5090", L"32.0.15.6614", "digest-a"};
+
+    CHECK(StoreNeuralPreflightReceipt(root, first, "{\"ok\":true,\"gpu\":\"first\"}"));
+    const std::string served = LoadNeuralPreflightReceipt(root, second);
+    // Either it refuses to answer for a name it cannot represent, or it
+    // answers for the right card. It must never hand back the other card's.
+    CHECK(served.find("first") == std::string::npos);
+
+    // And the card it was actually stored for still gets its own verdict.
+    // Refusing both would also pass the assertion above while quietly costing
+    // every such machine a five second probe on every launch.
+    const std::string own = LoadNeuralPreflightReceipt(root, first);
+    CHECK(own.find("first") != std::string::npos);
+
+    std::filesystem::remove_all(root, error);
+}
+
+// P1.12: the stored verdict is written through a temporary and a rename, and
+// read back by parsing it. A search for "ok":true accepted a file cut short
+// mid-write, because that member sits in the receipt's first bytes.
+void a_stored_preflight_verdict_is_whole_or_absent_test()
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"preflight-atomic-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    const NeuralPreflightKey key{L"NVIDIA GeForce RTX 5090", L"32.0.16.1664", "digest-a"};
+    const std::filesystem::path path = NeuralPreflightReceiptPath(root, key);
+    const std::string pass = "{\"ok\":true,\"gpu\":{\"description\":\"fake\"},\"observations\":[]}";
+    CHECK(StoreNeuralPreflightReceipt(root, key, pass));
+    CHECK_EQ(pass, LoadNeuralPreflightReceipt(root, key));
+    // Replaced in place, and no temporary is left behind beside it.
+    CHECK(StoreNeuralPreflightReceipt(root, key, "{\"ok\":true,\"gpu\":\"second\"}"));
+    CHECK_EQ(std::string("{\"ok\":true,\"gpu\":\"second\"}"), LoadNeuralPreflightReceipt(root, key));
+    size_t files = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(path.parent_path(), error)) {
+        (void)entry;
+        ++files;
+    }
+    CHECK_EQ(size_t{1}, files);
+
+    // Whatever sits on disk under the right identity line, only a whole
+    // document whose top-level "ok" is true stands in for a probe.
+    std::string identity;
+    {
+        std::ifstream input(path, std::ios::binary);
+        std::getline(input, identity);
+    }
+    const auto plant = [&](std::string_view body) {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        output << identity << '\n' << body;
+    };
+    for (const std::string_view rejected : {std::string_view("{\"ok\":true,\"gpu\":{\"descr"),
+                                            std::string_view("{\"ok\":true,"),
+                                            std::string_view("{\"ok\":false,\"note\":\"\\\"ok\\\":true\"}"),
+                                            std::string_view("{\"gpu\":{\"ok\":true}}"),
+                                            std::string_view("{\"ok\":\"true\"}"),
+                                            std::string_view("{\"ok\":true} trailing")}) {
+        plant(rejected);
+        CHECK(LoadNeuralPreflightReceipt(root, key).empty());
+    }
+    plant("{\"ok\":true}");
+    CHECK_EQ(std::string("{\"ok\":true}"), LoadNeuralPreflightReceipt(root, key));
+    std::filesystem::remove_all(root, error);
+}
+
+// P1.12: the handler works from what Install prepared. It builds no path and
+// writes its line straight to the log file rather than through LOG, whose
+// mutex a fault inside Log::Write would still be holding.
+void crash_handler_writes_its_dump_and_line_from_prepared_paths_test()
+{
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"crash-dump-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    std::filesystem::remove_all(directory, error);
+    std::filesystem::create_directories(directory, error);
+    const std::filesystem::path logPath = directory / L"NeuralWorker.log";
+    {
+        std::ofstream log(logPath, std::ios::binary);
+        log << "[00:00:00.000] earlier line\n";
+    }
+    crash_dump::detail::Prepare(logPath);
+
+    EXCEPTION_RECORD record{};
+    record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+    record.ExceptionAddress = reinterpret_cast<void*>(uintptr_t{0x1234abcd});
+    CONTEXT context{};
+    RtlCaptureContext(&context);
+    EXCEPTION_POINTERS pointers{&record, &context};
+    CHECK_EQ(LONG{EXCEPTION_EXECUTE_HANDLER}, crash_dump::detail::Handler(&pointers));
+
+    std::vector<std::filesystem::path> dumps;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+        if (entry.path().extension() == L".dmp") dumps.push_back(entry.path());
+    }
+    std::ifstream input(logPath, std::ios::binary);
+    const std::string log{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>{}};
+    input.close();
+    CHECK(log.starts_with("[00:00:00.000] earlier line\n["));
+    // Under AddressSanitizer MiniDumpWriteDump of this instrumented process can
+    // fail (it did on CI's runner, not on a workstation), and the handler then
+    // takes its designed fallback: no file, and a "could not be written" line.
+    // That still proves what this test is for - the line from prepared paths -
+    // and the uninstrumented build holds the dump itself to the strict check.
+    //
+    // The uninstrumented build lost its dump once too, on CI (run
+    // 36230306450 on 5dbb3b9; the file never appeared, and 88 local runs never
+    // repeated it), and again on 9b04344 with both kinds failing (299, then
+    // 0x800704F8). The handler now writes the dump from a thread of its own,
+    // follows a failed full dump with a minimal one, and tries that pair
+    // twice, so a written dump may be either kind; and when there is none, the
+    // handler's own line - with the winerr of each attempt - is printed, so
+    // the next failure names its cause.
+    const auto checkWrittenDump = [&](const std::vector<std::filesystem::path>& written,
+                                      const std::string& text) {
+        CHECK_EQ(size_t{1}, written.size());
+        const std::wstring expectedTail = L"-" + std::to_wstring(GetCurrentProcessId()) + L".dmp";
+        if (written.size() == 1) {
+            const std::wstring name = written[0].filename().wstring();
+            CHECK(name.starts_with(L"NeuralWorker-crash-"));
+            CHECK(name.ends_with(expectedTail));
+            CHECK(std::filesystem::file_size(written[0], error) > 0);
+        } else {
+            std::cerr << "  crash handler wrote no dump; its line: "
+                      << text.substr(text.rfind('[') == std::string::npos ? 0 : text.rfind('['));
+        }
+        const bool full = text.find("] Unhandled exception 0xc0000005 at 0x1234abcd; minidump written to ") != std::string::npos;
+        const bool minimal = text.find("] Unhandled exception 0xc0000005 at 0x1234abcd; the full minidump failed (winerr=") != std::string::npos &&
+                             text.find("); minidump written to ") != std::string::npos;
+        CHECK(full || minimal);
+        CHECK(text.ends_with(".dmp\n"));
+    };
+#if defined(__SANITIZE_ADDRESS__)
+    if (dumps.empty()) {
+        CHECK(log.find("] Unhandled exception 0xc0000005 at 0x1234abcd; a minidump could not be written (winerr=") != std::string::npos);
+        CHECK(log.ends_with(").\n"));
+    } else {
+        checkWrittenDump(dumps, log);
+    }
+#else
+    checkWrittenDump(dumps, log);
+#endif
+
+    // The retry itself, forced: the full dump reports ERROR_PARTIAL_COPY (299)
+    // without being tried, and the minimal one is written in its place with the
+    // full dump's error in the line. A log of its own, because the dump name
+    // carries only the second and the first dump above may share it.
+    const auto retryDirectory = directory / L"retry";
+    std::filesystem::create_directories(retryDirectory, error);
+    const std::filesystem::path retryLog = retryDirectory / L"NeuralWorker.log";
+    crash_dump::detail::Prepare(retryLog);
+    crash_dump::detail::g_failFullDumpForTest = true;
+    CHECK_EQ(LONG{EXCEPTION_EXECUTE_HANDLER}, crash_dump::detail::Handler(&pointers));
+    crash_dump::detail::g_failFullDumpForTest = false;
+    std::vector<std::filesystem::path> retryDumps;
+    for (const auto& entry : std::filesystem::directory_iterator(retryDirectory, error)) {
+        if (entry.path().extension() == L".dmp") retryDumps.push_back(entry.path());
+    }
+    std::ifstream retryInput(retryLog, std::ios::binary);
+    const std::string retryText{std::istreambuf_iterator<char>(retryInput), std::istreambuf_iterator<char>{}};
+    retryInput.close();
+#if defined(__SANITIZE_ADDRESS__)
+    if (!retryDumps.empty()) checkWrittenDump(retryDumps, retryText);
+#else
+    checkWrittenDump(retryDumps, retryText);
+#endif
+    if (!retryDumps.empty())
+        CHECK(retryText.find("; the full minidump failed (winerr=299); minidump written to ") != std::string::npos);
+
+    // A log path too long for the prepared buffers costs the dump, never the
+    // handler: it still returns, and there is nowhere it may write.
+    crash_dump::detail::Prepare(directory / std::wstring(crash_dump::detail::kPathCapacity, L'x'));
+    wchar_t path[crash_dump::detail::kPathCapacity + 64];
+    CHECK(!crash_dump::detail::ComposeDumpPath(path, std::size(path), SYSTEMTIME{}, 1));
+    CHECK_EQ(LONG{EXCEPTION_EXECUTE_HANDLER}, crash_dump::detail::Handler(&pointers));
+    std::filesystem::remove_all(directory, error);
+}
+
+// P1.12: a helper whose exit code cannot be read is not a clean exit. The
+// resident path kept its 0 when GetExitCodeProcess failed, which judged a
+// crash a Protocol failure - and those are never relaunched.
+void an_unreadable_helper_exit_code_is_not_a_clean_exit_test()
+{
+    using neural_worker_detail::ReadHelperExitCode;
+    CHECK(!ReadHelperExitCode([](DWORD* code) { *code = 0; return false; }).has_value());
+    CHECK(!ReadHelperExitCode([](DWORD* code) { *code = STILL_ACTIVE; return true; }).has_value());
+    CHECK(ReadHelperExitCode([](DWORD* code) { *code = 0; return true; }) == DWORD{0});
+    CHECK(ReadHelperExitCode([](DWORD* code) { *code = 5; return true; }) == DWORD{5});
+
+    // Against a real process that has gone, the code it exited with.
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION child{};
+    std::wstring command = L"\"" + CurrentExecutable().wstring() + L"\" --exit-now";
+    REQUIRE(CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                           nullptr, &startup, &child) != FALSE);
+    CloseHandle(child.hThread);
+    CHECK_EQ(DWORD{WAIT_OBJECT_0}, WaitForSingleObject(child.hProcess, 10000));
+    CHECK(ReadHelperExitCode([&](DWORD* code) { return GetExitCodeProcess(child.hProcess, code) != FALSE; }) ==
+          DWORD{0});
+    CloseHandle(child.hProcess);
+}
+
+void preflight_latch_holds_one_verdict_per_runtime_identity_test()
+{
+    const NeuralPreflightKey key{L"NVIDIA GeForce RTX 3060 Laptop GPU", L"32.0.15.6614", "runtime-digest-a"};
+    constexpr std::wstring_view detail =
+        L"NVIDIA driver 566.14 is below the 610.47 minimum for neural rendering.";
+    NeuralPreflightLatch latch;
+    // A non-empty detail is the whole predicate: it is both the reason to skip
+    // the probe and the sentence the render fails with.
+    CHECK(latch.LatchedFailureDetail(key).empty());
+
+    latch.RecordFailure(key, std::wstring(detail));
+    CHECK_EQ(std::wstring(detail), latch.LatchedFailureDetail(key));
+
+    // Anything that can change the answer carries no verdict, so it probes.
+    const NeuralPreflightKey newDriver{key.gpu, L"32.0.16.1664", key.runtimeDigest};
+    const NeuralPreflightKey otherGpu{L"NVIDIA GeForce RTX 5090", key.driver, key.runtimeDigest};
+    const NeuralPreflightKey newRuntime{key.gpu, key.driver, "runtime-digest-b"};
+    for (const NeuralPreflightKey& other : {newDriver, otherGpu, newRuntime})
+        CHECK(latch.LatchedFailureDetail(other).empty());
+    CHECK(!latch.LatchedFailureDetail(key).empty());
+
+    // A pass is remembered too, with its receipt: skipping the probe is only
+    // allowed when the render's own receipt can still carry the evidence.
+    latch.RecordSuccess(key, "{\"schema\":2,\"ok\":true}");
+    CHECK(latch.LatchedFailureDetail(key).empty());
+    CHECK_EQ(std::string("{\"schema\":2,\"ok\":true}"), latch.LatchedSuccessJson(key));
+    for (const NeuralPreflightKey& other : {newDriver, otherGpu, newRuntime})
+        CHECK(latch.LatchedSuccessJson(other).empty());
+    // A pass without a receipt cannot stand in for one.
+    latch.RecordSuccess(key, std::string{});
+    CHECK(latch.LatchedSuccessJson(key).empty());
+
+    latch.RecordSuccess(key, "{\"ok\":true}");
+    latch.RecordFailure(key, std::wstring(detail));
+    CHECK(latch.LatchedSuccessJson(key).empty());
+    latch.Invalidate();
+    CHECK(latch.LatchedFailureDetail(key).empty());
+    CHECK(latch.LatchedSuccessJson(key).empty());
+
+    // The field storm: three playback starts on the same doomed machine ran
+    // three ~5 s probes in 65 s. One probe is the whole point of the latch.
+    NeuralPreflightLatch storm;
+    int probes = 0;
+    for (int playbackStart = 0; playbackStart < 3; ++playbackStart) {
+        if (!storm.LatchedFailureDetail(key).empty()) continue;
+        ++probes;
+        storm.RecordFailure(key, std::wstring(detail));
+    }
+    CHECK_EQ(1, probes);
+}
+
+void runtime_lease_admits_one_holder_per_directory_test()
+{
+    const std::filesystem::path runtime = L"D:/example/neural-runtime";
+    // The name identifies the directory, not the process or the path spelling.
+    CHECK(NeuralRuntimeLease::MutexName(runtime) == NeuralRuntimeLease::MutexName(L"D:\\Example\\neural-runtime\\"));
+    CHECK(NeuralRuntimeLease::MutexName(runtime) != NeuralRuntimeLease::MutexName(L"D:/example/other-runtime"));
+    // Machine-wide, not session-local: two players in two Windows sessions
+    // share one neural-runtime directory.
+    CHECK(NeuralRuntimeLease::MutexName(runtime).starts_with(L"Global\\DLSSVideoPlayer.neural-runtime."));
+
+    auto heldElsewhere = [&](const std::filesystem::path& directory) {
+        // Ownership is per thread, so a competing holder must be another thread.
+        bool held = false;
+        std::jthread other([&] { NeuralRuntimeLease lease(directory, 0ms); held = lease.Held(); });
+        other.join();
+        return held;
+    };
+    {
+        NeuralRuntimeLease lease(runtime);
+        CHECK(lease.Held());
+        CHECK(!heldElsewhere(runtime));
+        // A different runtime directory is unaffected.
+        CHECK(heldElsewhere(L"D:/example/other-runtime"));
+    }
+    // Releasing lets the next render in.
+    CHECK(heldElsewhere(runtime));
+    // An empty directory is not a shared resource and never blocks.
+    NeuralRuntimeLease none(L"");
+    CHECK(!none.Held());
+}
+
+void protocol_rejects_inconsistent_results_test()
+{
+    NeuralRenderResult okWithFailure;
+    okWithFailure.ok = true;
+    okWithFailure.feature18ArmedBeforeCapture = true;
+    okWithFailure.evidence = {true, true, true, true, false, 1};
+    okWithFailure.frameCount = okWithFailure.nativeEvaluations = okWithFailure.verifiedNeuralFrames = 1;
+    okWithFailure.duration100ns = 1;
+    CHECK(DecodeResult(EncodeResult(okWithFailure)).has_value());
+    okWithFailure.failure = NeuralRenderFailure::GpuStall;
+    CHECK(!DecodeResult(EncodeResult(okWithFailure)).has_value());
+    NeuralRenderResult failedWithoutKind;
+    CHECK(!DecodeResult(EncodeResult(failedWithoutKind)).has_value());
+    NeuralRenderResult cancelledWrongKind;
+    cancelledWrongKind.cancelled = true;
+    cancelledWrongKind.failure = NeuralRenderFailure::Source;
+    CHECK(!DecodeResult(EncodeResult(cancelledWrongKind)).has_value());
+    cancelledWrongKind.failure = NeuralRenderFailure::Cancelled;
+    CHECK(DecodeResult(EncodeResult(cancelledWrongKind)).has_value());
+    // The reserved bytes are the only growth room left in WireResult; a helper that
+    // writes anything there is not speaking this version of the protocol.
+    // Byte 10 became superResolutionOnly; the five after it are still reserved.
+    auto reservedInUse = EncodeResult(cancelledWrongKind);
+    reservedInUse[11] = std::byte{1};
+    CHECK(!DecodeResult(reservedInUse).has_value());
+    auto notBoolean = EncodeResult(cancelledWrongKind);
+    notBoolean[10] = std::byte{2};
+    CHECK(!DecodeResult(notBoolean).has_value());
+
+    // A neural result round-trips as neural, and zero on the wire - what every
+    // helper that wrote byte 10 as reserved produced - still reads as neural.
+    NeuralRenderResult neural = okWithFailure;
+    neural.failure = NeuralRenderFailure::None;
+    const auto encodedNeural = EncodeResult(neural);
+    CHECK(encodedNeural[10] == std::byte{0});
+    const auto decodedNeural = DecodeResult(encodedNeural);
+    CHECK(decodedNeural.has_value() && decodedNeural->neural);
+
+    // Super Resolution alone: no verified neural frame, nothing armed, no
+    // feature-18 evidence, and it says so on the wire.
+    NeuralRenderResult upscaleOnly;
+    upscaleOnly.ok = true;
+    upscaleOnly.neural = false;
+    upscaleOnly.frameCount = upscaleOnly.nativeEvaluations = 5;
+    upscaleOnly.duration100ns = 1;
+    const auto encodedUpscale = EncodeResult(upscaleOnly);
+    CHECK(encodedUpscale[10] == std::byte{1});
+    const auto decodedUpscale = DecodeResult(encodedUpscale);
+    CHECK(decodedUpscale.has_value());
+    if (decodedUpscale) {
+        CHECK(!decodedUpscale->neural);
+        CHECK_EQ(uint64_t{0}, decodedUpscale->verifiedNeuralFrames);
+        CHECK(!decodedUpscale->feature18ArmedBeforeCapture);
+    }
+    // Held to the opposite claim: an upscale-only result that says a frame was
+    // verified neural, that feature 18 was armed, or whose log shows feature 18
+    // evaluating is not an upscale-only render, and cannot be accepted as one.
+    NeuralRenderResult claimsVerified = upscaleOnly;
+    claimsVerified.verifiedNeuralFrames = 5;
+    CHECK(!DecodeResult(EncodeResult(claimsVerified)).has_value());
+    NeuralRenderResult claimsArmed = upscaleOnly;
+    claimsArmed.feature18ArmedBeforeCapture = true;
+    CHECK(!DecodeResult(EncodeResult(claimsArmed)).has_value());
+    NeuralRenderResult addonRan = upscaleOnly;
+    addonRan.evidence.feature18Evaluated = true;
+    CHECK(!DecodeResult(EncodeResult(addonRan)).has_value());
+    // And a neural result is still held to the whole verification set.
+    NeuralRenderResult neuralWithoutEvidence = neural;
+    neuralWithoutEvidence.evidence = {};
+    CHECK(!DecodeResult(EncodeResult(neuralWithoutEvidence)).has_value());
+    NeuralRenderProgress recoveringWithoutKind;
+    recoveringWithoutKind.phase = NeuralRenderPhase::Recovering;
+    const WireProgress wire = EncodeProgress(recoveringWithoutKind);
+    CHECK(!DecodeProgress(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&wire), sizeof(wire))).has_value());
+}
+
+void segment_messages_round_trip_and_reject_malformed_test()
+{
+    const NeuralRenderSegment segment = TestSegment(3, 48);
+    const auto decoded = DecodeSegment(EncodeSegment(segment, kTestFrameDuration100ns));
+    CHECK(decoded.has_value());
+    if (decoded) {
+        CHECK(decoded->index == 3);
+        CHECK(decoded->firstFrameNumber == segment.firstFrameNumber);
+        CHECK(decoded->firstTimestamp100ns == segment.firstTimestamp100ns);
+        CHECK(decoded->frameCount == 48);
+        CHECK(decoded->end100ns == segment.end100ns);
+        CHECK(decoded->fileName == L"neural-00003.mkv");
+    }
+    NeuralRenderSegment empty = segment;
+    empty.frameCount = 0;
+    CHECK(!DecodeSegment(EncodeSegment(empty, kTestFrameDuration100ns)).has_value());
+    CHECK(!DecodeSegment(EncodeSegment(segment, 0)).has_value());
+    CHECK(!DecodeSegment(EncodeSegment(segment, -1)).has_value());
+    NeuralRenderSegment nested = segment;
+    nested.fileName = L"sub/neural-00003.mkv";
+    CHECK(!DecodeSegment(EncodeSegment(nested, kTestFrameDuration100ns)).has_value());
+    nested.fileName = L"sub\\neural-00003.mkv";
+    CHECK(!DecodeSegment(EncodeSegment(nested, kTestFrameDuration100ns)).has_value());
+    NeuralRenderSegment traversal = segment;
+    traversal.fileName = L"neural..mkv";
+    CHECK(!DecodeSegment(EncodeSegment(traversal, kTestFrameDuration100ns)).has_value());
+    NeuralRenderSegment unnamed = segment;
+    unnamed.fileName.clear();
+    CHECK(!DecodeSegment(EncodeSegment(unnamed, kTestFrameDuration100ns)).has_value());
+    // The encoder caps the name; a hand-built oversized payload is refused.
+    NeuralRenderSegment longName = segment;
+    longName.fileName.assign(400, L'n');
+    const auto capped = DecodeSegment(EncodeSegment(longName, kTestFrameDuration100ns));
+    CHECK(capped.has_value());
+    if (capped) CHECK(capped->fileName.size() == kMaximumSegmentNameBytes / sizeof(wchar_t));
+    CHECK(!DecodeSegment(OversizedSegmentPayload(segment)).has_value());
+    const auto payload = EncodeSegment(segment, kTestFrameDuration100ns);
+    CHECK(!DecodeSegment(std::span<const std::byte>(payload.data(), payload.size() - 2)).has_value());
+}
+
+void metadata_reader_accepts_segments_before_the_result_test()
+{
+    const WireProgress progress = EncodeProgress([] {
+        NeuralRenderProgress value;
+        value.phase = NeuralRenderPhase::NeuralRendering;
+        value.completedFrames = 24;
+        value.totalFrames = 48;
+        return value;
+    }());
+    const auto resultPayload = EncodeResult(ValidFakeResult(4242));
+    const auto segmentPayload = [](uint64_t index) {
+        return EncodeSegment(TestSegment(index, 24), kTestFrameDuration100ns);
+    };
+    std::vector<std::byte> stream;
+    AppendMessage(stream, WireKind::Progress, AsBytes(progress));
+    AppendMessage(stream, WireKind::Segment, segmentPayload(0));
+    AppendMessage(stream, WireKind::Segment, segmentPayload(1));
+    AppendMessage(stream, WireKind::Result, resultPayload);
+    const auto accepted = neural_worker_detail::DecodeMetadataStream(stream);
+    CHECK(!accepted.malformed);
+    CHECK(accepted.complete);
+    CHECK(accepted.progressUpdates == 1);
+    CHECK(accepted.restarts == 0);
+    CHECK(accepted.segments.size() == 2);
+    if (accepted.segments.size() == 2) {
+        CHECK(accepted.segments[0].index == 0);
+        CHECK(accepted.segments[0].fileName == L"neural-00000.mkv");
+        CHECK(accepted.segments[1].index == 1);
+        CHECK(accepted.segments[1].firstTimestamp100ns == accepted.segments[0].end100ns);
+    }
+
+    // A segment can never follow the terminal result.
+    std::vector<std::byte> afterResult = stream;
+    AppendMessage(afterResult, WireKind::Segment, segmentPayload(2));
+    const auto rejected = neural_worker_detail::DecodeMetadataStream(afterResult);
+    CHECK(rejected.malformed);
+    CHECK(!rejected.complete);
+
+    // A skipped index is malformed; a repeated 0 restarts the sequence.
+    std::vector<std::byte> gap;
+    AppendMessage(gap, WireKind::Segment, segmentPayload(0));
+    AppendMessage(gap, WireKind::Segment, segmentPayload(2));
+    CHECK(neural_worker_detail::DecodeMetadataStream(gap).malformed);
+    std::vector<std::byte> replay;
+    AppendMessage(replay, WireKind::Segment, segmentPayload(0));
+    AppendMessage(replay, WireKind::Segment, segmentPayload(1));
+    AppendMessage(replay, WireKind::Segment, segmentPayload(0));
+    AppendMessage(replay, WireKind::Result, resultPayload);
+    const auto restarted = neural_worker_detail::DecodeMetadataStream(replay);
+    CHECK(!restarted.malformed);
+    CHECK(restarted.complete);
+    CHECK(restarted.restarts == 1);
+    CHECK(restarted.segments.size() == 1);
+
+    // A helper speaking the previous protocol version is refused outright.
+    std::vector<std::byte> older;
+    AppendMessage(older, static_cast<uint16_t>(kProtocolVersion - 1), WireKind::Segment, segmentPayload(0));
+    CHECK(neural_worker_detail::DecodeMetadataStream(older).malformed);
+    std::vector<std::byte> broken;
+    AppendMessage(broken, WireKind::Segment, OversizedSegmentPayload(TestSegment(0, 24)));
+    CHECK(neural_worker_detail::DecodeMetadataStream(broken).malformed);
+}
+
+// A malformed message stopped the decoder before it dropped the messages it had
+// already delivered, so the pump's last drain - and any later read - decoded
+// them again: progress, segments and restarts fired twice for one message.
+void a_malformed_stream_never_re_delivers_what_it_handed_out_test()
+{
+    const WireProgress progress = EncodeProgress([] {
+        NeuralRenderProgress value;
+        value.phase = NeuralRenderPhase::NeuralRendering;
+        value.completedFrames = 1;
+        value.totalFrames = 48;
+        return value;
+    }());
+    const auto segmentPayload = [](uint64_t index) {
+        return EncodeSegment(TestSegment(index, 24), kTestFrameDuration100ns);
+    };
+    std::vector<std::byte> stream;
+    AppendMessage(stream, WireKind::Progress, AsBytes(progress));
+    AppendMessage(stream, WireKind::Segment, segmentPayload(0));
+    AppendMessage(stream, WireKind::Segment, segmentPayload(1));
+    AppendMessage(stream, WireKind::Segment, segmentPayload(3));   // a gap: malformed
+    // Bytes still arriving after the bad message, as a pump's final drain sees.
+    AppendMessage(stream, WireKind::Progress, AsBytes(progress));
+    AppendMessage(stream, WireKind::Segment, segmentPayload(0));
+    const auto decoded = neural_worker_detail::DecodeMetadataStream(stream);
+    CHECK(decoded.malformed);
+    CHECK(!decoded.complete);
+    CHECK(decoded.progressUpdates == 1);
+    CHECK(decoded.restarts == 0);
+    CHECK(decoded.segments.size() == 2);
+}
+
+// P0.14, at the decoder: a job's stream ends with a Result and a probe's with a
+// Preflight receipt, and each refuses the other's however well-formed it is -
+// either verdict, reserved bytes zero, a JSON body. The reader used to take
+// both in any stream, which is what let a resident job stop on a receipt.
+void a_stream_ends_only_with_the_terminal_message_it_expects_test()
+{
+    using neural_worker_detail::DecodeMetadataStream;
+    using neural_worker_detail::MetadataStream;
+    for (const bool verdict : {false, true}) {
+        const auto receipt = EncodePreflight(
+            PreflightPayload{verdict, verdict ? "{\"ok\":true,\"gpu\":\"fake\"}" : "{\"ok\":false,\"gpu\":\"fake\"}"});
+        CHECK(DecodePreflight(receipt).has_value());
+        std::vector<std::byte> answered;
+        AppendMessage(answered, WireKind::Preflight, receipt);
+        const auto job = DecodeMetadataStream(answered);
+        CHECK(job.malformed);
+        CHECK(!job.complete);
+        CHECK(DecodeMetadataStream(answered, MetadataStream::Job).malformed);
+        const auto probe = DecodeMetadataStream(answered, MetadataStream::Preflight);
+        CHECK(!probe.malformed);
+        CHECK(probe.complete);
+    }
+
+    const auto resultPayload = EncodeResult(ValidFakeResult(4242));
+    std::vector<std::byte> rendered;
+    AppendMessage(rendered, WireKind::Result, resultPayload);
+    const auto job = DecodeMetadataStream(rendered, MetadataStream::Job);
+    CHECK(!job.malformed);
+    CHECK(job.complete);
+    const auto probe = DecodeMetadataStream(rendered, MetadataStream::Preflight);
+    CHECK(probe.malformed);
+    CHECK(!probe.complete);
+
+    // Ready describes the process, not the question, so either stream takes it
+    // on either side of its terminal message.
+    std::vector<std::byte> announcedJob;
+    AppendMessage(announcedJob, WireKind::Result, resultPayload);
+    AppendMessage(announcedJob, WireKind::Ready, {});
+    CHECK(DecodeMetadataStream(announcedJob).complete);
+    std::vector<std::byte> announcedProbe;
+    AppendMessage(announcedProbe, WireKind::Ready, {});
+    AppendMessage(announcedProbe, WireKind::Preflight,
+                  EncodePreflight(PreflightPayload{true, "{\"ok\":true}"}));
+    CHECK(DecodeMetadataStream(announcedProbe, MetadataStream::Preflight).complete);
+}
+
+void running_helper_publishes_segments_before_its_result_test()
+{
+    NeuralRenderRequest request = TestRequest(L"segment-source.mkv");
+    request.jobId = 5150;
+    request.segmentFrames = 24;
+    std::vector<NeuralRenderSegment> segments;
+    size_t restarts = 0;
+    NeuralSegmentSink sink;
+    sink.onSegment = [&](const NeuralRenderSegment& segment) { segments.push_back(segment); };
+    sink.onRestart = [&] { ++restarts; };
+    const NeuralRenderResult result = RunNeuralWorker(CurrentExecutable(), request, {}, {}, sink);
+    CHECK(result.ok);
+    CHECK(result.jobId == 5150);
+    CHECK(restarts == 0);
+    CHECK(segments.size() == 2);
+    if (segments.size() == 2) {
+        CHECK(segments[0].index == 0);
+        CHECK(segments[0].frameCount == 24);
+        CHECK(segments[0].firstFrameNumber == 0);
+        CHECK(segments[0].fileName == L"neural-00000.mkv");
+        CHECK(segments[1].index == 1);
+        CHECK(segments[1].firstFrameNumber == 24);
+        CHECK(segments[1].fileName == L"neural-00001.mkv");
+        CHECK(segments[1].firstTimestamp100ns == segments[0].end100ns);
+    }
+}
+
+void configuration_retry_is_sequential_and_bounded_test()
+{
+    size_t progressCount = 0, launches = 0;
+    const auto configured = RunNeuralWorker(CurrentExecutable(), TestRequest(L"configure-once-source.mkv"),
+        [&](const NeuralRenderProgress&) { ++progressCount; }, {}, {}, kDefaultCrashRelaunchLimit,
+        [&] { ++launches; });
+    CHECK(configured.ok);
+    CHECK(configured.frameCount == 60);
+    CHECK(progressCount == 1);
+    // The repaired helper and its replacement are both launch cost, so both
+    // processes are reported rather than only the one that rendered.
+    CHECK(launches == 2);
+    const auto repeated = RunNeuralWorker(CurrentExecutable(), TestRequest(L"configure-always-source.mkv"));
+    CHECK(!repeated.ok);
+    CHECK(!repeated.detail.empty());
+}
+
+void helper_cold_start_timeline_reaches_the_parent_test()
+{
+    size_t launches = 0;
+    const NeuralRenderResult result = RunNeuralWorker(CurrentExecutable(),
+        TestRequest(L"timeline-source.mkv"), {}, {}, {}, kDefaultCrashRelaunchLimit,
+        [&] { ++launches; });
+    CHECK(result.ok);
+    CHECK(launches == 1);
+    CHECK(result.coldStart == FakeHelperTimeline());
+    // The helper measures its own five phases and claims nothing else: the
+    // player's preparation and its request-to-picture total are not its to report.
+    CHECK(!result.coldStart.Phase(NeuralColdStartPhase::Request).has_value());
+    CHECK(!result.coldStart.Phase(NeuralColdStartPhase::Attach).has_value());
+    CHECK(!result.coldStart.Total().has_value());
+    // A helper that never reports one leaves every phase absent rather than zero.
+    const NeuralRenderResult silent = RunNeuralWorker(CurrentExecutable(), TestRequest(L"valid-source.mkv"));
+    CHECK(silent.ok);
+    CHECK(silent.coldStart == NeuralColdStartTimeline{});
+}
+
+void cold_start_timeline_messages_are_validated_test()
+{
+    const auto resultPayload = EncodeResult(ValidFakeResult(9001));
+    const WireTimeline valid = EncodeTimeline(FakeHelperTimeline());
+    std::vector<std::byte> stream;
+    AppendMessage(stream, WireKind::Timeline, AsBytes(valid));
+    AppendMessage(stream, WireKind::Result, resultPayload);
+    const auto accepted = neural_worker_detail::DecodeMetadataStream(stream);
+    CHECK(!accepted.malformed);
+    CHECK(accepted.complete);
+    CHECK(accepted.timeline == FakeHelperTimeline());
+
+    // A helper speaking the previous protocol version is refused outright, so a
+    // stale NeuralWorker.exe cannot have its shorter messages read as v5 ones.
+    std::vector<std::byte> older;
+    AppendMessage(older, static_cast<uint16_t>(kProtocolVersion - 1), WireKind::Timeline, AsBytes(valid));
+    CHECK(neural_worker_detail::DecodeMetadataStream(older).malformed);
+
+    // Reserved bytes are the only room a later version has; a helper that
+    // writes there is not the helper this parent validated.
+    WireTimeline reserved = valid;
+    reserved.reserved[2] = 1;
+    std::vector<std::byte> dirty;
+    AppendMessage(dirty, WireKind::Timeline, AsBytes(reserved));
+    CHECK(neural_worker_detail::DecodeMetadataStream(dirty).malformed);
+
+    // A phase the player owns, a duration in a slot with no present bit, a
+    // negative duration, an empty timeline and a second timeline are all
+    // helpers that measured something they could not have measured.
+    for (const WireTimeline broken : {
+             [&] { WireTimeline value = valid;
+                   value.present |= 1u << static_cast<uint32_t>(NeuralColdStartPhase::Attach);
+                   return value; }(),
+             [&] { WireTimeline value = valid;
+                   value.microseconds[static_cast<size_t>(NeuralColdStartPhase::Request)] = 5;
+                   return value; }(),
+             [&] { WireTimeline value = valid;
+                   value.microseconds[static_cast<size_t>(NeuralColdStartPhase::NeuralInit)] = -1;
+                   return value; }(),
+             WireTimeline{}}) {
+        std::vector<std::byte> rejected;
+        AppendMessage(rejected, WireKind::Timeline, AsBytes(broken));
+        CHECK(neural_worker_detail::DecodeMetadataStream(rejected).malformed);
+    }
+    std::vector<std::byte> twice;
+    AppendMessage(twice, WireKind::Timeline, AsBytes(valid));
+    AppendMessage(twice, WireKind::Timeline, AsBytes(valid));
+    CHECK(neural_worker_detail::DecodeMetadataStream(twice).malformed);
+
+    // The payload is fixed size: a short or padded one is not a timeline.
+    std::vector<std::byte> truncated;
+    AppendMessage(truncated, WireKind::Timeline, AsBytes(valid).first(sizeof(WireTimeline) - 8));
+    CHECK(neural_worker_detail::DecodeMetadataStream(truncated).malformed);
+}
+
+// The render report's metrics (P2.11) travel as their own message ahead of the
+// result, at most once, and only as numbers an 8-bit render could produce.
+void render_metrics_messages_are_validated_test()
+{
+    TemporalMetrics metrics;
+    metrics.frames = 120;
+    metrics.pairs = 117;
+    metrics.shots = 3;
+    metrics.sourceWarpError = 2.5;
+    metrics.outputWarpError = 3.25;
+    metrics.sourceSigma = 4.0;
+    metrics.outputSigma = 3.5;
+    metrics.lumaShift = -1.2;
+    metrics.colorDelta = 6.4;
+    const auto resultPayload = EncodeResult(ValidFakeResult(9002));
+    const WireMetrics valid = EncodeMetrics(metrics);
+    std::vector<std::byte> stream;
+    AppendMessage(stream, WireKind::Metrics, AsBytes(valid));
+    AppendMessage(stream, WireKind::Result, resultPayload);
+    const auto accepted = neural_worker_detail::DecodeMetadataStream(stream);
+    CHECK(!accepted.malformed);
+    CHECK(accepted.complete);
+    CHECK(accepted.metrics == metrics);
+
+    // Absent is fine - a refused or failed job measures nothing - and reads as
+    // unmeasured rather than as zeros.
+    std::vector<std::byte> none;
+    AppendMessage(none, WireKind::Result, resultPayload);
+    const auto without = neural_worker_detail::DecodeMetadataStream(none);
+    CHECK(without.complete && !without.metrics.Measured());
+
+    for (const WireMetrics broken : {
+             [&] { WireMetrics value = valid; value.frames = 0; return value; }(),
+             [&] { WireMetrics value = valid; value.pairs = value.frames; return value; }(),
+             [&] { WireMetrics value = valid; value.sourceSigma = -1.0; return value; }(),
+             [&] { WireMetrics value = valid; value.colorDelta = std::numeric_limits<double>::quiet_NaN(); return value; }(),
+             [&] { WireMetrics value = valid; value.lumaShift = 1.0e9; return value; }(),
+             [&] { WireMetrics value = valid; value.reserved[1] = 1; return value; }()}) {
+        std::vector<std::byte> rejected;
+        AppendMessage(rejected, WireKind::Metrics, AsBytes(broken));
+        AppendMessage(rejected, WireKind::Result, resultPayload);
+        CHECK(neural_worker_detail::DecodeMetadataStream(rejected).malformed);
+    }
+    std::vector<std::byte> twice;
+    AppendMessage(twice, WireKind::Metrics, AsBytes(valid));
+    AppendMessage(twice, WireKind::Metrics, AsBytes(valid));
+    CHECK(neural_worker_detail::DecodeMetadataStream(twice).malformed);
+    // After the result is after the job: a terminal message ends what describes it.
+    std::vector<std::byte> late;
+    AppendMessage(late, WireKind::Result, resultPayload);
+    AppendMessage(late, WireKind::Metrics, AsBytes(valid));
+    CHECK(neural_worker_detail::DecodeMetadataStream(late).malformed);
+}
+
+// --- The resident command channel and its job loop -------------------------
+
+using resident_worker::CommandChannel;
+using resident_worker::JobOutcome;
+using resident_worker::ResidentExit;
+
+// An anonymous pipe the test writes command frames into. The read end is handed
+// to the channel, which owns it from then on; the write end is closed here so
+// the channel's reader sees the end of the stream when the test means it to and
+// not when this process exits.
+class CommandPipe {
+public:
+    CommandPipe() { CHECK(CreatePipe(&read_, &write_, nullptr, 0) != 0); }
+    ~CommandPipe()
+    {
+        CloseWrite();
+        if (read_) CloseHandle(read_);
+    }
+    CommandPipe(const CommandPipe&) = delete;
+    CommandPipe& operator=(const CommandPipe&) = delete;
+
+    // Transfers the read end to the caller, which is what CommandChannel wants.
+    HANDLE TakeRead()
+    {
+        HANDLE handle = read_;
+        read_ = nullptr;
+        return handle;
+    }
+
+    void Send(CommandKind kind, std::span<const std::byte> payload = {})
+    {
+        CHECK(WriteCommand(write_, kind, payload.data(), static_cast<uint32_t>(payload.size())));
+    }
+
+    // A frame built without the protocol's own writer, so the header fields the
+    // helper is supposed to refuse can actually be produced.
+    void SendRaw(uint32_t magic, uint16_t version, uint16_t kind,
+                 std::span<const std::byte> payload = {})
+    {
+        const WireHeader header{magic, version, kind, static_cast<uint32_t>(payload.size())};
+        CHECK(WriteAll(write_, &header, sizeof(header)));
+        if (!payload.empty()) CHECK(WriteAll(write_, payload.data(), payload.size()));
+    }
+
+    void CloseWrite()
+    {
+        if (!write_) return;
+        CloseHandle(write_);
+        write_ = nullptr;
+    }
+
+private:
+    HANDLE read_{};
+    HANDLE write_{};
+};
+
+// Stands in for the runner that renders. Every observation the loop's contract
+// is written against is recorded here, and a job can be made to block until it
+// is stopped so a cancel has something to interrupt.
+struct RecordingRunner {
+    size_t readyCalls{};
+    size_t idleCalls{};
+    std::vector<std::vector<std::wstring>> jobs;
+    std::vector<std::wstring> refusals;
+    JobOutcome outcome{JobOutcome::Completed};
+    bool blockUntilStopped{};
+    bool sawStop{};
+    // Observed from the test thread while the loop runs on another, so a job's
+    // completion can be waited for without a lock.
+    std::atomic<size_t> completedJobs{};
+    size_t stoppedJobs{};
+    bool readyFails{};
+    std::chrono::milliseconds jobDuration{0};
+
+    bool Ready()
+    {
+        ++readyCalls;
+        return !readyFails;
+    }
+
+    bool Refuse(std::wstring_view detail)
+    {
+        refusals.emplace_back(detail);
+        return true;
+    }
+
+    void Idle() { ++idleCalls; }
+
+    JobOutcome Job(std::span<const std::wstring> argv, std::stop_token stop)
+    {
+        jobs.emplace_back(argv.begin(), argv.end());
+        if (jobDuration.count()) std::this_thread::sleep_for(jobDuration);
+        while (blockUntilStopped && !stop.stop_requested()) std::this_thread::sleep_for(1ms);
+        sawStop = stop.stop_requested();
+        if (sawStop) ++stoppedJobs;
+        ++completedJobs;
+        return sawStop ? JobOutcome::Cancelled : outcome;
+    }
+};
+
+std::vector<std::wstring> ResidentJobArguments()
+{
+    NeuralRenderRequest request = TestRequest(L"resident-source.mkv");
+    request.jobId = 4242;
+    std::vector<std::wstring> argv{L"NeuralWorker.exe"};
+    const auto tail = neural_worker_detail::BuildWorkerArguments(
+        request, reinterpret_cast<HANDLE>(static_cast<uintptr_t>(9)), nullptr, false);
+    argv.insert(argv.end(), tail.begin(), tail.end());
+    return argv;
+}
+
+void resident_loop_answers_hello_and_serves_jobs_test()
+{
+    const std::vector<std::wstring> argv = ResidentJobArguments();
+    const std::vector<std::byte> payload = EncodeJobArguments(argv);
+    CommandPipe pipe;
+    pipe.Send(CommandKind::Hello);
+    pipe.Send(CommandKind::Job, payload);
+    pipe.Send(CommandKind::Job, payload);
+    pipe.Send(CommandKind::Shutdown);
+    RecordingRunner runner;
+    CommandChannel channel(pipe.TakeRead(), nullptr);
+    CHECK(RunResidentLoop(channel, runner, 10s) == ResidentExit::Shutdown);
+    // Hello is answered exactly once, and the two jobs arrive with the argument
+    // vector the parent encoded, byte for byte: the helper's own parser is the
+    // only thing that decides what those arguments mean.
+    CHECK_EQ(size_t{1}, runner.readyCalls);
+    CHECK_EQ(size_t{2}, runner.jobs.size());
+    CHECK(runner.refusals.empty());
+    if (runner.jobs.size() == 2) {
+        CHECK(runner.jobs[0] == argv);
+        CHECK(runner.jobs[1] == argv);
+    }
+}
+
+void resident_loop_refuses_frames_it_cannot_trust_test()
+{
+    const std::vector<std::byte> payload = EncodeJobArguments(ResidentJobArguments());
+    const std::array<std::byte, 4> fourBytes{};
+
+    // A header this version cannot vouch for leaves the stream at an unknown
+    // offset, so the session ends rather than guessing where the next frame
+    // starts. Every case here must end the session WITHOUT running a job.
+    struct Framing {
+        uint32_t magic;
+        uint16_t version;
+        uint16_t kind;
+        bool payload;
+    };
+    for (const Framing broken : {
+             Framing{kProtocolMagic, static_cast<uint16_t>(kProtocolVersion - 1),
+                     static_cast<uint16_t>(CommandKind::Job), true},
+             Framing{kProtocolMagic, static_cast<uint16_t>(kProtocolVersion + 1),
+                     static_cast<uint16_t>(CommandKind::Job), true},
+             Framing{kProtocolMagic ^ 1u, kProtocolVersion,
+                     static_cast<uint16_t>(CommandKind::Job), true},
+             Framing{kProtocolMagic, kProtocolVersion, 0, false},
+             Framing{kProtocolMagic, kProtocolVersion, 5, false},
+             // Only Job carries a payload; anything else with one is not this
+             // protocol's frame whatever its kind says.
+             Framing{kProtocolMagic, kProtocolVersion,
+                     static_cast<uint16_t>(CommandKind::Hello), true}}) {
+        CommandPipe pipe;
+        pipe.SendRaw(broken.magic, broken.version, broken.kind,
+                     broken.payload ? std::span<const std::byte>(payload)
+                                    : std::span<const std::byte>());
+        pipe.Send(CommandKind::Job, payload);
+        RecordingRunner runner;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        CHECK(RunResidentLoop(channel, runner, 10s) == ResidentExit::Malformed);
+        CHECK(runner.jobs.empty());
+        CHECK(runner.readyCalls == 0);
+    }
+
+    // A Job payload the decoder refuses is different in kind: the frame's
+    // length was known, so the stream is still in sync. That job is refused and
+    // the helper stays, which the Shutdown behind it proves.
+    std::vector<std::byte> trailing = payload;
+    trailing.push_back(std::byte{0});
+    uint32_t zeroCount = 0;
+    std::vector<std::byte> emptyVector(sizeof(zeroCount));
+    std::memcpy(emptyVector.data(), &zeroCount, sizeof(zeroCount));
+    for (const std::vector<std::byte>& refused : {trailing, emptyVector, std::vector<std::byte>{}}) {
+        CommandPipe pipe;
+        pipe.Send(CommandKind::Job, refused);
+        pipe.Send(CommandKind::Shutdown);
+        RecordingRunner runner;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        CHECK(RunResidentLoop(channel, runner, 10s) == ResidentExit::Shutdown);
+        CHECK(runner.jobs.empty());
+        CHECK_EQ(size_t{1}, runner.refusals.size());
+    }
+}
+
+void resident_loop_exits_on_shutdown_and_on_idle_test()
+{
+    // The shipped budget, stated here because it is the number that bounds
+    // parked VRAM: a change to it is a change to that promise.
+    static_assert(resident_worker::kIdleTimeout == std::chrono::seconds{30});
+
+    {
+        CommandPipe pipe;
+        pipe.Send(CommandKind::Shutdown);
+        RecordingRunner runner;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        CHECK(RunResidentLoop(channel, runner, 10s) == ResidentExit::Shutdown);
+    }
+    {
+        // Nothing arrives and the parent keeps its end of the pipe open, so the
+        // only thing that can end this session is the idle budget - and it must
+        // actually wait for it rather than falling out of an empty queue.
+        CommandPipe pipe;
+        RecordingRunner runner;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        const auto started = std::chrono::steady_clock::now();
+        CHECK(RunResidentLoop(channel, runner, 200ms) == ResidentExit::Idle);
+        CHECK(std::chrono::steady_clock::now() - started >= 180ms);
+    }
+    {
+        // "No job for this long" is measured from the end of the last job, so a
+        // job that took longer than the budget does not itself expire it.
+        CommandPipe pipe;
+        const std::vector<std::byte> payload = EncodeJobArguments(ResidentJobArguments());
+        pipe.Send(CommandKind::Job, payload);
+        RecordingRunner runner;
+        runner.jobDuration = 300ms;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        const auto started = std::chrono::steady_clock::now();
+        CHECK(RunResidentLoop(channel, runner, 200ms) == ResidentExit::Idle);
+        CHECK(std::chrono::steady_clock::now() - started >= 480ms);
+        CHECK_EQ(size_t{1}, runner.jobs.size());
+    }
+}
+
+void resident_loop_cancel_stops_the_job_and_keeps_the_helper_test()
+{
+    const std::vector<std::byte> payload = EncodeJobArguments(ResidentJobArguments());
+    {
+        CommandPipe pipe;
+        pipe.Send(CommandKind::Job, payload);
+        pipe.Send(CommandKind::Cancel);
+        pipe.Send(CommandKind::Shutdown);
+        RecordingRunner runner;
+        runner.blockUntilStopped = true;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        // The job only ends because the cancel reached it while it was running,
+        // and the session only ends on the Shutdown behind it: a cancel leaves
+        // the helper resident and idle.
+        CHECK(RunResidentLoop(channel, runner, 10s) == ResidentExit::Shutdown);
+        CHECK_EQ(size_t{1}, runner.jobs.size());
+        CHECK(runner.sawStop);
+    }
+    {
+        // A cancel arriving with no job to cancel is a no-op, not an exit.
+        CommandPipe pipe;
+        pipe.Send(CommandKind::Cancel);
+        RecordingRunner runner;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        CHECK(RunResidentLoop(channel, runner, 200ms) == ResidentExit::Idle);
+    }
+    {
+        // Shutdown during a job stops it too, and the job still gets to report
+        // before the session ends.
+        CommandPipe pipe;
+        pipe.Send(CommandKind::Job, payload);
+        pipe.Send(CommandKind::Shutdown);
+        RecordingRunner runner;
+        runner.blockUntilStopped = true;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        CHECK(RunResidentLoop(channel, runner, 10s) == ResidentExit::Shutdown);
+        CHECK_EQ(size_t{1}, runner.jobs.size());
+        CHECK(runner.sawStop);
+    }
+}
+
+// The parent pumps the helper's pipe every 20 ms, so its Cancel can be written
+// after the helper has already reported the job's Result. That Cancel reaches
+// the loop with nothing running, and it used to leave the reader's pending
+// stop set: the next Job attached to it and started already cancelled, before
+// its first frame.
+void resident_loop_late_cancel_does_not_cancel_the_next_job_test()
+{
+    const std::vector<std::byte> payload = EncodeJobArguments(ResidentJobArguments());
+    CommandPipe pipe;
+    RecordingRunner runner;
+    CommandChannel channel(pipe.TakeRead(), nullptr);
+    ResidentExit exit = ResidentExit::Idle;
+    std::thread loop([&] { exit = RunResidentLoop(channel, runner, 10s); });
+    auto awaitCompleted = [&](size_t count) {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (runner.completedJobs.load() < count && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(1ms);
+        return runner.completedJobs.load() >= count;
+    };
+    pipe.Send(CommandKind::Job, payload);
+    CHECK(awaitCompleted(1));
+    // The Result for the first job is out; only now does the parent's cancel
+    // land, followed by the job the user actually wants rendered.
+    pipe.Send(CommandKind::Cancel);
+    pipe.Send(CommandKind::Job, payload);
+    CHECK(awaitCompleted(2));
+    pipe.Send(CommandKind::Shutdown);
+    loop.join();
+    CHECK(exit == ResidentExit::Shutdown);
+    CHECK_EQ(size_t{2}, runner.jobs.size());
+    CHECK_EQ(size_t{0}, runner.stoppedJobs);
+}
+
+void resident_loop_ends_when_the_parent_dies_test()
+{
+    // The job object already kills a helper whose player died. This is the
+    // second mechanism, because the failure it prevents is a process holding
+    // the GPU and the runtime lease with nobody left to reap it.
+    std::wstring commandLine = L"\"" + CurrentExecutable().wstring() + L"\" --exit-now";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    CHECK(CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                         nullptr, nullptr, &startup, &process) != 0);
+    if (!process.hProcess) return;
+    CloseHandle(process.hThread);
+    CommandPipe pipe;
+    RecordingRunner runner;
+    {
+        CommandChannel channel(pipe.TakeRead(), process.hProcess);
+        // The command pipe stays open and empty, and the idle budget is far
+        // longer than the child lives, so the only thing that can end this
+        // session is the parent handle signalling.
+        CHECK(RunResidentLoop(channel, runner, 30s) == ResidentExit::ParentExited);
+    }
+    CloseHandle(process.hProcess);
+    CHECK(runner.jobs.empty());
+}
+
+void resident_loop_stops_serving_after_an_invalidating_job_test()
+{
+    const std::vector<std::byte> payload = EncodeJobArguments(ResidentJobArguments());
+    {
+        // A failed job retires the process: the session log's failure lines are
+        // scanned session-wide, so the second job queued behind it must never
+        // run in this helper.
+        CommandPipe pipe;
+        pipe.Send(CommandKind::Job, payload);
+        pipe.Send(CommandKind::Job, payload);
+        RecordingRunner runner;
+        runner.outcome = JobOutcome::Invalidated;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        CHECK(RunResidentLoop(channel, runner, 10s) == ResidentExit::JobInvalidated);
+        CHECK_EQ(size_t{1}, runner.jobs.size());
+    }
+    {
+        // Nothing left to report to: the session ends instead of rendering into
+        // a pipe nobody is reading.
+        CommandPipe pipe;
+        pipe.Send(CommandKind::Hello);
+        RecordingRunner runner;
+        runner.readyFails = true;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        CHECK(RunResidentLoop(channel, runner, 10s) == ResidentExit::WriteFailed);
+    }
+    {
+        // The parent closed its end without saying goodbye.
+        CommandPipe pipe;
+        pipe.CloseWrite();
+        RecordingRunner runner;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        CHECK(RunResidentLoop(channel, runner, 10s) == ResidentExit::Closed);
+    }
+}
+
+void resident_launch_line_is_a_helper_and_not_a_job_test()
+{
+    const HANDLE metadata = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(11));
+    const HANDLE command = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(22));
+    const HANDLE pause = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(33));
+    const HANDLE parent = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(44));
+    auto parse = [](std::vector<std::wstring_view> values) {
+        return neural_worker_detail::ParseWorkerArguments(values);
+    };
+    const auto resident = parse({L"NeuralWorker.exe", L"--neural-worker", L"--metadata-handle", L"11",
+                                 L"--command-handle", L"22", L"--pause-event", L"33",
+                                 L"--parent-process", L"44"});
+    CHECK(resident.has_value());
+    if (resident) {
+        CHECK(resident->Resident());
+        CHECK(resident->metadata == metadata);
+        CHECK(resident->command == command);
+        CHECK(resident->request.pauseEvent == pause);
+        CHECK(resident->parentProcess == parent);
+        // The launch line describes a helper: it carries no job, and the first
+        // job arrives as a command frame.
+        CHECK(resident->request.sourcePath.empty());
+        CHECK(resident->request.width == 0);
+    }
+    // A job field on a resident launch line is a job nobody asked for, arriving
+    // beside a channel that is about to deliver one.
+    CHECK(!parse({L"NeuralWorker.exe", L"--neural-worker", L"--metadata-handle", L"11",
+                  L"--command-handle", L"22", L"--width", L"1920"}).has_value());
+    // A probe never goes resident, and a zero handle is not a handle.
+    CHECK(!parse({L"NeuralWorker.exe", L"--neural-preflight", L"--metadata-handle", L"11",
+                  L"--command-handle", L"22"}).has_value());
+    CHECK(!parse({L"NeuralWorker.exe", L"--neural-worker", L"--metadata-handle", L"11",
+                  L"--command-handle", L"0"}).has_value());
+    // The parent handle is only meaningful to a helper that outlives one job.
+    const auto single = neural_worker_detail::BuildWorkerArguments(
+        TestRequest(L"single.mkv"), metadata, nullptr, false);
+    std::vector<std::wstring_view> withParent{L"NeuralWorker.exe"};
+    for (const auto& argument : single) withParent.emplace_back(argument);
+    withParent.emplace_back(L"--parent-process");
+    withParent.emplace_back(L"44");
+    CHECK(!neural_worker_detail::ParseWorkerArguments(withParent).has_value());
+    // And the single-shot line the benchmark harness drives is still exactly
+    // what it was: no command handle, no residency.
+    std::vector<std::wstring_view> plain{L"NeuralWorker.exe"};
+    for (const auto& argument : single) plain.emplace_back(argument);
+    const auto parsed = neural_worker_detail::ParseWorkerArguments(plain);
+    CHECK(parsed.has_value());
+    if (parsed) {
+        CHECK(!parsed->Resident());
+        CHECK(parsed->command == nullptr);
+        CHECK(parsed->parentProcess == nullptr);
+        CHECK(parsed->request.width == 1920);
+    }
+}
+
+void resident_loop_samples_once_per_idle_stretch_test()
+{
+    // The shipped grace, stated here because it is the number the idle VRAM
+    // sample and the FreeFeature release are both timed on, and because it
+    // must stay well short of the exit budget for either to mean anything.
+    static_assert(resident_worker::kIdleSampleGrace < resident_worker::kIdleTimeout);
+
+    const std::vector<std::byte> payload = EncodeJobArguments(ResidentJobArguments());
+    {
+        // A helper that has rendered nothing has nothing parked to measure and
+        // no workset to hand back, so the grace passes without a sample.
+        CommandPipe pipe;
+        RecordingRunner runner;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        CHECK(RunResidentLoop(channel, runner, 300ms, 50ms) == ResidentExit::Idle);
+        CHECK_EQ(size_t{0}, runner.idleCalls);
+    }
+    {
+        // One job, then quiet: the sample fires at the grace, and the helper
+        // still leaves on the idle budget rather than on the grace.
+        CommandPipe pipe;
+        pipe.Send(CommandKind::Job, payload);
+        RecordingRunner runner;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        const auto started = std::chrono::steady_clock::now();
+        CHECK(RunResidentLoop(channel, runner, 400ms, 50ms) == ResidentExit::Idle);
+        CHECK(std::chrono::steady_clock::now() - started >= 380ms);
+        CHECK_EQ(size_t{1}, runner.idleCalls);
+    }
+    {
+        // A second job re-arms the grace, so each idle stretch is sampled once
+        // and a helper serving jobs steadily is never sampled at all.
+        CommandPipe pipe;
+        pipe.Send(CommandKind::Job, payload);
+        RecordingRunner runner;
+        CommandChannel channel(pipe.TakeRead(), nullptr);
+        std::jthread second([&] {
+            std::this_thread::sleep_for(250ms);
+            pipe.Send(CommandKind::Job, payload);
+        });
+        CHECK(RunResidentLoop(channel, runner, 700ms, 50ms) == ResidentExit::Idle);
+        CHECK_EQ(size_t{2}, runner.jobs.size());
+        CHECK_EQ(size_t{2}, runner.idleCalls);
+    }
+}
+
+void idle_vram_policy_is_named_on_the_launch_line_and_read_from_the_player_ini_test()
+{
+    using resident_helper::IdleVramPolicy;
+    const HANDLE metadata = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(11));
+    const HANDLE command = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(22));
+    auto roundTrip = [&](IdleVramPolicy policy) {
+        const auto built = neural_worker_detail::BuildResidentArguments(metadata, command, nullptr,
+                                                                        nullptr, policy);
+        std::vector<std::wstring_view> values{L"NeuralWorker.exe"};
+        for (const auto& argument : built) values.emplace_back(argument);
+        return neural_worker_detail::ParseWorkerArguments(values);
+    };
+    // Both arms survive the launch line, the default one included: a helper
+    // whose line does not say which arm it runs cannot attribute its samples.
+    const auto keep = roundTrip(IdleVramPolicy::KeepFeature);
+    CHECK(keep.has_value());
+    if (keep) CHECK(keep->idleVramPolicy == IdleVramPolicy::KeepFeature);
+    const auto free = roundTrip(IdleVramPolicy::FreeFeature);
+    CHECK(free.has_value());
+    if (free) CHECK(free->idleVramPolicy == IdleVramPolicy::FreeFeature);
+
+    // A helper launched by a parent that predates the flag keeps its feature
+    // memory, which is what every helper before the flag did.
+    const auto absent = neural_worker_detail::ParseWorkerArguments(
+        std::vector<std::wstring_view>{L"NeuralWorker.exe", L"--neural-worker", L"--metadata-handle",
+                                       L"11", L"--command-handle", L"22"});
+    CHECK(absent.has_value());
+    if (absent) CHECK(absent->idleVramPolicy == IdleVramPolicy::KeepFeature);
+    // A name this build cannot resolve is refused rather than defaulted: the
+    // helper would otherwise run one arm while its line claimed another.
+    CHECK(!neural_worker_detail::ParseWorkerArguments(
+        std::vector<std::wstring_view>{L"NeuralWorker.exe", L"--neural-worker", L"--metadata-handle",
+                                       L"11", L"--command-handle", L"22", L"--idle-vram-policy",
+                                       L"maybe"}).has_value());
+    // A single-shot helper exits instead of idling, so an idle instruction on
+    // its line is an instruction for a period it will never have.
+    const auto single = neural_worker_detail::BuildWorkerArguments(
+        TestRequest(L"single.mkv"), metadata, nullptr, false);
+    std::vector<std::wstring_view> withPolicy{L"NeuralWorker.exe"};
+    for (const auto& argument : single) withPolicy.emplace_back(argument);
+    withPolicy.emplace_back(L"--idle-vram-policy");
+    withPolicy.emplace_back(L"free");
+    CHECK(!neural_worker_detail::ParseWorkerArguments(withPolicy).has_value());
+
+    // The advanced setting the arm is selected with, out of the player's own
+    // ini rather than the neural runtime's - a resource policy must not reach
+    // the settings digest the render cache key hashes.
+    const std::filesystem::path ini =
+        FailureInjectionCounterPath(L"settings").replace_extension(L".ini");
+    std::error_code error;
+    std::filesystem::remove(ini, error);
+    // No file at all is the default, and so is a file without the key.
+    CHECK(ReadIdleVramPolicy(ini) == IdleVramPolicy::KeepFeature);
+    CHECK(WritePrivateProfileStringW(L"NeuralHelper", L"IdleVramPolicy", L"free", ini.c_str()) != FALSE);
+    CHECK(ReadIdleVramPolicy(ini) == IdleVramPolicy::FreeFeature);
+    CHECK(WritePrivateProfileStringW(L"NeuralHelper", L"IdleVramPolicy", L"keep", ini.c_str()) != FALSE);
+    CHECK(ReadIdleVramPolicy(ini) == IdleVramPolicy::KeepFeature);
+    // A typo in a settings file is not worth refusing to render over; the arm
+    // that actually ran is still on the launch line and in the receipt.
+    CHECK(WritePrivateProfileStringW(L"NeuralHelper", L"IdleVramPolicy", L"freee", ini.c_str()) != FALSE);
+    CHECK(ReadIdleVramPolicy(ini) == IdleVramPolicy::KeepFeature);
+    CHECK(ReadIdleVramPolicy({}) == IdleVramPolicy::KeepFeature);
+    std::filesystem::remove(ini, error);
+
+    // And the policy is not part of what decides whether a helper is reusable:
+    // two jobs that differ only in it must still reuse one process, because a
+    // relaunch here would cost the residency it is being measured against.
+    const resident_helper::HelperKey key =
+        resident_helper::MakeHelperKey(L"C:\\runtime", "digest", "settings");
+    CHECK(resident_helper::PlanForJob({true, key}, key) == resident_helper::HelperPlan::Reuse);
+}
+
+// --- A resident helper as a real process, killed while holding a job -------
+
+// Live processes this one started. Every helper is this executable re-run
+// inside a kill-on-close job object, so anything still alive here is exactly
+// the orphan that safety net exists to prevent - a process holding a GPU and
+// a runtime lease that no player is left to end.
+size_t LiveChildProcesses()
+{
+    const DWORD self = GetCurrentProcessId();
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    size_t alive = 0;
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == self || entry.th32ParentProcessID != self) continue;
+            const HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, entry.th32ProcessID);
+            if (!process) continue;
+            // A terminated process is signalled, so this counts the ones that
+            // are genuinely still running rather than the snapshot's leftovers.
+            if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT) ++alive;
+            CloseHandle(process);
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return alive;
+}
+
+// Bounded settle, because the launcher returns as soon as it has terminated
+// the job object and the kernel retires the last process a moment later. An
+// orphan never leaves, so this still fails for the case it is written against.
+size_t LiveChildProcessesAfterSettling()
+{
+    for (int attempt = 0; attempt < 40 && LiveChildProcesses(); ++attempt) {
+        std::this_thread::sleep_for(50ms);
+    }
+    return LiveChildProcesses();
+}
+
+uint64_t FailureInjectionAttempts(std::wstring_view token)
+{
+    std::error_code error;
+    const auto size = std::filesystem::file_size(FailureInjectionCounterPath(token), error);
+    return error ? 0 : static_cast<uint64_t>(size);
+}
+
+resident_helper::HelperKey ResidentTestKey()
+{
+    return resident_helper::MakeHelperKey(L"C:\\neural-runtime", "runtime-digest", "settings-digest");
+}
+
+NeuralRenderRequest ResidentRequest(std::wstring_view source, uint64_t jobId)
+{
+    NeuralRenderRequest request = TestRequest(source);
+    request.jobId = jobId;
+    return request;
+}
+
+void idle_vram_samples_reach_the_receipt_under_both_policies_test()
+{
+    using resident_helper::IdleVramPolicy;
+    for (const IdleVramPolicy policy : {IdleVramPolicy::KeepFeature, IdleVramPolicy::FreeFeature}) {
+        ResidentNeuralHelper helper(policy);
+        CHECK(helper.IdleVramPolicyInForce() == policy);
+        NeuralJobHooks hooks;
+        resident_helper::HelperPlan plan{};
+        const NeuralRenderResult first = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+            ResidentRequest(L"resident-source.mkv", 1), hooks, {}, &plan);
+        CHECK(first.ok);
+        CHECK(plan == resident_helper::HelperPlan::Launch);
+        // What the process is holding once its render went quiet, which is the
+        // figure residency parks, and the arm it was launched under - proof
+        // the policy crossed the launch line into another process.
+        CHECK_EQ(FakeResidentRunner::kParkedMiB, first.timing.postJobLocalVramMiB);
+        CHECK(first.timing.idleVramPolicy == policy);
+        // No idle period preceded the first job a process serves, so there is
+        // no idle figure rather than a measured zero.
+        CHECK_EQ(uint64_t{0}, first.timing.idleLocalVramMiB);
+
+        // Past the helper's idle grace, so the next job's receipt carries what
+        // the policy left parked while nothing was running.
+        std::this_thread::sleep_for(400ms);
+        const NeuralRenderResult second = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+            ResidentRequest(L"resident-source.mkv", 2), hooks, {}, &plan);
+        CHECK(second.ok);
+        CHECK(plan == resident_helper::HelperPlan::Reuse);
+        CHECK_EQ(policy == IdleVramPolicy::FreeFeature ? FakeResidentRunner::kFreedMiB
+                                                       : FakeResidentRunner::kParkedMiB,
+                 second.timing.idleLocalVramMiB);
+        CHECK_EQ(FakeResidentRunner::kParkedMiB, second.timing.postJobLocalVramMiB);
+        CHECK(second.timing.idleVramPolicy == policy);
+        helper.Release();
+    }
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+}
+
+// P1.24. A helper that has decided to exit - the idle timeout, or retiring
+// after a job - tears down while still alive with its command pipe open.
+// Resident() saw a live process, so the next job was sent to it, written
+// successfully and never read; the helper exited 0 with no result and the job
+// failed as "incomplete metadata", which is never relaunched. The retiring
+// exit now has its own code, and the job goes to a fresh helper.
+void a_job_sent_to_a_retiring_helper_goes_to_a_fresh_one_test()
+{
+    std::vector<resident_helper::HelperPlan> accepted;
+    size_t restarts = 0;
+    NeuralJobHooks hooks;
+    hooks.accepted = [&](resident_helper::HelperPlan plan) { accepted.push_back(plan); };
+    // Not a crash: nothing was rendered, so nothing is superseded and no
+    // recovery probe or relaunch budget is spent on it.
+    hooks.segments.onRestart = [&] { ++restarts; };
+    ResidentNeuralHelper helper;
+    resident_helper::HelperPlan plan{};
+    const NeuralRenderResult first = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(L"resident-retire-source.mkv", 21), hooks, {}, &plan);
+    CHECK(first.ok);
+    CHECK(plan == resident_helper::HelperPlan::Launch);
+    // Still alive, tearing down: the parent has every reason to reuse it.
+    CHECK(helper.Resident());
+    accepted.clear();
+    const NeuralRenderResult second = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(L"resident-source.mkv", 22), hooks, {}, &plan);
+    CHECK(second.ok);
+    CHECK(second.failure == NeuralRenderFailure::None);
+    CHECK_EQ(uint64_t{22}, second.jobId);
+    CHECK(plan == resident_helper::HelperPlan::Reuse);
+    CHECK_EQ(size_t{0}, restarts);
+    // Handed to the retiring helper, then to the one launched in its place.
+    CHECK_EQ(size_t{2}, accepted.size());
+    if (accepted.size() == 2) {
+        CHECK(accepted[0] == resident_helper::HelperPlan::Reuse);
+        CHECK(accepted[1] == resident_helper::HelperPlan::Launch);
+    }
+    helper.Release();
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+}
+
+// P1.33. A job argument longer than a command frame carries - a source path
+// past 2048 characters - was refused by the resident helper with no fallback.
+// It runs single-shot instead, where the arguments are the command line.
+void a_job_too_long_for_a_command_frame_runs_single_shot_test()
+{
+    NeuralJobHooks hooks;
+    ResidentNeuralHelper helper;
+    resident_helper::HelperPlan plan{};
+    const std::wstring longSource = std::wstring(2100, L'a') + L".mkv";
+    const NeuralRenderResult result = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(longSource, 31), hooks, {}, &plan);
+    CHECK(plan == resident_helper::HelperPlan::SingleShot);
+    CHECK(result.ok);
+    CHECK_EQ(uint64_t{31}, result.jobId);
+    CHECK(!helper.Resident());
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+}
+
+void killed_resident_helper_restarts_once_and_completes_the_job_test()
+{
+    ResetFailureInjection(L"crash-once");
+    size_t restarts = 0;
+    NeuralJobHooks hooks;
+    hooks.segments.onRestart = [&] { ++restarts; };
+    ResidentNeuralHelper helper;
+    const NeuralRenderResult result = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(L"resident-crash-once-source.mkv", 7), hooks);
+    // The observable outcome: the job the first helper died holding is
+    // finished by its replacement, under the job's own identity.
+    CHECK(result.ok);
+    CHECK(!result.cancelled);
+    CHECK(result.failure == NeuralRenderFailure::None);
+    CHECK_EQ(uint64_t{7}, result.jobId);
+    // Two helper processes took the job and no more: one controlled restart.
+    CHECK_EQ(uint64_t{2}, FailureInjectionAttempts(L"crash-once"));
+    // The replacement rendered the range again from frame zero, so anything
+    // the dead helper published is discarded rather than spliced onto.
+    CHECK_EQ(size_t{1}, restarts);
+    helper.Release();
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+    ResetFailureInjection(L"crash-once");
+}
+
+void second_kill_fails_closed_with_a_reason_and_leaves_no_orphan_test()
+{
+    NeuralJobHooks hooks;
+    ResidentNeuralHelper helper;
+    const NeuralRenderResult result = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(L"resident-crash-always-source.mkv", 9), hooks);
+    // Closed, once, with something a user can be shown: the bounded relaunch
+    // is spent and the detail says so rather than the render retrying forever.
+    CHECK(!result.ok);
+    CHECK(!result.cancelled);
+    CHECK(result.failure == NeuralRenderFailure::RetryExhausted);
+    CHECK(result.detail.find(L"did not recover after 2 attempt(s)") != std::wstring::npos);
+    CHECK(!helper.Resident());
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+}
+
+void recovery_probe_refusal_fails_closed_instead_of_relaunching_test()
+{
+    // A probe that refuses between the death and the relaunch is what a TDR
+    // that took the runtime with it looks like from here. The one relaunch is
+    // not spent on it: a second render on a runtime that can no longer arm
+    // feature 18 buys a second identical crash instead of a reason.
+    ResetFailureInjection(L"crash-once");
+    CHECK(SetEnvironmentVariableW(L"DLSSVIDEOPLAYER_FAKE_PREFLIGHT", L"refused") != FALSE);
+    NeuralJobHooks hooks;
+    ResidentNeuralHelper helper;
+    const NeuralRenderResult result = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(L"resident-crash-once-source.mkv", 11), hooks);
+    CHECK(SetEnvironmentVariableW(L"DLSSVIDEOPLAYER_FAKE_PREFLIGHT", nullptr) != FALSE);
+    CHECK(!result.ok);
+    CHECK(!result.cancelled);
+    CHECK(result.failure == NeuralRenderFailure::Preflight);
+    // The reason shown is the probe's, not a repeat of the crash.
+    CHECK(result.detail.find(L"610.47 minimum") != std::wstring::npos);
+    // Exactly one helper process ever took the job: the replacement the crash
+    // would otherwise have earned was never launched.
+    CHECK_EQ(uint64_t{1}, FailureInjectionAttempts(L"crash-once"));
+    CHECK(!helper.Resident());
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+    ResetFailureInjection(L"crash-once");
+}
+
+// P0.14: a terminal message of the wrong kind, through the real pump and the
+// real acceptance on every path that reads one. A resident job answered with a
+// preflight receipt used to stop the pump as "completed" and then copy the
+// job's result out of an empty optional; a single-shot job and a probe read
+// the stray frame as a silence. All three are a helper saying something this
+// parent did not ask, which is malformed, and none of them is accepted.
+void a_terminal_message_of_the_wrong_kind_is_malformed_on_every_path_test()
+{
+    NeuralJobHooks hooks;
+    ResidentNeuralHelper helper;
+    const NeuralRenderResult resident = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(L"resident-preflight-answer-source.mkv", 13), hooks);
+    CHECK(!resident.ok);
+    CHECK(!resident.cancelled);
+    CHECK(resident.failure == NeuralRenderFailure::Protocol);
+    CHECK_EQ(uint64_t{13}, resident.jobId);
+    CHECK(resident.detail == L"The isolated neural helper returned malformed metadata.");
+    // Nothing that helper says afterwards can be trusted, so it is not kept.
+    CHECK(!helper.Resident());
+    helper.Release();
+
+    const NeuralRenderResult single = RunNeuralWorker(CurrentExecutable(),
+        ResidentRequest(L"preflight-answer-source.mkv", 14));
+    CHECK(!single.ok);
+    CHECK(single.failure == NeuralRenderFailure::Protocol);
+    CHECK_EQ(uint64_t{14}, single.jobId);
+    CHECK(single.detail == L"The isolated neural helper returned malformed metadata.");
+
+    CHECK(SetEnvironmentVariableW(L"DLSSVIDEOPLAYER_FAKE_PREFLIGHT", L"result") != FALSE);
+    const NeuralPreflightResult probe = RunNeuralPreflight(CurrentExecutable());
+    CHECK(SetEnvironmentVariableW(L"DLSSVIDEOPLAYER_FAKE_PREFLIGHT", nullptr) != FALSE);
+    CHECK(!probe.ok);
+    CHECK(!probe.cancelled);
+    CHECK(probe.json.empty());
+    CHECK(probe.detail == L"The neural preflight helper returned malformed metadata.");
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+}
+
+// A job thread that threw was caught and reported as a Preflight failure: the
+// parent accepted it as the job's verdict, never relaunched it, and showed the
+// user a preflight problem. It is a crash. A single-shot helper says so in its
+// Result; a resident one writes nothing and exits with its own code, because
+// a Result written between jobs would be read by the next job as its own.
+void a_helper_that_throws_mid_job_is_relaunched_as_a_crash_test()
+{
+    const NeuralRenderResult reported = neural_worker_detail::WorkerThrewResult(41);
+    CHECK(!reported.ok);
+    CHECK(!reported.cancelled);
+    CHECK(reported.failure == NeuralRenderFailure::WorkerCrashed);
+    CHECK_EQ(uint64_t{41}, reported.jobId);
+    CHECK(kWorkerThrewExitCode != 0 && kWorkerThrewExitCode != kRetiredExitCode &&
+          kWorkerThrewExitCode != neural_worker_detail::kConfigurationChangedExitCode);
+
+    const auto crashRecoveries = [](const std::vector<NeuralRenderProgress>& updates) {
+        return std::ranges::count_if(updates, [](const NeuralRenderProgress& update) {
+            return update.phase == NeuralRenderPhase::Recovering &&
+                   update.recovering == NeuralRenderFailure::WorkerCrashed;
+        });
+    };
+
+    ResetFailureInjection(L"threw-once");
+    std::vector<NeuralRenderProgress> progress;
+    size_t restarts = 0;
+    NeuralSegmentSink sink;
+    sink.onRestart = [&] { ++restarts; };
+    const NeuralRenderResult single = RunNeuralWorker(CurrentExecutable(),
+        ResidentRequest(L"threw-once-source.mkv", 41),
+        [&](const NeuralRenderProgress& update) { progress.push_back(update); }, {}, sink);
+    CHECK(single.ok);
+    CHECK(single.failure == NeuralRenderFailure::None);
+    CHECK_EQ(uint64_t{41}, single.jobId);
+    CHECK_EQ(uint64_t{2}, FailureInjectionAttempts(L"threw-once"));
+    CHECK_EQ(size_t{1}, restarts);
+    CHECK_EQ(std::ptrdiff_t{1}, crashRecoveries(progress));
+    ResetFailureInjection(L"threw-once");
+
+    progress.clear();
+    restarts = 0;
+    NeuralJobHooks hooks;
+    hooks.progress = [&](const NeuralRenderProgress& update) { progress.push_back(update); };
+    hooks.segments.onRestart = [&] { ++restarts; };
+    ResidentNeuralHelper helper;
+    const NeuralRenderResult resident = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(L"resident-threw-once-source.mkv", 42), hooks);
+    CHECK(resident.ok);
+    CHECK(resident.failure == NeuralRenderFailure::None);
+    CHECK_EQ(uint64_t{42}, resident.jobId);
+    CHECK_EQ(uint64_t{2}, FailureInjectionAttempts(L"threw-once"));
+    CHECK_EQ(size_t{1}, restarts);
+    CHECK_EQ(std::ptrdiff_t{1}, crashRecoveries(progress));
+    helper.Release();
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+    ResetFailureInjection(L"threw-once");
+}
+
+// The same exception between jobs. A resident helper that threw while idle
+// wrote an unsolicited Result with job id 0 and exited 0, and the next job -
+// sent while it was still tearing down - read that Result as its own failure.
+// With nothing written, that job meets a crash and is relaunched instead.
+void a_resident_helper_that_throws_while_idle_does_not_fail_the_next_job_test()
+{
+    NeuralJobHooks hooks;
+    ResidentNeuralHelper helper;
+    resident_helper::HelperPlan plan{};
+    const NeuralRenderResult first = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(L"resident-threw-when-idle-source.mkv", 51), hooks, {}, &plan);
+    CHECK(first.ok);
+    CHECK(plan == resident_helper::HelperPlan::Launch);
+    // Past the 150 ms grace, when the fake's idle sample throws, and inside the
+    // 600 ms it stays alive afterwards: the parent has every reason to reuse it.
+    std::this_thread::sleep_for(300ms);
+    CHECK(helper.Resident());
+    const NeuralRenderResult second = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(L"resident-source.mkv", 52), hooks, {}, &plan);
+    CHECK(second.ok);
+    CHECK(second.failure == NeuralRenderFailure::None);
+    CHECK_EQ(uint64_t{52}, second.jobId);
+    helper.Release();
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+}
+
+// A single-shot helper's pump stops at its Result, and the process used to be
+// ended there with its exit code assumed to be 0, so a helper that failed after
+// reporting - a short write of its own, a crash in teardown - went unnoticed.
+// It is given a bounded moment to exit and judged on its code; one that does
+// not exit in that moment is still ended promptly and judged on its result.
+void a_helper_that_fails_after_its_result_is_judged_on_its_exit_code_test()
+{
+    const NeuralRenderResult failed = RunNeuralWorker(CurrentExecutable(),
+        TestRequest(L"result-then-exit-nonzero-source.mkv"), {}, {}, {}, 0);
+    CHECK(!failed.ok);
+    CHECK(!failed.cancelled);
+    CHECK(failed.failure == NeuralRenderFailure::RetryExhausted);
+    CHECK(failed.detail.find(L"exited with code 3 after reporting its result") != std::wstring::npos);
+
+    const auto started = std::chrono::steady_clock::now();
+    const NeuralRenderResult lingering = RunNeuralWorker(CurrentExecutable(),
+        TestRequest(L"result-then-linger-source.mkv"));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(lingering.ok);
+    CHECK(lingering.failure == NeuralRenderFailure::None);
+    // The helper sleeps 20 s after its result; anything near that is a wait
+    // on its exit that the grace was meant to bound.
+    CHECK(elapsed < 10s);
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+}
+
+// An exception out of the parent's own code while a single-shot helper runs -
+// a progress, segment or timeline callback - unwound past the raw handles the
+// launcher held: the job object leaked, its kill-on-close never fired, and the
+// helper outlived the call holding the GPU.
+void a_throwing_progress_callback_still_ends_the_helper_test()
+{
+    bool threw = false;
+    try {
+        RunNeuralWorker(CurrentExecutable(), TestRequest(L"progress-then-hang-source.mkv"),
+            [](const NeuralRenderProgress&) { throw std::runtime_error("progress callback"); });
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    // The helper sleeps 20 s; only the launcher ending it gets it out of here.
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+}
+
+// The resident counterpart. A callback that threw out of the pump left the
+// session in place with its helper still running the abandoned job, so the
+// next job was handed to that same helper and read the abandoned job's
+// Result as its own - a "different job" Identity failure. The session is
+// dropped on the way out, and the next job gets a fresh helper.
+void a_throwing_progress_callback_drops_the_resident_session_test()
+{
+    NeuralJobHooks hooks;
+    hooks.progress = [](const NeuralRenderProgress&) { throw std::runtime_error("progress callback"); };
+    ResidentNeuralHelper helper;
+    bool threw = false;
+    try {
+        helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+                      ResidentRequest(L"resident-progress-then-slow-source.mkv", 61), hooks);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(!helper.Resident());
+
+    hooks.progress = {};
+    resident_helper::HelperPlan plan{};
+    const NeuralRenderResult next = helper.RunJob(CurrentExecutable(), ResidentTestKey(),
+        ResidentRequest(L"resident-source.mkv", 62), hooks, {}, &plan);
+    CHECK(next.ok);
+    CHECK(next.failure == NeuralRenderFailure::None);
+    CHECK_EQ(uint64_t{62}, next.jobId);
+    CHECK(plan == resident_helper::HelperPlan::Launch);
+    // Exactly the one helper serving the second job is still alive.
+    CHECK_EQ(size_t{1}, LiveChildProcesses());
+    helper.Release();
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+}
+
+// The processCreated hook runs once the suspended helper is in its job, so a
+// hook that throws takes the helper with the job object - but the process and
+// thread handles CreateProcess returned were raw and leaked, two per launch.
+void a_throwing_process_created_hook_leaks_no_handles_test()
+{
+    const auto throwOnCreate = [] {
+        try {
+            RunNeuralWorker(CurrentExecutable(), TestRequest(L"valid-source.mkv"), {}, {}, {},
+                            kDefaultCrashRelaunchLimit,
+                            [] { throw std::runtime_error("processCreated"); });
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        return false;
+    };
+    // Once first, so whatever a first launch opens for good is not counted.
+    CHECK(throwOnCreate());
+    DWORD before = 0;
+    CHECK(GetProcessHandleCount(GetCurrentProcess(), &before) != FALSE);
+    constexpr DWORD kLaunches = 8;
+    for (DWORD launch = 0; launch < kLaunches; ++launch) CHECK(throwOnCreate());
+    DWORD after = 0;
+    CHECK(GetProcessHandleCount(GetCurrentProcess(), &after) != FALSE);
+    // A leak is two handles a launch; a little slack for the rest of the process.
+    CHECK(after < before + kLaunches);
+    CHECK_EQ(size_t{0}, LiveChildProcessesAfterSettling());
+}
+
+} // namespace
+
+int wmain(int argc, wchar_t** argv)
+{
+    if (argc > 1 && (std::wstring_view(argv[1]) == L"--neural-worker" ||
+                     std::wstring_view(argv[1]) == L"--neural-preflight")) return RunFakeWorker(argc, argv);
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--real-worker") return RunRealWorker(argc, argv);
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--real-preflight") return RunRealPreflight(argc, argv);
+    // A parent that dies immediately, for the resident helper's second
+    // orphan-safety mechanism. It has to be a real process handle: the wait it
+    // exercises is a wait on one.
+    if (argc > 1 && std::wstring_view(argv[1]) == L"--exit-now") return 0;
+    test_support::ContainChildProcesses();
+    SetEnvironmentVariableW(kTestRunVariable, std::to_wstring(GetCurrentProcessId()).c_str());
+    nonexistent_helper_fails_test();
+    helper_main_parser_accepts_normal_and_restarted_contracts_test();
+    the_frame_rate_reaches_the_helper_exactly_test();
+    temporal_settings_reach_the_helper_only_off_their_defaults_test();
+    benchmark_guide_sources_leave_the_shared_parser_canonical_test();
+    guide_files_round_trip_the_estimator_grid_bit_for_bit_test();
+    cancellation_of_running_child_is_bounded_test();
+    a_still_running_helper_is_not_reported_as_exit_code_259_test();
+    a_shutdown_frame_to_an_unread_pipe_gives_up_instead_of_hanging_test();
+    a_shutdown_frame_to_a_reading_pipe_is_taken_test();
+    one_metadata_drain_pass_stops_on_its_budget_test();
+    an_empty_metadata_pipe_is_not_a_spent_budget_test();
+    cancellation_is_bounded_even_when_the_helper_floods_the_pipe_test();
+    helper_messages_reach_the_parent_without_a_poll_interval_test();
+    malformed_or_truncated_results_are_rejected_test();
+    valid_result_preserves_all_verification_fields_test();
+    request_fields_reach_the_helper_intact_test();
+    crashed_helper_is_relaunched_at_most_once_test();
+    relaunched_helper_writes_its_segments_under_a_name_of_its_own_test();
+    preflight_receipt_round_trips_and_restarts_once_test();
+    preflight_failure_detail_comes_from_the_receipt_diagnosis_test();
+    identity_encoding_keeps_different_names_different_test();
+    a_preflight_verdict_is_not_shared_by_two_non_ascii_gpu_names_test();
+    a_stored_preflight_verdict_is_whole_or_absent_test();
+    crash_handler_writes_its_dump_and_line_from_prepared_paths_test();
+    an_unreadable_helper_exit_code_is_not_a_clean_exit_test();
+    preflight_latch_holds_one_verdict_per_runtime_identity_test();
+    runtime_lease_admits_one_holder_per_directory_test();
+    protocol_rejects_inconsistent_results_test();
+    segment_messages_round_trip_and_reject_malformed_test();
+    metadata_reader_accepts_segments_before_the_result_test();
+    a_malformed_stream_never_re_delivers_what_it_handed_out_test();
+    a_stream_ends_only_with_the_terminal_message_it_expects_test();
+    running_helper_publishes_segments_before_its_result_test();
+    configuration_retry_is_sequential_and_bounded_test();
+    helper_cold_start_timeline_reaches_the_parent_test();
+    cold_start_timeline_messages_are_validated_test();
+    render_metrics_messages_are_validated_test();
+    resident_loop_answers_hello_and_serves_jobs_test();
+    resident_loop_refuses_frames_it_cannot_trust_test();
+    resident_loop_exits_on_shutdown_and_on_idle_test();
+    resident_loop_cancel_stops_the_job_and_keeps_the_helper_test();
+    resident_loop_late_cancel_does_not_cancel_the_next_job_test();
+    resident_loop_ends_when_the_parent_dies_test();
+    resident_loop_stops_serving_after_an_invalidating_job_test();
+    resident_launch_line_is_a_helper_and_not_a_job_test();
+    resident_loop_samples_once_per_idle_stretch_test();
+    idle_vram_policy_is_named_on_the_launch_line_and_read_from_the_player_ini_test();
+    idle_vram_samples_reach_the_receipt_under_both_policies_test();
+    a_job_sent_to_a_retiring_helper_goes_to_a_fresh_one_test();
+    a_job_too_long_for_a_command_frame_runs_single_shot_test();
+    killed_resident_helper_restarts_once_and_completes_the_job_test();
+    second_kill_fails_closed_with_a_reason_and_leaves_no_orphan_test();
+    recovery_probe_refusal_fails_closed_instead_of_relaunching_test();
+    a_terminal_message_of_the_wrong_kind_is_malformed_on_every_path_test();
+    a_helper_that_throws_mid_job_is_relaunched_as_a_crash_test();
+    a_resident_helper_that_throws_while_idle_does_not_fail_the_next_job_test();
+    a_helper_that_fails_after_its_result_is_judged_on_its_exit_code_test();
+    a_throwing_progress_callback_still_ends_the_helper_test();
+    a_throwing_progress_callback_drops_the_resident_session_test();
+    a_throwing_process_created_hook_leaks_no_handles_test();
+    return test_support::failure_count == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}

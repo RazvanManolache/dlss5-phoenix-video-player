@@ -1,0 +1,41 @@
+name: Source and packaging contracts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reject tracked models, runtime binaries and generated files
+        run: |
+          $files = @(git ls-files)
+          if ($LASTEXITCODE) { throw 'Cannot inspect tracked files.' }
+          $bad = @($files | Where-Object {
+            $_ -match '(^|/)(build[^/]*|artifacts|Payload|__pycache__)/' -or
+            $_ -match '\.(dll|exe|pdb|obj|lib|exp|pyc|zip|7z|rar|mp4|mkv|mov|npy|npz|onnx|safetensors)$'
+          })
+          if ($bad.Count) { throw ('External/generated payload tracked: ' + ($bad -join ', ')) }
+      - name: Check package source identity rules
+        run: ./tests/PackageSourceIdentity.ps1 -Tools (Join-Path $PWD tools)
+      - name: Check hardware-report validation rules without hardware
+        run: ./tests/HardwareTestReport.ps1 -Tools (Join-Path $PWD tools)
+      - name: Check failed helper staging preserves existing files
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          python tests/test_media_helper_staging.py
+          if ($LASTEXITCODE) { throw 'Helper staging checks failed.' }

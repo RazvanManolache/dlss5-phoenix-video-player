@@ -1,0 +1,1909 @@
+#include "MediaPipeline.h"
+#include "ExportPipeline.h"
+#include "PlatformPaths.h"
+#include "HardErrorSuppression.h"
+#include "KillOnCloseJob.h"
+#include "MediaTools.h"
+#include "Utf8Text.h"
+
+#include <windows.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <functional>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+#include <thread>
+
+std::wstring FrameRateText(double fps)
+{
+    std::wostringstream output;
+    output << std::fixed << std::setprecision(6) << fps;
+    std::wstring value = output.str();
+    while (value.size() > 1 && value.back() == L'0') value.pop_back();
+    if (!value.empty() && value.back() == L'.') value.pop_back();
+    return value;
+}
+
+namespace {
+
+struct ExportFormat {
+    bool mkv{}, mp4{}, gif{}, png{}, jpeg{};
+    bool Valid() const { return mkv || mp4 || gif || png || jpeg; }
+};
+
+ExportFormat ExportFormatFor(const std::filesystem::path& output)
+{
+    const auto extension = output.extension().wstring();
+    const auto is = [&](const wchar_t* candidate) { return _wcsicmp(extension.c_str(), candidate) == 0; };
+    return {is(L".mkv"), is(L".mp4"), is(L".gif"), is(L".png"), is(L".jpg") || is(L".jpeg")};
+}
+
+bool ValidRangeSeconds(double value) { return std::isfinite(value) && value >= 0.0; }
+
+// The source's streams beside the video, for every export that carries them:
+// "Save converted video", the frame-generation mux it serves, and the stage
+// export's last step. Each stream of input 1 that `container` keeps is mapped
+// by its own index, in file order, and its codec is named by OUTPUT index,
+// which is known only once each stream has been kept or left out; the video is
+// output 0. ExportStreamActionFor is the one judge of what is kept, so a track
+// the container cannot hold is converted or left out instead of failing an
+// export that may have spent an hour on the GPU - a blind `-map 1:s?` failed
+// every MKV of an MP4's timed text and every MP4 of a disc's picture
+// subtitles. `encodeAudio` encodes every kept audio stream to AAC where the
+// policy would copy it, which is what "Save converted video" gives MP4.
+void AppendSourceStreams(ExportContainer container, const std::vector<MediaStreamInfo>& sourceStreams,
+                         bool encodeAudio, std::vector<std::wstring>& arguments, std::vector<std::wstring>& codecs)
+{
+    uint32_t outputIndex = 1;
+    for (const MediaStreamInfo& stream : sourceStreams) {
+        ExportStreamAction action = ExportStreamActionFor(container, stream.type, stream.codec);
+        if (action == ExportStreamAction::Drop) continue;
+        if (encodeAudio && stream.type == "audio") action = ExportStreamAction::EncodeAac;
+        arguments.insert(arguments.end(), {L"-map", L"1:" + std::to_wstring(stream.index)});
+        const std::wstring specifier = std::to_wstring(outputIndex++);
+        switch (action) {
+        case ExportStreamAction::EncodeAac:
+            codecs.insert(codecs.end(), {L"-c:" + specifier, L"aac", L"-b:" + specifier, L"192k"});
+            break;
+        case ExportStreamAction::ToMovText: codecs.insert(codecs.end(), {L"-c:" + specifier, L"mov_text"}); break;
+        case ExportStreamAction::ToSubrip: codecs.insert(codecs.end(), {L"-c:" + specifier, L"srt"}); break;
+        default: codecs.insert(codecs.end(), {L"-c:" + specifier, L"copy"}); break;
+        }
+    }
+}
+
+// What an export says about the subtitles AppendSourceStreams left out, or
+// nothing when it kept them all. A track that is not there is reported, never
+// silent.
+std::wstring LeftOutSubtitlesNote(ExportContainer container, const std::vector<MediaStreamInfo>& sourceStreams)
+{
+    uint32_t leftOut = 0;
+    for (const MediaStreamInfo& stream : sourceStreams)
+        if (stream.type == "subtitle" &&
+            ExportStreamActionFor(container, stream.type, stream.codec) == ExportStreamAction::Drop)
+            ++leftOut;
+    if (!leftOut) return {};
+    return std::to_wstring(leftOut) + L" subtitle stream(s) this container cannot hold were left out.";
+}
+
+// Wall-clock budget for a child that works through `mediaSeconds` of media at
+// no worse than `slowdown` times real time, over a floor that covers spawn,
+// probe and short media. A child still running past it is wedged, not slow, so
+// each caller picks a slowdown its own worst case sits well inside.
+std::chrono::milliseconds MediaDeadline(double mediaSeconds, std::chrono::minutes floor, double slowdown)
+{
+    const double bounded = std::isfinite(mediaSeconds) && mediaSeconds > 0.0
+        ? std::min(mediaSeconds, 7.0 * 86400.0) : 0.0;
+    return floor + std::chrono::milliseconds(std::llround(bounded * slowdown * 1000.0));
+}
+
+// An exclusively created, empty file in `folder` for an export to be written
+// into and then renamed onto its final name, or an empty path when none could
+// be created. Beside the output rather than in a temporary folder, so the
+// final rename never crosses a volume.
+// A player that crashed mid-export left its staging file beside the user's
+// output, named for its process and never removed (P1.33). Only a file whose
+// owner is certainly gone is taken: its process id names no running process.
+// A live process under that id - the owner, or another one reusing the number
+// - keeps its file, and so does anything this process could still be writing.
+void SweepAbandonedExportStaging(const std::filesystem::path& folder)
+{
+    std::error_code error;
+    std::filesystem::directory_iterator entries(folder, error);
+    if (error) return;
+    for (const auto& entry : entries) {
+        const auto owner = ExportStagingOwner(entry.path().filename().wstring());
+        if (!owner || *owner == GetCurrentProcessId()) continue;
+        if (const HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, *owner)) {
+            const bool exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+            CloseHandle(process);
+            if (!exited) continue;
+        } else if (GetLastError() != ERROR_INVALID_PARAMETER) {
+            continue;  // Access denied: a process runs under that id.
+        }
+        std::error_code ignored;
+        if (entry.is_regular_file(ignored)) std::filesystem::remove(entry.path(), ignored);
+    }
+}
+
+std::filesystem::path ReserveExportStaging(const std::filesystem::path& folder)
+{
+    static std::atomic_uint64_t sequence{};
+    SweepAbandonedExportStaging(folder);
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        const auto candidate = folder / (L".dlss-export-" +
+            std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) +
+            L"-" + std::to_wstring(sequence.fetch_add(1)) + L".tmp");
+        HANDLE file = CreateFileW(candidate.c_str(), GENERIC_WRITE, 0, nullptr,
+                                  CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+            return candidate;
+        }
+        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) break;
+    }
+    return {};
+}
+
+// Removes the staging file on every way out that did not publish it.
+struct ExportStagingFile {
+    std::filesystem::path path;
+    ExportStagingFile() = default;
+    ExportStagingFile(const ExportStagingFile&) = delete;
+    ExportStagingFile& operator=(const ExportStagingFile&) = delete;
+    ~ExportStagingFile() { if (!path.empty()) { std::error_code ignored; std::filesystem::remove(path, ignored); } }
+};
+
+std::filesystem::path FindHelper(const std::filesystem::path& directory,
+                                 std::wstring_view name)
+{
+    // What the pipeline writes goes into the cache and the user's files, so
+    // it only ever runs the packaged tools, never an arbitrary one from PATH.
+    return media_tools::FindTool(directory, name, media_tools::Fallback::None);
+}
+
+std::wstring QuoteArgument(std::wstring_view value)
+{
+    std::wstring quoted(1, L'"');
+    size_t slashes = 0;
+    for (const wchar_t character : value) {
+        if (character == L'\\') { ++slashes; continue; }
+        if (character == L'"') {
+            quoted.append(slashes * 2 + 1, L'\\');
+            quoted.push_back(L'"');
+        } else {
+            quoted.append(slashes, L'\\');
+            quoted.push_back(character);
+        }
+        slashes = 0;
+    }
+    quoted.append(slashes * 2, L'\\');
+    quoted.push_back(L'"');
+    return quoted;
+}
+
+std::wstring CommandLine(const std::filesystem::path& executable,
+                         const std::vector<std::wstring>& arguments)
+{
+    std::wstring result = QuoteArgument(executable.wstring());
+    // Every local input ffmpeg or ffprobe is handed here reaches files only.
+    for (const auto& argument : media_tools::GuardLocalInputs(arguments)) {
+        result.push_back(L' ');
+        result += QuoteArgument(argument);
+    }
+    return result;
+}
+
+struct ChildProcess {
+    HANDLE process{};
+    HANDLE job{};
+    HANDLE stdinWrite{};
+
+    ~ChildProcess() { Stop(); }
+
+    void Stop()
+    {
+        if (stdinWrite) { CloseHandle(stdinWrite); stdinWrite = nullptr; }
+        if (process) {
+            if (WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
+                if (job) TerminateJobObject(job, 1); else TerminateProcess(process, 1);
+                WaitForSingleObject(process, 2000);
+            }
+            CloseHandle(process);
+            process = nullptr;
+        }
+        if (job) { CloseHandle(job); job = nullptr; }
+    }
+
+    bool Start(const std::filesystem::path& executable,
+               const std::vector<std::wstring>& arguments, bool pipeInput)
+    {
+        Stop();
+        HANDLE stdinRead = nullptr;
+        if (pipeInput) {
+            SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+            // The caller's frame queue provides the real buffering; a larger pipe just
+            // holds nonpaged pool.
+            if (!CreatePipe(&stdinRead, &stdinWrite, &security,
+                            static_cast<DWORD>(kChildStdinPipeBytes))) return false;
+            if (!SetHandleInformation(stdinWrite, HANDLE_FLAG_INHERIT, 0)) {
+                CloseHandle(stdinRead); CloseHandle(stdinWrite); stdinWrite = nullptr; return false;
+            }
+        }
+        job = CreateKillOnCloseJob();
+        if (!job) {
+            if (stdinRead) CloseHandle(stdinRead);
+            if (stdinWrite) { CloseHandle(stdinWrite); stdinWrite = nullptr; }
+            return false;
+        }
+        STARTUPINFOEXW startup{};
+        startup.StartupInfo.cb = sizeof(startup);
+        std::vector<uint8_t> attributes;
+        if (pipeInput) {
+            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            startup.StartupInfo.hStdInput = stdinRead;
+            startup.StartupInfo.hStdOutput = nullptr;
+            startup.StartupInfo.hStdError = nullptr;
+            SIZE_T attributeBytes = 0;
+            InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeBytes);
+            if (attributeBytes == 0) {
+                CloseHandle(stdinRead); Stop(); return false;
+            }
+            attributes.resize(attributeBytes);
+            startup.lpAttributeList = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(attributes.data());
+            HANDLE inherited = stdinRead;
+            if (!InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0,
+                                                   &attributeBytes)) {
+                CloseHandle(stdinRead); Stop(); return false;
+            }
+            if (!UpdateProcThreadAttribute(startup.lpAttributeList, 0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited, sizeof(inherited),
+                    nullptr, nullptr)) {
+                DeleteProcThreadAttributeList(startup.lpAttributeList);
+                CloseHandle(stdinRead); Stop(); return false;
+            }
+        }
+        PROCESS_INFORMATION info{};
+        std::wstring command = CommandLine(executable, arguments);
+        const ScopedHardErrorSuppression noHardErrorDialog;
+        const BOOL created = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr,
+            pipeInput ? TRUE : FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED |
+            (pipeInput ? EXTENDED_STARTUPINFO_PRESENT : 0), nullptr,
+            executable.parent_path().c_str(), &startup.StartupInfo, &info);
+        if (startup.lpAttributeList) DeleteProcThreadAttributeList(startup.lpAttributeList);
+        if (stdinRead) CloseHandle(stdinRead);
+        if (!created) { Stop(); return false; }
+        process = info.hProcess;
+        if (!AssignProcessToJobObject(job, process)) {
+            TerminateProcess(process, 1); CloseHandle(info.hThread); Stop(); return false;
+        }
+        if (ResumeThread(info.hThread) == static_cast<DWORD>(-1)) {
+            CloseHandle(info.hThread); Stop(); return false;
+        }
+        CloseHandle(info.hThread);
+        return true;
+    }
+
+    DWORD Wait(std::stop_token stop, bool& cancelled)
+    {
+        cancelled = false;
+        if (!process) return static_cast<DWORD>(-1);
+        // Blocked, not polled. The 25 ms timeout existed only so the loop could
+        // look at the stop token, and it cost up to 25 ms on every segment
+        // publish - latency that lands directly in the live session's buffer
+        // budget, where a segment becoming visible late is a frame the playhead
+        // does not have. Cancellation arrives as an event this same wait
+        // observes, so the token stays exactly as responsive as it was.
+        const HANDLE cancelEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (cancelEvent) {
+            // Fires immediately if stop was already requested before this was
+            // constructed, which is the case the old loop caught on its first
+            // timeout.
+            //
+            // Scoped to the wait, so the callback is unregistered before any
+            // path below closes the event: the early return used to close it
+            // with `wake` still live, and a stop arriving then signalled a
+            // closed - possibly reused - handle.
+            DWORD wait = WAIT_FAILED;
+            {
+                std::stop_callback wake(stop, [cancelEvent] { SetEvent(cancelEvent); });
+                const HANDLE waited[2] = { process, cancelEvent };
+                wait = WaitForMultipleObjects(2, waited, FALSE, INFINITE);
+            }
+            if (wait == WAIT_OBJECT_0 + 1) {
+                cancelled = true;
+                if (job) TerminateJobObject(job, 1); else TerminateProcess(process, 1);
+                WaitForSingleObject(process, 2000);
+            } else if (wait != WAIT_OBJECT_0) {
+                CloseHandle(cancelEvent);
+                return static_cast<DWORD>(-1);
+            }
+        } else {
+            // An event could not be created: keep the original poll rather than
+            // fail a publish over it.
+            for (;;) {
+                const DWORD wait = WaitForSingleObject(process, 25);
+                if (wait == WAIT_OBJECT_0) break;
+                if (wait != WAIT_TIMEOUT) return static_cast<DWORD>(-1);
+                if (stop.stop_requested()) {
+                    cancelled = true;
+                    if (job) TerminateJobObject(job, 1); else TerminateProcess(process, 1);
+                    WaitForSingleObject(process, 2000);
+                    break;
+                }
+            }
+        }
+        if (cancelEvent) CloseHandle(cancelEvent);
+        DWORD exitCode = static_cast<DWORD>(-1);
+        GetExitCodeProcess(process, &exitCode);
+        CloseHandle(process); process = nullptr;
+        if (job) { CloseHandle(job); job = nullptr; }
+        return exitCode;
+    }
+};
+
+class OwnedHandle {
+public:
+    explicit OwnedHandle(HANDLE value=nullptr):value_(value){}
+    ~OwnedHandle(){if(value_)CloseHandle(value_);}
+    OwnedHandle(const OwnedHandle&)=delete;
+    OwnedHandle& operator=(const OwnedHandle&)=delete;
+    HANDLE get()const{return value_;}
+private:
+    HANDLE value_{};
+};
+
+struct CaptureResult {
+    bool started{};
+    bool cancelled{};
+    // The child outlived its deadline and was killed; exitCode is the kill code.
+    bool timedOut{};
+    DWORD exitCode{static_cast<DWORD>(-1)};
+    std::string output;
+};
+
+// `deadline` is wall-clock from spawn: a child that has not exited by then is
+// terminated with its job, the same way a cancel ends it. Every call site sets
+// one from what its child is doing, because the alternative was a hung ffmpeg
+// holding a worker thread for as long as the process lived.
+CaptureResult RunCapture(const std::filesystem::path& executable,
+                         const std::vector<std::wstring>& arguments,
+                         std::stop_token stop, std::chrono::milliseconds deadline,
+                         size_t limit = 1024 * 1024,
+                         const std::function<void(std::string_view)>& consume = {})
+{
+    CaptureResult result;
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    HANDLE readPipe = nullptr;
+    HANDLE writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &security, 0)) return result;
+    if (!SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0)) {
+        CloseHandle(readPipe); CloseHandle(writePipe); return result;
+    }
+    HANDLE job = CreateKillOnCloseJob();
+    if (!job) { CloseHandle(readPipe); CloseHandle(writePipe); return result; }
+    SIZE_T attributeBytes = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeBytes);
+    if (attributeBytes == 0) {
+        CloseHandle(readPipe); CloseHandle(writePipe); CloseHandle(job); return result;
+    }
+    std::vector<std::byte> attributeStorage(attributeBytes);
+    auto* attributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributeStorage.data());
+    if (!InitializeProcThreadAttributeList(attributeList, 1, 0, &attributeBytes)) {
+        CloseHandle(readPipe); CloseHandle(writePipe); CloseHandle(job); return result;
+    }
+    if (!UpdateProcThreadAttribute(attributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   &writePipe, sizeof(writePipe), nullptr, nullptr)) {
+        DeleteProcThreadAttributeList(attributeList);
+        CloseHandle(readPipe); CloseHandle(writePipe); CloseHandle(job); return result;
+    }
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = nullptr;
+    startup.StartupInfo.hStdOutput = writePipe;
+    startup.StartupInfo.hStdError = writePipe;
+    startup.lpAttributeList = attributeList;
+    PROCESS_INFORMATION info{};
+    std::wstring command = CommandLine(executable, arguments);
+    const ScopedHardErrorSuppression noHardErrorDialog;
+    const BOOL created = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr,
+        TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+        nullptr, executable.parent_path().c_str(), &startup.StartupInfo, &info);
+    DeleteProcThreadAttributeList(attributeList);
+    CloseHandle(writePipe);
+    if (!created) { CloseHandle(readPipe); CloseHandle(job); return result; }
+    result.started = true;
+    if (!AssignProcessToJobObject(job, info.hProcess) ||
+        ResumeThread(info.hThread) == static_cast<DWORD>(-1)) {
+        TerminateProcess(info.hProcess, 1);
+    }
+    CloseHandle(info.hThread);
+    const auto expiry = std::chrono::steady_clock::now() + deadline;
+    std::array<char, 4096> buffer{};
+    bool done = false;
+    bool captureOverflowed = false;
+    while (!done) {
+        DWORD available = 0;
+        if (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available) {
+            DWORD read = 0;
+            const DWORD wanted = std::min<DWORD>(available, static_cast<DWORD>(buffer.size()));
+            if (ReadFile(readPipe, buffer.data(), wanted, &read, nullptr) && read) {
+                if (consume) consume(std::string_view(buffer.data(), read));
+                else if (result.output.size() + read > limit) {
+                    captureOverflowed = true;
+                    TerminateJobObject(job, 1);
+                    result.output.clear();
+                    break;
+                }
+                else result.output.append(buffer.data(), read);
+            }
+        }
+        const DWORD wait = WaitForSingleObject(info.hProcess, 10);
+        if (wait == WAIT_OBJECT_0) done = true;
+        else if (wait != WAIT_TIMEOUT) { TerminateJobObject(job, 1); done = true; }
+        if (stop.stop_requested() || std::chrono::steady_clock::now() >= expiry) {
+            if (stop.stop_requested()) result.cancelled = true;
+            else result.timedOut = true;
+            TerminateJobObject(job, 1);
+            WaitForSingleObject(info.hProcess, 2000);
+            done = true;
+        }
+    }
+    // What the child wrote before it ended is in the pipe now; read it without
+    // waiting for end-of-file. End-of-file needs every write end closed, and a
+    // child spawned elsewhere that inherited this one (P1.28) kept a probe's
+    // drain - and the cancel that joined it on the UI thread - waiting until
+    // that child died. Bounded as well, for a writer nothing here knows about.
+    const auto drainUntil = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (;;) {
+        DWORD available = 0, read = 0;
+        if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) || !available) break;
+        if (std::chrono::steady_clock::now() >= drainUntil) break;
+        const DWORD wanted = std::min<DWORD>(available, static_cast<DWORD>(buffer.size()));
+        if (!ReadFile(readPipe, buffer.data(), wanted, &read, nullptr) || !read)
+            break;
+        if (consume) consume(std::string_view(buffer.data(), read));
+        else if (!captureOverflowed) {
+            if (result.output.size() + read <= limit) result.output.append(buffer.data(), read);
+            else {
+                captureOverflowed = true;
+                result.output.clear();
+            }
+        }
+    }
+    GetExitCodeProcess(info.hProcess, &result.exitCode);
+    CloseHandle(readPipe); CloseHandle(info.hProcess); CloseHandle(job);
+    return result;
+}
+
+bool ParseUnsigned(std::string_view value, uint64_t& output)
+{
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), output);
+    return parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size();
+}
+
+std::wstring MaterializeDiagnostic(std::string_view output, const MaterializeRequest& request)
+{
+    std::wstring text = utf8_text::ToWide(output);
+    if (text.empty()) return {};
+    // Remove exact inputs first (including any whitespace), then URLs emitted
+    // after redirects. Redact before shortening so signed query strings cannot
+    // survive a truncated URL match.
+    for (const auto& url : {request.videoUrl, request.audioUrl}) {
+        if (url.empty()) continue;
+        size_t position = 0;
+        while ((position = text.find(url, position)) != std::wstring::npos) {
+            text.replace(position, url.size(), L"[input]");
+            position += 7;
+        }
+    }
+    for (size_t position = 0; position < text.size();) {
+        if (_wcsnicmp(text.c_str() + position, L"https://", 8) == 0 ||
+            _wcsnicmp(text.c_str() + position, L"http://", 7) == 0) {
+            const size_t end = text.find_first_of(L" \t\r\n\"'", position);
+            text.replace(position, (end == std::wstring::npos ? text.size() : end) - position, L"[url]");
+            position += 5;
+        } else ++position;
+    }
+    if (text.size() > 2048) text.resize(2048);
+    return text;
+}
+
+} // namespace
+
+namespace media_pipeline_detail {
+
+MediaProgressReader::MediaProgressReader(std::function<void(const MediaDownloadProgress&)> onProgress,
+                                         std::function<void(std::string_view)> onDiagnostic)
+    : onProgress_(std::move(onProgress)), onDiagnostic_(std::move(onDiagnostic)) {}
+
+void MediaProgressReader::Consume(std::string_view chunk, Clock::time_point now)
+{
+    for (const char character : chunk) {
+        if (character == '\n') EndLine(now);
+        // A progress line is a few dozen bytes at most. Bounding the buffer the
+        // way ProbeMedia bounds its own stops a newline-free error flood from
+        // growing it without limit, and dropping the remainder of such a line
+        // matches what the capture did with an oversized diagnostic before.
+        else if (partial_.size() < 64 * 1024) partial_.push_back(character);
+        else oversizedLine_ = true;
+    }
+}
+
+void MediaProgressReader::Finish(Clock::time_point now)
+{
+    if (!partial_.empty()) EndLine(now);
+    Report(now, true);
+}
+
+void MediaProgressReader::EndLine(Clock::time_point now)
+{
+    if (!oversizedLine_) {
+        std::string_view line(partial_);
+        // FFmpeg writes the stream in text mode, so the newline arrives as CRLF.
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        ReadLine(line, now);
+    }
+    partial_.clear();
+    oversizedLine_ = false;
+}
+
+void MediaProgressReader::ReadLine(std::string_view line, Clock::time_point now)
+{
+    const size_t equals = line.find('=');
+    const std::string_view key = equals == std::string_view::npos
+        ? std::string_view{} : line.substr(0, equals);
+    // Progress keys are lowercase identifiers. Anything else on this pipe is
+    // FFmpeg's own error text, which the caller still needs verbatim, so the
+    // parser hands it straight back instead of swallowing it.
+    const bool progressKey = !key.empty() && std::ranges::all_of(key, [](char character) {
+        return (character >= 'a' && character <= 'z') ||
+               (character >= '0' && character <= '9') || character == '_';
+    });
+    if (!progressKey) {
+        if (onDiagnostic_) onDiagnostic_(line);
+        return;
+    }
+    const std::string_view value = line.substr(equals + 1);
+    uint64_t integer = 0;
+    if (key == "total_size") {
+        // Every value may legitimately read "N/A" until the muxer has written
+        // something; an unparsable one leaves the last known figure standing.
+        if (ParseUnsigned(value, integer)) { latest_.bytes = integer; pending_ = true; }
+    } else if (key == "out_time_us" || key == "out_time_ms") {
+        // out_time_ms is the older spelling of the same field and also carries
+        // microseconds: a long-standing FFmpeg misnomer, not a different unit.
+        if (ParseUnsigned(value, integer)) {
+            latest_.seconds = static_cast<double>(integer) / 1000000.0;
+            pending_ = true;
+        }
+    } else if (key == "progress") {
+        // Each block is terminated by progress=continue, or progress=end for the
+        // last one, which is reported whatever the rate limit would have said.
+        Report(now, value == "end");
+    }
+}
+
+void MediaProgressReader::Report(Clock::time_point now, bool force)
+{
+    if (!pending_ || !onProgress_) return;
+    if (!force && reported_ && now - lastReport_ < kMediaProgressInterval) return;
+    pending_ = false;
+    reported_ = true;
+    lastReport_ = now;
+    onProgress_(latest_);
+}
+
+} // namespace media_pipeline_detail
+
+std::vector<std::wstring> BuildMaterializeArguments(const MaterializeRequest& request)
+{
+    // -progress makes FFmpeg write a machine-readable key/value block to stdout
+    // about twice a second, which is the only stable way to see a stream copy
+    // advance: the human-readable stderr line is carriage-return separated and
+    // reformatted between builds. It is a global option, so it belongs here with
+    // the others, ahead of the first input.
+    std::vector<std::wstring> arguments{
+        L"-hide_banner", L"-nostdin", L"-loglevel", L"error", L"-progress", L"pipe:1",
+        L"-y", L"-xerror",
+    };
+    const auto appendInput = [&](const std::wstring& input) {
+        if (_wcsnicmp(input.c_str(), L"http://", 7) == 0 ||
+            _wcsnicmp(input.c_str(), L"https://", 8) == 0) {
+            // A resolved stream is https and nothing else. The certificate is
+            // verified explicitly rather than by the build's default, which the
+            // next ffmpeg pin may change, and the whitelist is the minimal set a
+            // direct or HLS googlevideo stream reaches (https -> tls -> tcp), so a
+            // plain http:// input or a redirect to one fails in the child. Proven
+            // against the shipped ffmpeg on a live videoplayback URL and a live
+            // hls_playlist manifest; dropping tcp, or offering file:/http:, is
+            // refused with "Protocol ... not on whitelist".
+            arguments.insert(arguments.end(), {
+                L"-tls_verify", L"1", L"-protocol_whitelist", L"https,tls,tcp",
+                L"-rw_timeout", L"10000000", L"-reconnect", L"1", L"-reconnect_on_network_error", L"1",
+                L"-reconnect_on_http_error", L"429,5xx", L"-reconnect_delay_max", L"2",
+                L"-reconnect_max_retries", L"3", L"-reconnect_delay_total_max", L"8", L"-respect_retry_after", L"0"});
+        }
+        arguments.insert(arguments.end(), {L"-i", input});
+    };
+    appendInput(request.videoUrl);
+    if (!request.audioUrl.empty()) {
+        appendInput(request.audioUrl);
+    }
+    arguments.insert(arguments.end(), {L"-map", L"0:v:0"});
+    if (!request.audioUrl.empty()) {
+        arguments.insert(arguments.end(), {L"-map", L"1:a:0?"});
+    } else {
+        arguments.insert(arguments.end(), {L"-map", L"0:a:0?"});
+    }
+    arguments.insert(arguments.end(), {
+        L"-c", L"copy", L"-f", L"matroska", request.output.wstring()});
+    return arguments;
+}
+
+std::vector<std::wstring> BuildEncoderArguments(const EncoderSpec& spec,
+                                                const std::filesystem::path& output)
+{
+    std::vector<std::wstring> arguments{
+        L"-hide_banner", L"-nostdin", L"-loglevel", L"error", L"-y"};
+    if (spec.kind == EncoderKind::HevcNvenc) {
+        // hevc_nvenc creates its CUDA context when the first frame reaches the encoder,
+        // not at spawn. A segmented job spawns one ffmpeg per 2 s segment, so that cost
+        // landed inside every segment's first frames: measured 126 ms of stdin not being
+        // drained, of which the render loop absorbed ~55 ms as a stall. Creating the
+        // device up front moves the context creation to the spawn, which the segment
+        // writer already does a whole segment ahead; the remaining ~59 ms is the NVENC
+        // session itself. The option fails only where hevc_nvenc would fail too.
+        arguments.insert(arguments.end(), {L"-init_hw_device", L"cuda=cu:0"});
+    }
+    const bool nv12 = spec.pixelFormat == EncoderPixelFormat::Nv12;
+    const bool p010 = spec.pixelFormat == EncoderPixelFormat::P010;
+    arguments.insert(arguments.end(), {
+        L"-f", L"rawvideo",
+        L"-pix_fmt", nv12 ? L"nv12" : p010 ? L"p010le" : L"bgra",
+        L"-video_size", std::to_wstring(spec.width) + L"x" + std::to_wstring(spec.height),
+        L"-framerate", FrameRateText(spec.fps), L"-i", L"pipe:0", L"-an",
+    });
+    // The 10-bit rungs (EncoderQuality). Their frames arrive as P010 from the GPU
+    // capture; only an odd output size, which P010 cannot describe, still arrives as
+    // 8-bit BGRA, and is then written 4:4:4 so no row or column is lost to chroma
+    // subsampling - the same rule the 8-bit software path applies.
+    const bool tenBit = EncoderQualityIsTenBit(spec.quality);
+    const bool odd = spec.width % 2 || spec.height % 2;
+    const std::wstring highCq = std::to_wstring(kHighRungCq);
+    if (spec.kind == EncoderKind::Ffv1) {
+        // Level 3 with range coding, every frame a keyframe so a segment join or a
+        // seek never needs a neighbour, and per-slice CRCs so a damaged file says so.
+        // 16 slices keep a 4K frame's encode spread across the cores.
+        arguments.insert(arguments.end(), {
+            L"-c:v", L"ffv1", L"-level", L"3", L"-coder", L"1", L"-context", L"1", L"-g", L"1",
+            L"-slices", L"16", L"-slicecrc", L"1",
+            L"-pix_fmt", odd ? L"yuv444p10le" : L"yuv420p10le"});
+    } else if (spec.kind == EncoderKind::HevcNvenc) {
+        arguments.insert(arguments.end(), {
+            L"-c:v", L"hevc_nvenc", L"-preset",
+            L"p" + std::to_wstring(std::clamp<uint32_t>(spec.nvencPreset, 1u, 7u)), L"-tune", L"hq",
+            L"-rc", L"vbr", L"-cq", tenBit ? highCq : std::wstring(L"16"), L"-b:v", L"0",
+            // The export loop measured 3.7 ms/frame of encoder back pressure at
+            // 2578x1080 once decode moved to NVDEC: one NVENC session at p7 caps near
+            // 150 fps. Split-frame encoding stripes each frame across every NVENC
+            // engine the GPU has. `auto` and not `forced`: ffmpeg hands the value
+            // straight to nvEncInitializeEncoder with no capability gate, so a driver
+            // or GPU that refuses forced split encode fails encoder open, which this
+            // player only sees as a broken pipe on the first frame - and that retries
+            // the whole render on libx264, silently turning an HEVC export into H.264.
+            // `auto` lets the encoder enable striping where it is supported and
+            // costs only the preset/tune pairs NVENC declines to stripe.
+            L"-split_encode_mode", L"auto"});
+        // Every rung lifts NVENC's own ceiling. With -b:v 0 and no -maxrate, VBR is not
+        // constant quality at all on detailed content: measured at 1080p it held every
+        // CQ from 10 to 20 at the same ~10.7 Mbit/s (43.7 KiB a frame) on the fractal
+        // clip, and ~32 Mbit/s at 4K, while the uncapped encode wanted 53.7 and 161 - the
+        // Standard rung scored VMAF 81.7 there against its own lossless render. 800M is
+        // far above anything CQ 14 or 16 asked for and within what NVENC accepts (1000M
+        // with a 2000M buffer was refused as an invalid parameter), so it never binds and
+        // -cq alone sets the quality. This changed the Standard rung's bytes, which is
+        // why its key term names it (CaptureQualityIdentityTerm).
+        arguments.insert(arguments.end(), {L"-maxrate", L"800M", L"-bufsize", L"800M"});
+        if (tenBit) arguments.insert(arguments.end(), {L"-profile:v", L"main10", L"-pix_fmt", L"p010le"});
+        // NVENC takes NV12 and P010 as they stand, so an already-converted capture
+        // reaches the encoder without ffmpeg touching a single pixel.
+        else arguments.insert(arguments.end(), {L"-pix_fmt", nv12 ? L"nv12" : L"yuv420p"});
+    } else {
+        arguments.insert(arguments.end(), {
+            L"-c:v", L"libx264", L"-preset", L"slow", L"-crf", tenBit ? highCq : std::wstring(L"16"),
+            // x264 has no NV12 input, but deinterleaving one plane is far cheaper than
+            // converting a whole BGRA frame.
+            L"-pix_fmt", tenBit ? (odd ? L"yuv444p10le" : L"yuv420p10le")
+                                : ((!nv12 && odd) ? L"yuv444p" : L"yuv420p")});
+    }
+    // Colorimetry is stated on BOTH paths, and the BGRA path is additionally told which
+    // matrix to convert with. Until 2026-09-15 only the GPU-converted path said
+    // anything, on the reasoning that only there does the player pick the matrix - but
+    // the consequence was that every default-path render shipped untagged, and ffmpeg's
+    // own conversion picks BT.601 for an untagged rawvideo input (measured on this
+    // build: a pure-red BGRA frame comes back Y=81 U=90 V=240, the 601 prediction, at
+    // 1080p and 480p alike). A BT.709 source therefore became a file that declared
+    // nothing and carried 601 pixels, which any consumer assuming 709 for HD decodes
+    // wrongly.
+    //
+    // Note the order of the two halves: labelling alone would be worse than the defect,
+    // because tagging 601 pixels as BT.709 turns an ambiguous file into a confidently
+    // wrong one. So the BGRA path converts with an explicit matrix and range, and only
+    // then is the result labelled.
+    //
+    // The tags themselves have to be stamped on the frames. On this FFmpeg (9.0.1) the
+    // `-color_primaries`/`-color_trc` output options below land the matrix and range and
+    // silently drop those two: tested in Matroska and MP4, with hevc_nvenc and with
+    // libx264, and with an `hevc_metadata` bitstream filter. Frame-side properties from
+    // the filter graph are what survive, which is why `setparams` carries all four on
+    // both paths.
+    //
+    // `setparams` is metadata-only and measured pixel-exact, which is what allows it on
+    // the NV12 path: through a lossless rawvideo round trip, `plain`, `null`,
+    // `setparams=range=tv`, `setparams=color_primaries/color_trc` and the full form all
+    // reproduce the input frame byte for byte. A lossy probe suggested otherwise once -
+    // that was the encoder reacting to the filter graph, not the filter touching a
+    // sample. `scale` stays off the NV12 path, because those pixels are already BT.709
+    // limited range from the capture shader and converting them again is the entire cost
+    // that path exists to avoid.
+    constexpr const wchar_t* kSetColorParams =
+        L"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv";
+    // P010 is converted by the same capture shaders at 10 bits, so it is BT.709 limited
+    // range already and takes the NV12 treatment.
+    if (nv12 || p010) {
+        arguments.insert(arguments.end(), {L"-vf", kSetColorParams});
+    } else {
+        arguments.insert(arguments.end(), {
+            L"-vf", std::wstring(L"scale=out_color_matrix=bt709:out_range=tv,") + kSetColorParams});
+    }
+    arguments.insert(arguments.end(), {
+        L"-colorspace", L"bt709", L"-color_primaries", L"bt709",
+        L"-color_trc", L"bt709", L"-color_range", L"tv"});
+    arguments.insert(arguments.end(), {L"-f", L"matroska", output.wstring()});
+    return arguments;
+}
+
+CachedVideoMp4Path CachedVideoMp4PathFor(std::string_view codecName, std::string_view pixelFormat)
+{
+    // Every 10-bit format this player writes spells its depth in the name
+    // (p010le, yuv420p10le, yuv444p10le); an 8-bit one never does. Only a 10-bit
+    // file is one of the 10-bit rungs: an 8-bit FFV1 or HEVC is re-encoded exactly
+    // as every export before the ladder was.
+    const bool tenBit = pixelFormat.find("10") != std::string_view::npos;
+    if (tenBit && codecName == "ffv1") return CachedVideoMp4Path::Lossless10Bit;
+    if (tenBit && codecName == "hevc") return CachedVideoMp4Path::CopyHevc;
+    if (tenBit && codecName == "h264") return CachedVideoMp4Path::CopyH264;
+    return CachedVideoMp4Path::Reencode8Bit;
+}
+
+std::vector<std::wstring> BuildCachedExportArguments(const CachedExportRequest& request,
+                                                     const std::filesystem::path& staging,
+                                                     const std::vector<MediaStreamInfo>& sourceStreams,
+                                                     bool oddDimensions,
+                                                     CachedVideoMp4Path mp4Path,
+                                                     std::string_view tenBitPixelFormat)
+{
+    const ExportFormat format = ExportFormatFor(request.output);
+    std::vector<std::wstring> arguments{
+        // -y applies only to the exclusively reserved staging file we own.
+        L"-hide_banner", L"-nostdin", L"-loglevel", L"error", L"-xerror", L"-y",
+        L"-i", request.neuralVideo.wstring()};
+    if (format.mkv || format.mp4) {
+        // No trim here, ever, and the range fields are not read: a ranged
+        // export cuts the source's streams to the range first
+        // (CachedVideoExporter::Run) and hands this command the cut. The
+        // output -ss 0 this used to trim with applied to the neural video as
+        // well, and a stream-copied render with B-frames lost every frame to
+        // it (BuildStageExportMuxArguments has the mechanism).
+        // A cut keeps its own timeline (CachedExportRequest::sourceStartSeconds).
+        if (request.sourceStartSeconds > 0.0)
+            arguments.insert(arguments.end(), {L"-itsoffset", FrameRateText(request.sourceStartSeconds)});
+        arguments.insert(arguments.end(), {L"-i", request.sourceMedia.wstring(), L"-map", L"0:v:0"});
+        // Audio MP4 can hold is copied as it stands, and only the rest is
+        // encoded to AAC - the stage export's rule (P1.33). Every MP4 track
+        // used to be re-encoded at 192k, a generation of loss on audio the
+        // container could have carried untouched.
+        std::vector<std::wstring> codecs;
+        AppendSourceStreams(format.mkv ? ExportContainer::Matroska : ExportContainer::Mp4, sourceStreams,
+                            false, arguments, codecs);
+        arguments.insert(arguments.end(), {L"-map_metadata", L"1", L"-map_chapters", L"1"});
+        if (format.mkv) arguments.insert(arguments.end(), {L"-c:v", L"copy"});
+        else if (mp4Path == CachedVideoMp4Path::CopyHevc) {
+            // The High rung's 10-bit HEVC as it was written. hvc1 is the sample entry
+            // players look for; ffmpeg's default for a copied stream, hev1, is not.
+            arguments.insert(arguments.end(), {L"-c:v", L"copy", L"-tag:v", L"hvc1"});
+        } else if (mp4Path == CachedVideoMp4Path::CopyH264) {
+            // The same rung from the libx264 fallback: High 10, carried as it is.
+            arguments.insert(arguments.end(), {L"-c:v", L"copy"});
+        } else if (mp4Path == CachedVideoMp4Path::Lossless10Bit) {
+            // Lossless H.264 keeps the Lossless rung lossless in a container that
+            // cannot hold FFV1, at the render's own depth and chroma layout.
+            const std::wstring pixelFormat(tenBitPixelFormat.begin(), tenBitPixelFormat.end());
+            arguments.insert(arguments.end(), {L"-c:v", L"libx264", L"-preset", L"medium", L"-qp", L"0",
+                L"-pix_fmt", pixelFormat.empty() ? std::wstring(oddDimensions ? L"yuv444p10le" : L"yuv420p10le") : pixelFormat});
+        } else {
+            arguments.insert(arguments.end(), {L"-c:v", L"libx264", L"-preset", L"medium", L"-crf", L"18"});
+            if (oddDimensions) arguments.insert(arguments.end(), {L"-pix_fmt", L"yuv444p"});
+            else arguments.insert(arguments.end(), {L"-vf", L"pad=ceil(iw/2)*2:ceil(ih/2)*2", L"-pix_fmt", L"yuv420p"});
+        }
+        arguments.insert(arguments.end(), codecs.begin(), codecs.end());
+        // An anamorphic source's shape, which the render was encoded without.
+        if (!request.displayAspect.empty())
+            arguments.insert(arguments.end(), {L"-aspect:v:0", request.displayAspect});
+        if (format.mp4) arguments.insert(arguments.end(), {L"-movflags", L"+faststart", L"-f", L"mp4"});
+        else arguments.insert(arguments.end(), {L"-f", L"matroska"});
+    } else if (format.gif) {
+        arguments.insert(arguments.end(), {L"-filter_complex",
+            // Two-centisecond frames avoid the short-delay clamping performed
+            // by common GIF viewers. fps retains holds through the final delay.
+            L"[0:v:0]fps=50,split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=sierra2_4a[v]",
+            L"-map", L"[v]", L"-an", L"-loop", L"0", L"-fps_mode", L"passthrough", L"-f", L"gif"});
+    } else {
+        arguments.insert(arguments.end(), {L"-map", L"0:v:0", L"-frames:v", L"1", L"-an",
+            L"-c:v", format.png ? L"png" : L"mjpeg", L"-pix_fmt", format.png ? L"rgb24" : L"yuvj444p"});
+        if (format.jpeg) arguments.insert(arguments.end(), {L"-q:v", L"2"});
+        arguments.insert(arguments.end(), {L"-f", L"image2", L"-update", L"1"});
+    }
+    arguments.push_back(staging.wstring());
+    return arguments;
+}
+
+size_t ExpectedFrameBytes(const EncoderSpec& spec)
+{
+    if (spec.width == 0 || spec.height == 0 || !std::isfinite(spec.fps) || spec.fps <= 0.0)
+        return 0;
+    // The size the frames actually arrive at, which is 1.5 bytes per pixel once the
+    // capture is converted on the GPU. Assuming BGRA here rejected every NV12 frame
+    // the capture handed over as the wrong size.
+    if ((spec.pixelFormat == EncoderPixelFormat::Nv12 || spec.pixelFormat == EncoderPixelFormat::P010) &&
+        (spec.width % 2 || spec.height % 2))
+        return 0;
+    const uint64_t bytes = EncoderFrameBytes(spec.pixelFormat, spec.width, spec.height);
+    if (bytes > std::numeric_limits<size_t>::max()) return 0;
+    return static_cast<size_t>(bytes);
+}
+
+bool ShouldRetryWithSoftware(EncoderKind attempted, EncodeError error)
+{
+    if (attempted != EncoderKind::HevcNvenc) return false;
+    return error == EncodeError::StartFailed || error == EncodeError::WriteFailed ||
+           error == EncodeError::FinishFailed;
+}
+
+MediaMaterializer::MediaMaterializer(std::filesystem::path helperDirectory)
+    : helperDirectory_(std::move(helperDirectory)) {}
+
+MaterializeResult MediaMaterializer::Run(const MaterializeRequest& request, std::stop_token stop,
+                                         std::function<void(const MediaDownloadProgress&)> onProgress)
+{
+    if (stop.stop_requested())
+        return {false, MaterializeError::Cancelled, L"Source preparation was cancelled."};
+    if (request.videoUrl.empty() || request.output.empty() ||
+        !std::isfinite(request.expectedDurationSeconds) || request.expectedDurationSeconds < 0.0)
+        return {false, MaterializeError::InvalidRequest, L"Invalid media materialization request."};
+    const auto ffmpeg = FindHelper(helperDirectory_, L"ffmpeg.exe");
+    if (ffmpeg.empty()) return {false, MaterializeError::HelperMissing, L"FFmpeg is unavailable."};
+    // One pipe carries both the progress stream and FFmpeg's errors, so the
+    // reader feeds the caller's callback and hands every other line back here.
+    // The diagnostic keeps the capture's own limit semantics: once the collected
+    // text passes it the text is discarded rather than grown without bound.
+    constexpr size_t diagnosticLimit = 64 * 1024;
+    std::string diagnostic;
+    bool diagnosticOverflowed = false;
+    media_pipeline_detail::MediaProgressReader reader(std::move(onProgress),
+        [&](std::string_view line) {
+            if (diagnosticOverflowed) return;
+            if (diagnostic.size() + line.size() + 1 > diagnosticLimit) {
+                diagnosticOverflowed = true;
+                diagnostic.clear();
+                return;
+            }
+            diagnostic.append(line);
+            diagnostic.push_back('\n');
+        });
+    // A throttled stream copy runs near real time; four times that plus an
+    // hour is a child that stopped, not a slow connection (socket stalls are
+    // already cut at 10 s by -rw_timeout and the bounded reconnects).
+    const CaptureResult capture = RunCapture(ffmpeg, BuildMaterializeArguments(request), stop,
+        MediaDeadline(request.expectedDurationSeconds, std::chrono::hours{1}, 4.0),
+        diagnosticLimit, [&](std::string_view chunk) {
+            reader.Consume(chunk, std::chrono::steady_clock::now());
+        });
+    reader.Finish(std::chrono::steady_clock::now());
+    if (!capture.started)
+        return {false, MaterializeError::StartFailed, L"FFmpeg could not be started."};
+    if (capture.cancelled) return {false, MaterializeError::Cancelled, L"Source preparation was cancelled."};
+    if (capture.timedOut) return {false, MaterializeError::ProcessFailed, L"FFmpeg did not finish preparing the source in time."};
+    std::error_code error;
+    if (capture.exitCode != 0 || !std::filesystem::is_regular_file(request.output, error) || error) {
+        std::wstring detail = L"FFmpeg could not prepare the source (exit " + std::to_wstring(capture.exitCode) + L").";
+        const auto diagnosticText = MaterializeDiagnostic(diagnostic, request);
+        if (!diagnosticText.empty()) detail += L"\n" + diagnosticText;
+        return {false, MaterializeError::ProcessFailed, std::move(detail)};
+    }
+    if (request.expectedDurationSeconds > 0.0) {
+        const ProbeResult probe = ProbeMedia(helperDirectory_, request.output, stop);
+        if (stop.stop_requested())
+            return {false, MaterializeError::Cancelled, L"Source preparation was cancelled."};
+        // yt-dlp may round duration to a whole second. Keep the allowance fixed:
+        // a percentage would conceal increasingly large gaps on longer videos.
+        if (!probe.ok || probe.videoDuration100ns <= 0 ||
+            double(probe.videoDuration100ns) / 10000000.0 + 1.0 < request.expectedDurationSeconds)
+            return {false, MaterializeError::ProcessFailed,
+                L"The prepared source video is incomplete (expected " +
+                FrameRateText(request.expectedDurationSeconds) + L" seconds, measured " +
+                FrameRateText(double(probe.videoDuration100ns) / 10000000.0) + L" seconds)."};
+    }
+    return {true, MaterializeError::None, {}};
+}
+
+namespace {
+
+// Where a file's own timeline begins: the start time FFmpeg rebases the file
+// by when it is an input, read off the file rather than assumed. 0 for a file
+// with no timed packets ("N/A"); nothing when it could not be read.
+std::optional<double> MediaStartSeconds(const std::filesystem::path& helperDirectory,
+                                        const std::filesystem::path& media, std::stop_token stop)
+{
+    const auto ffprobe = FindHelper(helperDirectory, L"ffprobe.exe");
+    if (ffprobe.empty()) return std::nullopt;
+    // A header read.
+    const CaptureResult capture = RunCapture(ffprobe,
+        {L"-v", L"error", L"-show_entries", L"format=start_time",
+         L"-of", L"default=noprint_wrappers=1:nokey=1", L"-i", media.wstring()},
+        stop, std::chrono::minutes{1}, 4 * 1024);
+    if (!capture.started || capture.cancelled || capture.timedOut || capture.exitCode != 0) return std::nullopt;
+    std::string_view text = capture.output;
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.remove_suffix(1);
+    if (text == "N/A") return 0.0;
+    double seconds = 0.0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), seconds);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || !std::isfinite(seconds)) return std::nullopt;
+    return seconds;
+}
+
+// The first step of every ranged export - "Save converted video" and "Export
+// with DLSS stages" alike: the source's audio, subtitles, attachments and
+// chapters cut to the range on their own into `trimmed`, a Matroska staging
+// file beside the output, which the last step then reads in place of the
+// source. The rendered video is never part of it and the last step never
+// trims (BuildStageExportTrimArguments says why). `streams` is what the
+// source was listed to carry; on success it and `streamSource` describe what
+// the last step is to read instead - the cut, or the rendered video itself
+// when the source carries nothing to cut - and `streamSourceStart` where the
+// cut's own timeline begins, which the last step must keep rather than
+// rebase (StageExportMuxRequest::streamSourceStartSeconds).
+MaterializeResult CutSourceStreamsToRange(const std::filesystem::path& helperDirectory,
+                                          const std::filesystem::path& ffmpeg,
+                                          const StageExportMuxRequest& request,
+                                          double videoSeconds,
+                                          ExportStagingFile& trimmed,
+                                          std::filesystem::path& streamSource,
+                                          double& streamSourceStart,
+                                          std::vector<MediaStreamInfo>& streams,
+                                          std::stop_token stop)
+{
+    streamSourceStart = 0.0;
+    const auto cancelled = [] { return MaterializeResult{false, MaterializeError::Cancelled, L"The export was cancelled."}; };
+    const auto nothingToCut = [&] {
+        // Nothing beside the video to carry; the video's own (empty) metadata
+        // stands in for chapters that would describe the whole.
+        streamSource = request.video;
+        streams.clear();
+        return MaterializeResult{true, MaterializeError::None, {}};
+    };
+    if (streams.empty()) return nothingToCut();
+    trimmed.path = ReserveExportStaging(request.output.parent_path());
+    if (trimmed.path.empty())
+        return {false, MaterializeError::ProcessFailed, L"A temporary export file could not be created in the selected folder."};
+    const auto arguments = BuildStageExportTrimArguments(request, trimmed.path, streams);
+    if (arguments.empty()) return nothingToCut();
+    const CaptureResult trim = RunCapture(ffmpeg, arguments, stop,
+        MediaDeadline(videoSeconds, std::chrono::hours{1}, 4.0), 64 * 1024);
+    if (trim.cancelled || stop.stop_requested()) return cancelled();
+    if (!trim.started || trim.timedOut || trim.exitCode != 0) {
+        std::wstring detail = L"The source's audio and subtitles could not be cut to the rendered range.";
+        if (const std::wstring diagnostic = utf8_text::ToWide(trim.output); !diagnostic.empty())
+            detail += L"\n" + diagnostic;
+        return {false, MaterializeError::ProcessFailed, std::move(detail)};
+    }
+    const auto trimmedStreams = ListMediaStreams(helperDirectory, trimmed.path, stop);
+    if (stop.stop_requested()) return cancelled();
+    if (!trimmedStreams)
+        return {false, MaterializeError::ProcessFailed, L"The streams to carry into the export could not be listed."};
+    // The cut starts where its first packet landed after the seek - an audio
+    // packet boundary, 24 ms in on 48 kHz AAC - and not at zero.
+    const auto start = MediaStartSeconds(helperDirectory, trimmed.path, stop);
+    if (stop.stop_requested()) return cancelled();
+    if (!start || *start < 0.0)
+        return {false, MaterializeError::ProcessFailed, L"The cut of the source's audio and subtitles could not be inspected."};
+    streamSource = trimmed.path;
+    streamSourceStart = *start;
+    streams = *trimmedStreams;
+    return {true, MaterializeError::None, {}};
+}
+
+} // namespace
+
+CachedVideoExporter::CachedVideoExporter(std::filesystem::path helperDirectory)
+    : helperDirectory_(std::move(helperDirectory)) {}
+
+MaterializeResult CachedVideoExporter::Run(const CachedExportRequest& request, std::stop_token stop)
+{
+    const auto cancelled = [] {
+        return MaterializeResult{false, MaterializeError::Cancelled, L"Cached video export was cancelled."};
+    };
+    if (stop.stop_requested()) return cancelled();
+    const ExportFormat format = ExportFormatFor(request.output);
+    if (request.neuralVideo.empty() || request.sourceMedia.empty() || request.output.empty() || !format.Valid())
+        return {false, MaterializeError::InvalidRequest, L"Choose a new MKV, MP4, GIF, PNG or JPEG file."};
+    if (!ValidRangeSeconds(request.rangeStartSeconds) || !ValidRangeSeconds(request.rangeDurationSeconds))
+        return {false, MaterializeError::InvalidRequest, L"The export range is invalid."};
+    std::error_code error;
+    const auto neuralVideo = std::filesystem::absolute(request.neuralVideo, error);
+    if (error)
+        return {false, MaterializeError::InvalidRequest, L"The cached video path is unavailable."};
+    const auto sourceMedia = std::filesystem::absolute(request.sourceMedia, error);
+    if (error)
+        return {false, MaterializeError::InvalidRequest, L"The original source path is unavailable."};
+    for (const auto& input : {neuralVideo, sourceMedia}) {
+        if (!std::filesystem::is_regular_file(input, error) || error)
+            return {false, MaterializeError::InvalidRequest, L"The cached video or original source is unavailable."};
+    }
+    const auto output = std::filesystem::absolute(request.output, error);
+    if (error || !std::filesystem::is_directory(output.parent_path(), error) || error)
+        return {false, MaterializeError::InvalidRequest, L"The export folder is unavailable."};
+    // This also rejects input aliases, directories and reparse points. The final
+    // no-replace rename below closes the race with a file created during export.
+    if (GetFileAttributesW(output.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return {false, MaterializeError::InvalidRequest, L"The export file already exists. Choose a new filename."};
+    const auto ffmpeg = FindHelper(helperDirectory_, L"ffmpeg.exe");
+    if (ffmpeg.empty()) return {false, MaterializeError::HelperMissing, L"FFmpeg is unavailable."};
+    // Every format reads the cached video's length for the encode's deadline;
+    // MP4 also needs its parity for the 4:4:4 decision.
+    const ProbeResult neuralMetadata = ProbeMedia(helperDirectory_, neuralVideo, stop,
+                                                   MediaProbeMode::CachedMetadata);
+    if (stop.stop_requested()) return cancelled();
+    if (!neuralMetadata.ok)
+        return {false, MaterializeError::ProcessFailed, L"The cached neural media could not be inspected."};
+    const bool oddDimensions = neuralMetadata.width % 2 || neuralMetadata.height % 2;
+    // A 10-bit or lossless render keeps its rung in an MP4 export too.
+    const CachedVideoMp4Path mp4Path = CachedVideoMp4PathFor(neuralMetadata.codecName, neuralMetadata.pixelFormat);
+
+    ExportStagingFile staging;
+    staging.path = ReserveExportStaging(output.parent_path());
+    if (staging.path.empty())
+        return {false, MaterializeError::ProcessFailed, L"A temporary export file could not be created in the selected folder."};
+    if (stop.stop_requested()) return cancelled();
+    CachedExportRequest resolved = request;
+    resolved.neuralVideo = neuralVideo;
+    resolved.sourceMedia = sourceMedia;
+    // Every stream of the source is listed, whole or ranged, so each is
+    // carried as the container can hold it (AppendSourceStreams). What is left
+    // out is said of the source's own subtitles, before a range cut can set
+    // aside any that Matroska cannot hold either.
+    std::vector<MediaStreamInfo> streams;
+    std::wstring note;
+    if (format.mkv || format.mp4) {
+        auto listed = ListMediaStreams(helperDirectory_, sourceMedia, stop);
+        if (stop.stop_requested()) return cancelled();
+        if (!listed)
+            return {false, MaterializeError::ProcessFailed, L"The original source's streams could not be listed."};
+        streams = std::move(*listed);
+        note = LeftOutSubtitlesNote(format.mkv ? ExportContainer::Matroska : ExportContainer::Mp4, streams);
+    }
+    // A range is cut out of the source's own streams first, as the stage
+    // export's last step does, and the encode below reads that cut with no
+    // trim of its own. The output -ss 0 this used to trim with applied to the
+    // neural video too, and on a stream-copied render with B-frames - every
+    // NVENC render - it dropped every frame: a ranged MKV came out as audio
+    // over an empty video track.
+    ExportStagingFile trimmed;
+    if ((format.mkv || format.mp4) && (request.rangeStartSeconds > 0.0 || request.rangeDurationSeconds > 0.0)) {
+        std::filesystem::path streamSource;
+        double streamSourceStart = 0.0;
+        const MaterializeResult cut = CutSourceStreamsToRange(helperDirectory_, ffmpeg,
+            {neuralVideo, sourceMedia, output, request.rangeStartSeconds, request.rangeDurationSeconds},
+            double(neuralMetadata.duration100ns) / 10000000.0, trimmed, streamSource, streamSourceStart, streams, stop);
+        if (cut.error == MaterializeError::Cancelled) return cancelled();
+        if (!cut.ok) return cut;
+        resolved.sourceMedia = streamSource;
+        resolved.sourceStartSeconds = streamSourceStart;
+        resolved.rangeStartSeconds = resolved.rangeDurationSeconds = 0.0;
+    }
+    const auto arguments = BuildCachedExportArguments(resolved, staging.path, streams, oddDimensions, mp4Path,
+                                                      neuralMetadata.pixelFormat);
+    // Attachments (such as subtitle fonts) travel with the source subtitles
+    // into MKV. No subtitle is burned in.
+    // A software encode of a 4K render runs at a small fraction of real time;
+    // sixty times the media plus an hour is an encoder that hung, not one that
+    // is busy.
+    const CaptureResult capture = RunCapture(ffmpeg, arguments, stop,
+        MediaDeadline(double(neuralMetadata.duration100ns) / 10000000.0, std::chrono::hours{1}, 60.0),
+        64 * 1024);
+    if (capture.cancelled || stop.stop_requested()) return cancelled();
+    if (capture.timedOut)
+        return {false, MaterializeError::ProcessFailed, L"FFmpeg did not finish the export in time."};
+    if (!capture.started)
+        return {false, MaterializeError::StartFailed, L"FFmpeg could not be started."};
+    const auto bytes = std::filesystem::file_size(staging.path, error);
+    if (capture.exitCode != 0 || error || bytes == 0) {
+        std::wstring detail = L"FFmpeg could not export this media in the selected format.";
+        if (const std::wstring diagnostic = utf8_text::ToWide(capture.output); !diagnostic.empty())
+            detail += L"\n" + diagnostic;
+        return {false, MaterializeError::ProcessFailed, std::move(detail)};
+    }
+    if (stop.stop_requested()) return cancelled();
+    // Read back off the file before it is published, as MuxStageExport does
+    // (P1.33): a copy that lost packets still leaves its video track behind,
+    // and the file reads as a finished video until it is played. A GIF is
+    // resampled to its own frame rate and a picture is one frame, so only the
+    // two video containers are held to the render's count.
+    if (format.mkv || format.mp4) {
+        const ProbeResult renderedVideo = ProbeMedia(helperDirectory_, neuralVideo, stop);
+        const ProbeResult writtenVideo = ProbeMedia(helperDirectory_, staging.path, stop);
+        if (stop.stop_requested()) return cancelled();
+        if (!renderedVideo.ok || !writtenVideo.ok || writtenVideo.frameCount != renderedVideo.frameCount)
+            return {false, MaterializeError::ProcessFailed,
+                L"The export carries " + std::to_wstring(writtenVideo.frameCount) + L" of the " +
+                std::to_wstring(renderedVideo.frameCount) + L" rendered frames."};
+    }
+    if (!MoveFileExW(staging.path.c_str(), output.c_str(), MOVEFILE_WRITE_THROUGH))
+        return {false, MaterializeError::ProcessFailed,
+            L"The completed export could not be saved. Check folder access and choose a filename that does not already exist."};
+    staging.path.clear();
+    return {true, MaterializeError::None, std::move(note)};
+}
+
+struct RawVideoEncoder::Impl {
+    explicit Impl(std::filesystem::path directory) : helperDirectory(std::move(directory)) {}
+    std::filesystem::path helperDirectory;
+    std::filesystem::path output;
+    EncoderSpec spec;
+    size_t frameBytes{};
+    ChildProcess process;
+    bool active{};
+};
+
+RawVideoEncoder::RawVideoEncoder(std::filesystem::path helperDirectory)
+    : impl_(std::make_unique<Impl>(std::move(helperDirectory))) {}
+
+RawVideoEncoder::~RawVideoEncoder() { Cancel(); }
+
+EncodeError RawVideoEncoder::Start(const EncoderSpec& spec,
+                                   const std::filesystem::path& output)
+{
+    Cancel();
+    const size_t bytes = ExpectedFrameBytes(spec);
+    if (bytes == 0 || output.empty()) return EncodeError::InvalidSpecification;
+    const auto ffmpeg = FindHelper(impl_->helperDirectory, L"ffmpeg.exe");
+    if (ffmpeg.empty()) return EncodeError::HelperMissing;
+    if (!impl_->process.Start(ffmpeg, BuildEncoderArguments(spec, output), true))
+        return EncodeError::StartFailed;
+    impl_->spec = spec;
+    impl_->output = output;
+    impl_->frameBytes = bytes;
+    impl_->active = true;
+    return EncodeError::None;
+}
+
+EncodeError RawVideoEncoder::WriteFrame(std::span<const uint8_t> bgra, std::stop_token stop)
+{
+    if (!impl_->active || !impl_->process.stdinWrite) return EncodeError::WriteFailed;
+    if (bgra.size() != impl_->frameBytes) return EncodeError::InvalidFrame;
+    HANDLE interruptJob=nullptr;
+    if(!impl_->process.job||!DuplicateHandle(GetCurrentProcess(),impl_->process.job,
+        GetCurrentProcess(),&interruptJob,0,FALSE,DUPLICATE_SAME_ACCESS))
+        return EncodeError::WriteFailed;
+    OwnedHandle interruptHandle(interruptJob);
+    std::stop_callback interrupt(stop,[job=interruptHandle.get()]{
+        TerminateJobObject(job,ERROR_CANCELLED);
+    });
+    // When the job is terminated under a blocked WriteFile, the kernel completes that
+    // write as a success for every byte it had accepted rather than failing it, so the
+    // stop has to be re-checked after each write, not only before. With a single
+    // remaining chunk the loop would otherwise report None for a frame nobody read.
+    size_t offset = 0;
+    while (offset < bgra.size()) {
+        if (stop.stop_requested()) { Cancel(); return EncodeError::Cancelled; }
+        const DWORD wanted = static_cast<DWORD>(std::min<size_t>(bgra.size() - offset, 16 * 1024 * 1024));
+        DWORD written = 0;
+        if (!WriteFile(impl_->process.stdinWrite, bgra.data() + offset, wanted, &written, nullptr) ||
+            written == 0) {
+            Cancel();
+            return stop.stop_requested() ? EncodeError::Cancelled : EncodeError::WriteFailed;
+        }
+        offset += written;
+    }
+    if (stop.stop_requested()) { Cancel(); return EncodeError::Cancelled; }
+    return EncodeError::None;
+}
+
+EncodeError RawVideoEncoder::Finish(std::stop_token stop)
+{
+    if (!impl_->active) return EncodeError::FinishFailed;
+    if (impl_->process.stdinWrite) {
+        CloseHandle(impl_->process.stdinWrite);
+        impl_->process.stdinWrite = nullptr;
+    }
+    bool cancelled = false;
+    const DWORD exitCode = impl_->process.Wait(stop, cancelled);
+    impl_->active = false;
+    if (cancelled) return EncodeError::Cancelled;
+    std::error_code error;
+    if (exitCode != 0 || !std::filesystem::is_regular_file(impl_->output, error) || error)
+        return EncodeError::FinishFailed;
+    return EncodeError::None;
+}
+
+void RawVideoEncoder::Cancel()
+{
+    if (!impl_) return;
+    impl_->process.Stop();
+    impl_->active = false;
+}
+
+namespace {
+
+// One `file` directive per part. FFmpeg reads the list as UTF-8 and treats the
+// quoted value literally, so only the quote itself needs escaping; forward
+// slashes avoid any backslash-escape ambiguity.
+std::string ConcatListText(std::span<const std::filesystem::path> parts)
+{
+    std::string text;
+    for (const auto& part : parts) {
+        std::error_code error;
+        std::wstring absolute = std::filesystem::absolute(part, error).wstring();
+        if (error || absolute.empty()) return {};
+        for (wchar_t& character : absolute) if (character == L'\\') character = L'/';
+        const std::string narrow = utf8_text::FromWide(absolute);
+        if (narrow.empty()) return {};
+        text += "file '";
+        for (const char character : narrow) {
+            if (character == '\'') text += "'\\''";
+            else text.push_back(character);
+        }
+        text += "'\n";
+    }
+    return text;
+}
+
+// The list goes into the user's temp directory, never beside the output: the
+// output's directory is a cache staging directory that is renamed whole into
+// the published entry, so a list whose removal failed - antivirus holding it
+// open, a crash between the two calls - used to travel into renders/<key>/.
+// The entries are absolute, so the demuxer does not care where the list is.
+std::filesystem::path WriteConcatList(std::string_view text)
+{
+    std::error_code error;
+    const auto directory = std::filesystem::temp_directory_path(error);
+    if (error) return {};
+    static std::atomic_uint64_t sequence{};
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        const auto candidate = directory / (L"dlss-concat-" +
+            std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) +
+            L"-" + std::to_wstring(sequence.fetch_add(1)) + L".txt");
+        HANDLE file = CreateFileW(candidate.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            if (GetLastError() == ERROR_FILE_EXISTS || GetLastError() == ERROR_ALREADY_EXISTS) continue;
+            return {};
+        }
+        size_t offset = 0;
+        bool ok = true;
+        while (ok && offset < text.size()) {
+            const DWORD wanted = static_cast<DWORD>(std::min<size_t>(text.size() - offset, 1024 * 1024));
+            DWORD written = 0;
+            ok = WriteFile(file, text.data() + offset, wanted, &written, nullptr) && written != 0;
+            offset += written;
+        }
+        CloseHandle(file);
+        if (ok) return candidate;
+        std::filesystem::remove(candidate, error);
+        return {};
+    }
+    return {};
+}
+
+} // namespace
+
+EncodeError ConcatenateMedia(const std::filesystem::path& helperDirectory,
+                             std::span<const std::filesystem::path> parts,
+                             const std::filesystem::path& output,
+                             std::stop_token stop)
+{
+    if (parts.empty() || output.empty()) return EncodeError::InvalidSpecification;
+    std::error_code error;
+    uintmax_t totalBytes = 0;
+    for (const auto& part : parts) {
+        if (part.empty() || !std::filesystem::is_regular_file(part, error) || error)
+            return EncodeError::InvalidSpecification;
+        const auto bytes = std::filesystem::file_size(part, error);
+        if (!error) totalBytes += bytes;
+    }
+    const auto ffmpeg = FindHelper(helperDirectory, L"ffmpeg.exe");
+    if (ffmpeg.empty()) return EncodeError::HelperMissing;
+    if (stop.stop_requested()) return EncodeError::Cancelled;
+    const std::string text = ConcatListText(parts);
+    if (text.empty()) return EncodeError::InvalidSpecification;
+    struct ListFile {
+        std::filesystem::path path;
+        ~ListFile() { if (!path.empty()) { std::error_code ignored; std::filesystem::remove(path, ignored); } }
+    } list{WriteConcatList(text)};
+    if (list.path.empty()) return EncodeError::StartFailed;
+    const std::vector<std::wstring> arguments{
+        L"-hide_banner", L"-nostdin", L"-loglevel", L"error", L"-y",
+        L"-f", L"concat", L"-safe", L"0", L"-i", list.path.wstring(),
+        L"-c", L"copy", L"-f", L"matroska", output.wstring()};
+    // A stream copy is bound by the disk: ten minutes plus the parts at 10 MB/s
+    // covers a 45 GB join on a spinning disk five times over.
+    const CaptureResult capture = RunCapture(ffmpeg, arguments, stop,
+        MediaDeadline(double(totalBytes) / (10.0 * 1024.0 * 1024.0), std::chrono::minutes{10}, 1.0),
+        64 * 1024);
+    if (!capture.started) return EncodeError::StartFailed;
+    if (capture.cancelled || stop.stop_requested()) return EncodeError::Cancelled;
+    if (capture.timedOut || capture.exitCode != 0 || !std::filesystem::is_regular_file(output, error) || error)
+        return EncodeError::FinishFailed;
+    return EncodeError::None;
+}
+
+EncodeError RemuxVideoStream(const std::filesystem::path& helperDirectory,
+                             const std::filesystem::path& input,
+                             const std::filesystem::path& output,
+                             std::stop_token stop)
+{
+    std::error_code error;
+    if (input.empty() || output.empty() || !std::filesystem::is_regular_file(input, error) || error)
+        return EncodeError::InvalidSpecification;
+    const auto bytes = std::filesystem::file_size(input, error);
+    const auto ffmpeg = FindHelper(helperDirectory, L"ffmpeg.exe");
+    if (ffmpeg.empty()) return EncodeError::HelperMissing;
+    if (stop.stop_requested()) return EncodeError::Cancelled;
+    const std::vector<std::wstring> arguments{
+        L"-hide_banner", L"-nostdin", L"-loglevel", L"error", L"-y", L"-i", input.wstring(),
+        L"-map", L"0:v:0", L"-c", L"copy", L"-f", L"matroska", output.wstring()};
+    // A stream copy is bound by the disk, as ConcatenateMedia's is.
+    const CaptureResult capture = RunCapture(ffmpeg, arguments, stop,
+        MediaDeadline(double(error ? 0 : bytes) / (10.0 * 1024.0 * 1024.0), std::chrono::minutes{10}, 1.0),
+        64 * 1024);
+    if (!capture.started) return EncodeError::StartFailed;
+    if (capture.cancelled || stop.stop_requested()) return EncodeError::Cancelled;
+    if (capture.timedOut || capture.exitCode != 0 || !std::filesystem::is_regular_file(output, error) || error)
+        return EncodeError::FinishFailed;
+    return EncodeError::None;
+}
+
+ProbeResult ProbeMedia(const std::filesystem::path& helperDirectory,
+                       const std::filesystem::path& media,
+                       std::stop_token stop, MediaProbeMode mode)
+{
+    ProbeResult result;
+    const bool fullValidation=mode==MediaProbeMode::FullValidation;
+    const auto ffprobe = FindHelper(helperDirectory, L"ffprobe.exe");
+    const auto ffmpeg = FindHelper(helperDirectory, L"ffmpeg.exe");
+    if (ffprobe.empty() || (fullValidation&&ffmpeg.empty())) { result.detail = L"FFmpeg tools are unavailable."; return result; }
+    // Counted by demuxing, not decoding. `-count_frames` decodes the whole file
+    // to answer "how many frames are in here", which on a joined 1440p render
+    // measured 23.8 s against 0.05 s for the packet count - and the publish that
+    // waits on it is what holds the next hole's render back. A video stream
+    // carries one packet per coded frame, so the count is the same number: 1300
+    // either way on that entry. What the gate is for still works, because a
+    // short join demuxes short - a 60%-truncated copy reports 889 packets, and
+    // one missing its tail segment 902 and 30.1 s against 43.3 s.
+    std::vector<std::wstring> probeArguments{
+        L"-v", L"error", L"-select_streams", L"v:0",
+        L"-show_entries", fullValidation?L"packet=pts_time,duration_time:stream=width,height,nb_read_packets:format=duration":L"stream=width,height,codec_name,pix_fmt:format=duration",
+        L"-of", L"default=noprint_wrappers=1:nokey=0", L"-i", media.wstring()};
+    if(fullValidation)probeArguments.insert(probeArguments.begin(),L"-count_packets");
+    double durationSeconds = 0.0;
+    double firstVideoTimestamp = std::numeric_limits<double>::infinity();
+    double videoEnd = -std::numeric_limits<double>::infinity();
+    double frameTimestamp = std::numeric_limits<double>::quiet_NaN();
+    const auto parseLine = [&](std::string_view line) {
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        const size_t equals = line.find('=');
+        if (equals != std::string_view::npos) {
+            const auto key = line.substr(0, equals);
+            const auto value = line.substr(equals + 1);
+            uint64_t integer = 0;
+            if (key == "width" && ParseUnsigned(value, integer)) result.width = static_cast<uint32_t>(integer);
+            else if (key == "height" && ParseUnsigned(value, integer)) result.height = static_cast<uint32_t>(integer);
+            else if (key == "nb_read_packets" && ParseUnsigned(value, integer)) result.frameCount = integer;
+            else if (key == "codec_name" && value != "N/A") result.codecName = std::string(value);
+            else if (key == "pix_fmt" && value != "N/A") result.pixelFormat = std::string(value);
+            else if (key == "duration") {
+                try { durationSeconds = std::stod(std::string(value)); } catch (...) { durationSeconds = 0.0; }
+            }
+            else if (key == "pts_time") {
+                try { frameTimestamp = std::stod(std::string(value)); }
+                catch (...) { frameTimestamp = std::numeric_limits<double>::quiet_NaN(); }
+                if (std::isfinite(frameTimestamp)) {
+                    firstVideoTimestamp = std::min(firstVideoTimestamp, frameTimestamp);
+                    videoEnd = std::max(videoEnd, frameTimestamp);
+                }
+            }
+            else if (key == "duration_time" && std::isfinite(frameTimestamp)) {
+                double frameDuration = 0.0;
+                try { frameDuration = std::stod(std::string(value)); } catch (...) {}
+                if (std::isfinite(frameDuration) && frameDuration > 0.0)
+                    videoEnd = std::max(videoEnd, frameTimestamp + frameDuration);
+            }
+        }
+    };
+    // Stream frame metadata so a full-length video does not need a proportional
+    // memory buffer or hit the bounded diagnostic capture limit.
+    std::string pending;
+    bool oversizedLine = false;
+    // A header read is seconds; a packet count of a two-hour render on a
+    // spinning disk is tens of seconds. Either past its bound is a wedged child.
+    const CaptureResult capture = RunCapture(ffprobe, probeArguments, stop,
+        fullValidation ? std::chrono::minutes{10} : std::chrono::minutes{1}, 64 * 1024,
+        [&](std::string_view chunk) {
+            for (const char character : chunk) {
+                if (character == '\n') {
+                    if (!oversizedLine) parseLine(pending);
+                    pending.clear(); oversizedLine = false;
+                } else if (pending.size() < 64 * 1024) pending.push_back(character);
+                else oversizedLine = true;
+            }
+        });
+    if (!pending.empty() && !oversizedLine) parseLine(pending);
+    if (!capture.started || capture.cancelled || capture.timedOut || capture.exitCode != 0) {
+        result.detail = capture.cancelled ? L"Media validation was cancelled." :
+            capture.timedOut ? L"FFprobe validation timed out." : L"FFprobe validation failed.";
+        return result;
+    }
+    const double videoSeconds = videoEnd - firstVideoTimestamp;
+    if (std::isfinite(videoSeconds) && videoSeconds > 0.0 && videoSeconds < double(INT64_MAX) / 10000000.0)
+        result.videoDuration100ns = std::llround(videoSeconds * 10000000.0);
+    if(std::isfinite(durationSeconds)&&durationSeconds>0.0&&durationSeconds<double(INT64_MAX)/10000000.0)
+        result.duration100ns = std::llround(durationSeconds * 10000000.0);
+    if (!result.width || !result.height || (fullValidation&&!result.frameCount) || result.duration100ns <= 0) {
+        result.detail = L"FFprobe returned incomplete media metadata.";
+        return result;
+    }
+    // Only for entries already checked against their persisted content hash and
+    // complete manifest. Full frame/end-of-stream validation stays on promotion.
+    if(!fullValidation){result.ok=true;return result;}
+    ChildProcess finalFrame;
+    const std::vector<std::wstring> decodeArguments{
+        L"-v", L"error", L"-sseof", L"-1", L"-i", media.wstring(),
+        L"-map", L"0:v:0", L"-frames:v", L"1", L"-f", L"null", L"NUL"};
+    if (!finalFrame.Start(ffmpeg, decodeArguments, false)) {
+        result.detail = L"Final-frame validation could not start.";
+        return result;
+    }
+    bool cancelled = false;
+    result.decodedFinalFrame = finalFrame.Wait(stop, cancelled) == 0 && !cancelled;
+    result.ok = result.decodedFinalFrame;
+    if (!result.ok) result.detail = L"The encoded final frame could not be decoded.";
+    return result;
+}
+
+namespace {
+
+// Splits an ffprobe `key=value` stream into lines for `parse`, bounding a line
+// the way ProbeMedia does so a malformed file cannot grow this without bound.
+void ConsumeProbeLines(std::string& pending, bool& oversized, std::string_view chunk,
+                       const std::function<void(std::string_view)>& parse)
+{
+    for (const char character : chunk) {
+        if (character == '\n') {
+            if (!oversized) parse(pending);
+            pending.clear();
+            oversized = false;
+        } else if (pending.size() < 64 * 1024) pending.push_back(character);
+        else oversized = true;
+    }
+}
+
+} // namespace
+
+EncodeError MuxVideoWithSourceStreams(const std::filesystem::path& helperDirectory,
+                                      const std::filesystem::path& video,
+                                      const std::filesystem::path& sourceMedia,
+                                      const std::filesystem::path& output,
+                                      std::stop_token stop)
+{
+    if (video.empty() || sourceMedia.empty() || output.empty()) return EncodeError::InvalidSpecification;
+    std::error_code error;
+    for (const auto& input : {video, sourceMedia}) {
+        if (!std::filesystem::is_regular_file(input, error) || error)
+            return EncodeError::InvalidSpecification;
+    }
+    if (stop.stop_requested()) return EncodeError::Cancelled;
+    // The exporter refuses an output that exists, because an interactive export
+    // must not overwrite a file the user named. This output is not the user's:
+    // the frame-generation pass composes the path and guards it, and converting
+    // the same source twice has to keep working, so a leftover from an earlier
+    // run is cleared here. `remove` returning false with no error is the usual
+    // case of nothing being there; an error means the path is held open or is
+    // not a file we may replace, which the export itself could not recover
+    // from either.
+    if (!std::filesystem::remove(output, error) && error) return EncodeError::FinishFailed;
+    // The cached-range exporter is the only muxer: run with no trim it emits
+    // exactly this mux, and it brings the exclusively created staging file and
+    // the no-replace rename with it, so a failed run leaves no partial output.
+    const MaterializeResult result = CachedVideoExporter(helperDirectory).Run(
+        CachedExportRequest{.neuralVideo = video, .sourceMedia = sourceMedia, .output = output,
+                            .rangeStartSeconds = 0.0, .rangeDurationSeconds = 0.0}, stop);
+    if (result.ok) return EncodeError::None;
+    switch (result.error) {
+    case MaterializeError::Cancelled: return EncodeError::Cancelled;
+    case MaterializeError::HelperMissing: return EncodeError::HelperMissing;
+    case MaterializeError::InvalidRequest: return EncodeError::InvalidSpecification;
+    case MaterializeError::StartFailed: return EncodeError::StartFailed;
+    // ProcessFailed and anything added later: the mux ran and did not produce
+    // the output.
+    default: return EncodeError::FinishFailed;
+    }
+}
+
+MediaStreamSummary SummarizeMediaStreams(const std::filesystem::path& helperDirectory,
+                                         const std::filesystem::path& media,
+                                         std::stop_token stop, MediaStreamMode mode)
+{
+    MediaStreamSummary summary;
+    if (media.empty()) { summary.detail = L"No media was given to inspect."; return summary; }
+    const auto ffprobe = FindHelper(helperDirectory, L"ffprobe.exe");
+    if (ffprobe.empty()) { summary.detail = L"FFmpeg tools are unavailable."; return summary; }
+    std::string pending;
+    bool oversized = false;
+    const auto countLine = [&summary](std::string_view line) {
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (line == "codec_type=audio") ++summary.audioStreams;
+        else if (line == "codec_type=subtitle") ++summary.subtitleStreams;
+    };
+    // The stream list is a header read: seconds on any file, so a minute past
+    // it is a wedged child rather than a slow one.
+    const CaptureResult streams = RunCapture(ffprobe,
+        {L"-v", L"error", L"-show_entries", L"stream=codec_type",
+         L"-of", L"default=noprint_wrappers=1:nokey=0", L"-i", media.wstring()},
+        stop, std::chrono::minutes{1}, 64 * 1024,
+        [&](std::string_view chunk) { ConsumeProbeLines(pending, oversized, chunk, countLine); });
+    if (!pending.empty() && !oversized) countLine(pending);
+    if (!streams.started || streams.cancelled || streams.timedOut || streams.exitCode != 0) {
+        summary.detail = streams.cancelled ? L"Stream inspection was cancelled."
+                       : streams.timedOut ? L"FFprobe stream inspection timed out."
+                                          : L"FFprobe could not list the file's streams.";
+        return summary;
+    }
+    if (mode == MediaStreamMode::Counts || summary.audioStreams == 0) {
+        summary.ok = true;
+        return summary;
+    }
+    pending.clear();
+    oversized = false;
+    double end = -std::numeric_limits<double>::infinity();
+    double timestamp = std::numeric_limits<double>::quiet_NaN();
+    const auto packetLine = [&](std::string_view line) {
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        const size_t equals = line.find('=');
+        if (equals == std::string_view::npos) return;
+        const auto key = line.substr(0, equals);
+        const auto value = line.substr(equals + 1);
+        if (key == "pts_time") {
+            try { timestamp = std::stod(std::string(value)); }
+            catch (...) { timestamp = std::numeric_limits<double>::quiet_NaN(); }
+            if (std::isfinite(timestamp)) end = std::max(end, timestamp);
+        } else if (key == "duration_time" && std::isfinite(timestamp)) {
+            double packetSeconds = 0.0;
+            try { packetSeconds = std::stod(std::string(value)); } catch (...) {}
+            // The last packet's own duration is part of where the audio ends:
+            // audio whose final packet starts before the video's last frame
+            // still covers it, and ignoring that packet's length would read as
+            // a truncated stream.
+            if (std::isfinite(packetSeconds) && packetSeconds > 0.0)
+                end = std::max(end, timestamp + packetSeconds);
+        }
+    };
+    // Ten minutes, the bound ProbeMedia gives its own packet walk: an audio
+    // stream is a few hundred packets per second of media, so a feature-length
+    // file is seconds of demuxing and anything past this is wedged.
+    const CaptureResult packets = RunCapture(ffprobe,
+        {L"-v", L"error", L"-select_streams", L"a:0",
+         L"-show_entries", L"packet=pts_time,duration_time",
+         L"-of", L"default=noprint_wrappers=1:nokey=0", L"-i", media.wstring()},
+        stop, std::chrono::minutes{10}, 64 * 1024,
+        [&](std::string_view chunk) { ConsumeProbeLines(pending, oversized, chunk, packetLine); });
+    if (!pending.empty() && !oversized) packetLine(pending);
+    if (!packets.started || packets.cancelled || packets.timedOut || packets.exitCode != 0) {
+        summary.detail = packets.cancelled ? L"Stream inspection was cancelled."
+                       : packets.timedOut ? L"FFprobe audio inspection timed out."
+                                          : L"FFprobe could not read the audio stream's packets.";
+        return summary;
+    }
+    if (!std::isfinite(end) || end <= 0.0 || end >= double(INT64_MAX) / 10000000.0) {
+        summary.detail = L"The audio stream reported no usable end timestamp.";
+        return summary;
+    }
+    summary.audioEnd100ns = std::llround(end * 10000000.0);
+    summary.ok = true;
+    return summary;
+}
+
+std::optional<std::vector<MediaStreamInfo>> ListMediaStreams(const std::filesystem::path& helperDirectory,
+                                                             const std::filesystem::path& media,
+                                                             std::stop_token stop)
+{
+    if (media.empty()) return std::nullopt;
+    const auto ffprobe = FindHelper(helperDirectory, L"ffprobe.exe");
+    if (ffprobe.empty()) return std::nullopt;
+    std::vector<MediaStreamInfo> streams;
+    std::string pending;
+    bool oversized = false;
+    // ffprobe writes each stream's keys together and `index` first, so a new
+    // index opens the record the following keys belong to.
+    const auto streamLine = [&streams](std::string_view line) {
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        const size_t equals = line.find('=');
+        if (equals == std::string_view::npos) return;
+        const auto key = line.substr(0, equals);
+        const auto value = line.substr(equals + 1);
+        if (key == "index") {
+            uint32_t index = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), index);
+            if (parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size())
+                streams.push_back({index, {}, {}});
+        } else if (!streams.empty() && key == "codec_type") {
+            streams.back().type = std::string(value);
+        } else if (!streams.empty() && key == "codec_name") {
+            streams.back().codec = std::string(value);
+        }
+    };
+    // A header read, as SummarizeMediaStreams' stream list is.
+    const CaptureResult capture = RunCapture(ffprobe,
+        {L"-v", L"error", L"-show_entries", L"stream=index,codec_type,codec_name",
+         L"-of", L"default=noprint_wrappers=1:nokey=0", L"-i", media.wstring()},
+        stop, std::chrono::minutes{1}, 64 * 1024,
+        [&](std::string_view chunk) { ConsumeProbeLines(pending, oversized, chunk, streamLine); });
+    if (!pending.empty() && !oversized) streamLine(pending);
+    if (!capture.started || capture.cancelled || capture.timedOut || capture.exitCode != 0)
+        return std::nullopt;
+    return streams;
+}
+
+std::vector<std::wstring> BuildStageExportMuxArguments(const StageExportMuxRequest& request,
+                                                       const std::filesystem::path& staging,
+                                                       std::string_view videoCodec,
+                                                       const std::vector<MediaStreamInfo>& sourceStreams)
+{
+    const auto container = ExportContainerFor(request.output.extension().wstring());
+    if (!container) return {};
+    // A picture is encoded from the video alone, exactly as "Save converted
+    // video" encodes one, so the two cannot drift apart.
+    if (*container != ExportContainer::Matroska && *container != ExportContainer::Mp4)
+        return BuildCachedExportArguments({request.video, request.streamSource, request.output}, staging, {}, false);
+
+    std::vector<std::wstring> arguments{
+        // -y applies only to the exclusively reserved staging file.
+        L"-hide_banner", L"-nostdin", L"-loglevel", L"error", L"-xerror", L"-y",
+        L"-i", request.video.wstring()};
+    // No trim here, ever: a range is cut out of the stream source first
+    // (BuildStageExportTrimArguments). The output -ss 0 the cached-range export
+    // trims with drops every packet of a stream-copied video that has B-frames:
+    // Matroska stores no decode timestamps, the keyframe's comes back unknown,
+    // so the cut discards it and then every frame up to the next keyframe - on
+    // an NVENC carrier with one keyframe per job, the whole video. A ranged
+    // export came out with audio and no picture.
+    // A cut keeps its own timeline (StageExportMuxRequest::streamSourceStartSeconds).
+    if (request.streamSourceStartSeconds > 0.0)
+        arguments.insert(arguments.end(), {L"-itsoffset", FrameRateText(request.streamSourceStartSeconds)});
+    arguments.insert(arguments.end(), {L"-i", request.streamSource.wstring(), L"-map", L"0:v:0"});
+    std::vector<std::wstring> codecs{L"-c:v", L"copy"};
+    if (const std::wstring tag = ExportVideoTag(*container, videoCodec); !tag.empty())
+        codecs.insert(codecs.end(), {L"-tag:v", tag});
+    // Audio MP4 can hold as it stands is copied, as the policy says.
+    AppendSourceStreams(*container, sourceStreams, false, arguments, codecs);
+    arguments.insert(arguments.end(), {L"-map_metadata", L"1", L"-map_chapters", L"1"});
+    arguments.insert(arguments.end(), codecs.begin(), codecs.end());
+    // An anamorphic source's shape, which the passes encoded without.
+    if (!request.displayAspect.empty())
+        arguments.insert(arguments.end(), {L"-aspect:v:0", request.displayAspect});
+    if (*container == ExportContainer::Mp4)
+        arguments.insert(arguments.end(), {L"-movflags", L"+faststart", L"-f", L"mp4"});
+    else
+        arguments.insert(arguments.end(), {L"-f", L"matroska"});
+    arguments.push_back(staging.wstring());
+    return arguments;
+}
+
+std::vector<std::wstring> BuildStageExportTrimArguments(const StageExportMuxRequest& request,
+                                                        const std::filesystem::path& staging,
+                                                        const std::vector<MediaStreamInfo>& sourceStreams)
+{
+    // An input seek to the range start, which rebases the source exactly as
+    // the decoder's own seek rebased the frames the render began with, so
+    // chapters and packets land on the render's timeline. What the seek
+    // leaves before zero - the pre-roll a stream copy keeps as negative
+    // timestamps - is removed per stream by bitstream filters, not by an
+    // output -ss 0: that option dropped every subtitle already showing when
+    // the range began, since a cue's start is its only timestamp. Matroska
+    // holds what the source carries; MP4 timed text becomes SubRip, which the
+    // last step can still turn back.
+    const bool seek = request.rangeStartSeconds > 0.0;
+    const std::wstring start = FrameRateText(request.rangeStartSeconds);
+    std::vector<std::wstring> arguments{
+        L"-hide_banner", L"-nostdin", L"-loglevel", L"error", L"-xerror", L"-y"};
+    if (seek) arguments.insert(arguments.end(), {L"-ss", start});
+    arguments.insert(arguments.end(), {L"-i", request.streamSource.wstring()});
+    // Subtitles are read from a second, unseeked copy of the source moved
+    // back by the range start (-itsoffset), which is the same timeline: the
+    // seek lands on the video keyframe at or before the range start, and a cue
+    // that began before that keyframe is never demuxed from the seeked input
+    // at all. This one is read from the top, which costs a demux of the file
+    // up to the range; the cues are the only thing kept from it.
+    const bool subtitlesUnseeked = seek && std::any_of(sourceStreams.begin(), sourceStreams.end(),
+        [](const MediaStreamInfo& stream) {
+            return stream.type == "subtitle" &&
+                   ExportStreamActionFor(ExportContainer::Matroska, stream.type, stream.codec) != ExportStreamAction::Drop;
+        });
+    if (subtitlesUnseeked)
+        arguments.insert(arguments.end(), {L"-itsoffset", L"-" + start, L"-i", request.streamSource.wstring()});
+    std::vector<std::wstring> codecs;
+    uint32_t outputIndex = 0;
+    for (const MediaStreamInfo& stream : sourceStreams) {
+        const ExportStreamAction action = ExportStreamActionFor(ExportContainer::Matroska, stream.type, stream.codec);
+        if (action == ExportStreamAction::Drop) continue;
+        const bool subtitle = stream.type == "subtitle";
+        arguments.insert(arguments.end(), {L"-map",
+            std::wstring(subtitle && subtitlesUnseeked ? L"1:" : L"0:") + std::to_wstring(stream.index)});
+        const std::wstring specifier = std::to_wstring(outputIndex++);
+        codecs.insert(codecs.end(), {L"-c:" + specifier, action == ExportStreamAction::ToSubrip ? L"srt" : L"copy"});
+        // The pre-roll: audio before zero is dropped, as -ss 0 dropped it. A
+        // cue before zero is dropped only if it has also ended by then;
+        // otherwise it starts at zero, shortened by what the range cut off. A
+        // bitmap cue carries no duration, so it is dropped as before - its
+        // clear is a packet of its own.
+        if (subtitle)
+            codecs.insert(codecs.end(), {L"-bsf:" + specifier,
+                L"noise=drop=lt(pts\\,0)*lte(pts+duration\\,0),"
+                L"setts=pts=max(PTS\\,0):dts=max(DTS\\,0):duration=DURATION+min(PTS\\,0)"});
+        else if (stream.type == "audio")
+            codecs.insert(codecs.end(), {L"-bsf:" + specifier, L"noise=drop=lt(pts\\,0)"});
+    }
+    if (!outputIndex) return {};
+    // Chapters and metadata from the seeked input: its rebase is the range
+    // start, so a chapter moves by exactly that.
+    arguments.insert(arguments.end(), {L"-map_metadata", L"0", L"-map_chapters", L"0"});
+    if (request.rangeDurationSeconds > 0.0)
+        arguments.insert(arguments.end(), {L"-t", FrameRateText(request.rangeDurationSeconds)});
+    arguments.insert(arguments.end(), codecs.begin(), codecs.end());
+    arguments.insert(arguments.end(), {L"-f", L"matroska", staging.wstring()});
+    return arguments;
+}
+
+MaterializeResult MuxStageExport(const std::filesystem::path& helperDirectory,
+                                 const StageExportMuxRequest& request,
+                                 std::stop_token stop)
+{
+    const auto cancelled = [] {
+        return MaterializeResult{false, MaterializeError::Cancelled, L"The export was cancelled."};
+    };
+    if (stop.stop_requested()) return cancelled();
+    const auto container = ExportContainerFor(request.output.extension().wstring());
+    if (request.video.empty() || request.streamSource.empty() || request.output.empty() || !container)
+        return {false, MaterializeError::InvalidRequest, L"Choose an MKV, MP4, GIF, PNG or JPEG file."};
+    if (!ValidRangeSeconds(request.rangeStartSeconds) || !ValidRangeSeconds(request.rangeDurationSeconds))
+        return {false, MaterializeError::InvalidRequest, L"The export range is invalid."};
+    std::error_code error;
+    StageExportMuxRequest resolved = request;
+    resolved.video = std::filesystem::absolute(request.video, error);
+    if (!error) resolved.streamSource = std::filesystem::absolute(request.streamSource, error);
+    if (!error) resolved.output = std::filesystem::absolute(request.output, error);
+    if (error) return {false, MaterializeError::InvalidRequest, L"An export path is unavailable."};
+    for (const auto& input : {resolved.video, resolved.streamSource}) {
+        if (!std::filesystem::is_regular_file(input, error) || error)
+            return {false, MaterializeError::InvalidRequest, L"The rendered video or the original source is unavailable."};
+        // Replacing an input would destroy it, and the stream source is the
+        // user's original.
+        if (std::filesystem::equivalent(input, resolved.output, error) && !error)
+            return {false, MaterializeError::InvalidRequest, L"The export cannot replace its own source. Choose a new filename."};
+        error.clear();
+    }
+    if (!std::filesystem::is_directory(resolved.output.parent_path(), error) || error)
+        return {false, MaterializeError::InvalidRequest, L"The export folder is unavailable."};
+    const auto ffmpeg = FindHelper(helperDirectory, L"ffmpeg.exe");
+    if (ffmpeg.empty()) return {false, MaterializeError::HelperMissing, L"FFmpeg is unavailable."};
+    // The video's length sizes the deadline, as it does for the cached export.
+    const ProbeResult videoMetadata = ProbeMedia(helperDirectory, resolved.video, stop, MediaProbeMode::CachedMetadata);
+    if (stop.stop_requested()) return cancelled();
+    if (!videoMetadata.ok)
+        return {false, MaterializeError::ProcessFailed, L"The rendered video could not be inspected."};
+    std::string videoCodec;
+    std::vector<MediaStreamInfo> sourceStreams;
+    std::wstring note;
+    if (*container == ExportContainer::Matroska || *container == ExportContainer::Mp4) {
+        const auto videoStreams = ListMediaStreams(helperDirectory, resolved.video, stop);
+        const auto listed = ListMediaStreams(helperDirectory, resolved.streamSource, stop);
+        if (stop.stop_requested()) return cancelled();
+        if (!videoStreams || !listed)
+            return {false, MaterializeError::ProcessFailed, L"The streams to carry into the export could not be listed."};
+        for (const MediaStreamInfo& stream : *videoStreams)
+            if (stream.type == "video") { videoCodec = stream.codec; break; }
+        sourceStreams = *listed;
+        // Of the source's own subtitles, before a range cut can set aside any
+        // that Matroska cannot hold either.
+        note = LeftOutSubtitlesNote(*container, sourceStreams);
+    }
+
+    // A range is cut out of the source's streams on their own first, so the
+    // mux below never trims the video (BuildStageExportTrimArguments says why).
+    ExportStagingFile trimmed;
+    if (request.rangeStartSeconds > 0.0 || request.rangeDurationSeconds > 0.0) {
+        std::filesystem::path streamSource;
+        double streamSourceStart = 0.0;
+        const MaterializeResult cut = CutSourceStreamsToRange(helperDirectory, ffmpeg, resolved,
+            double(videoMetadata.duration100ns) / 10000000.0, trimmed, streamSource, streamSourceStart, sourceStreams, stop);
+        if (cut.error == MaterializeError::Cancelled) return cancelled();
+        if (!cut.ok) return cut;
+        resolved.streamSource = streamSource;
+        resolved.streamSourceStartSeconds = streamSourceStart;
+    }
+
+    ExportStagingFile staging;
+    staging.path = ReserveExportStaging(resolved.output.parent_path());
+    if (staging.path.empty())
+        return {false, MaterializeError::ProcessFailed, L"A temporary export file could not be created in the selected folder."};
+    if (stop.stop_requested()) return cancelled();
+    // A stream copy is seconds; a GIF of a long 4K render is the slow case,
+    // bounded like the cached export's software encode.
+    const CaptureResult capture = RunCapture(ffmpeg,
+        BuildStageExportMuxArguments(resolved, staging.path, videoCodec, sourceStreams), stop,
+        MediaDeadline(double(videoMetadata.duration100ns) / 10000000.0, std::chrono::hours{1}, 60.0),
+        64 * 1024);
+    if (capture.cancelled || stop.stop_requested()) return cancelled();
+    if (capture.timedOut)
+        return {false, MaterializeError::ProcessFailed, L"FFmpeg did not finish the export in time."};
+    if (!capture.started)
+        return {false, MaterializeError::StartFailed, L"FFmpeg could not be started."};
+    const auto bytes = std::filesystem::file_size(staging.path, error);
+    if (capture.exitCode != 0 || error || bytes == 0) {
+        std::wstring detail = L"FFmpeg could not write the export in the chosen format.";
+        if (const std::wstring diagnostic = utf8_text::ToWide(capture.output); !diagnostic.empty())
+            detail += L"\n" + diagnostic;
+        return {false, MaterializeError::ProcessFailed, std::move(detail)};
+    }
+    if (stop.stop_requested()) return cancelled();
+    // Read back off the file before it is published, never inferred from the
+    // arguments - the same rule the frame-generation pass keeps, and for the
+    // same reason: an export that plays silent looks finished.
+    if (*container == ExportContainer::Matroska || *container == ExportContainer::Mp4) {
+        uint32_t audioKept = 0;
+        for (const MediaStreamInfo& stream : sourceStreams)
+            if (stream.type == "audio" &&
+                ExportStreamActionFor(*container, stream.type, stream.codec) != ExportStreamAction::Drop)
+                ++audioKept;
+        // Every frame the passes rendered, too: a cut that drops a copied
+        // video's packets still leaves its track header behind, so a file
+        // with a video stream and no picture reads as a video until played.
+        const ProbeResult renderedVideo = ProbeMedia(helperDirectory, resolved.video, stop);
+        const ProbeResult writtenVideo = ProbeMedia(helperDirectory, staging.path, stop);
+        if (stop.stop_requested()) return cancelled();
+        if (!renderedVideo.ok || !writtenVideo.ok || writtenVideo.frameCount != renderedVideo.frameCount)
+            return {false, MaterializeError::ProcessFailed,
+                L"The export carries " + std::to_wstring(writtenVideo.frameCount) + L" of the " +
+                std::to_wstring(renderedVideo.frameCount) + L" rendered frames."};
+        const MediaStreamSummary carried = SummarizeMediaStreams(helperDirectory, staging.path, stop);
+        if (stop.stop_requested()) return cancelled();
+        if (!carried.ok)
+            return {false, MaterializeError::ProcessFailed, L"The finished export could not be inspected: " + carried.detail};
+        if (carried.audioStreams != audioKept)
+            return {false, MaterializeError::ProcessFailed,
+                L"The export carries " + std::to_wstring(carried.audioStreams) + L" of the source's " +
+                std::to_wstring(audioKept) + L" audio streams, so it would not play the source's sound."};
+    }
+    if (!MoveFileExW(staging.path.c_str(), resolved.output.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return {false, MaterializeError::ProcessFailed,
+            L"The finished export could not be written to the chosen file. Check that it is not open in another program."};
+    staging.path.clear();
+    return {true, MaterializeError::None, std::move(note)};
+}

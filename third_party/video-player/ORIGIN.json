@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/2600th/dlss5-video-player",
+  "revision": "8dfded2bc16477eb985d4d21575832bde07b3df0",
+  "license": "MIT",
+  "scope": "native player/media/cache UI foundation; Phoenix integration maintained separately"
+}

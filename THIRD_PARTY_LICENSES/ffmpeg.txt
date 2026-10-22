@@ -1,0 +1,64 @@
+FFmpeg build notice
+
+What is shipped
+---------------
+The complete package ships ffmpeg.exe and ffprobe.exe unmodified from BtbN's
+64-bit static Windows GPL build of the FFmpeg 9.0 branch, version
+n9.0.2-14-gebafaee10a, archive ffmpeg-n9.0.2-14-gebafaee10a-win64-gpl-9.0.zip
+with SHA-256 11F676F2EE62C39768CEF1892E2E171ADF00FD04C85620B771520E985E7C7A69,
+as published in release autobuild-2026-09-29-13-10 of
+https://github.com/BtbN/FFmpeg-Builds and downloaded from
+https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-29-13-10/ffmpeg-n9.0.2-14-gebafaee10a-win64-gpl-9.0.zip
+by tools/fetch_ffmpeg_helpers.ps1. An identical copy is kept at
+https://github.com/2600th/dlss5-video-player/releases/tag/deps-ffmpeg-n9.0.2-14
+for when BtbN prunes that release. Each executable is pinned by SHA-256 in
+packaging/tool-lock.json. DLSS Video Player runs them as separate processes
+and does not link them.
+
+License
+-------
+The build is configured with --enable-gpl --enable-version3, and the packaged
+binaries report the following license notice:
+
+ffmpeg is free software; you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.
+
+ffmpeg is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+The complete text of the GNU General Public License version 3 is in
+ffmpeg-GPL-3.0.txt beside this file. It is the LICENSE.txt file from the
+archive above, unchanged apart from line endings. License information from the
+FFmpeg project: https://ffmpeg.org/legal.html
+
+Corresponding Source
+--------------------
+The source code is not included in this package. The Corresponding Source of
+the two executables - FFmpeg at the commit they were built from, the source of
+every library linked into them, and the scripts used to control compilation -
+is public at the places below, each pinned to the exact commit the build used:
+
+    FFmpeg, commit ebafaee10ab45fce1964bd09efcd848e2da5b401 on release/9.0
+        https://github.com/FFmpeg/FFmpeg/commit/ebafaee10ab45fce1964bd09efcd848e2da5b401
+        also https://git.ffmpeg.org/ffmpeg.git
+
+    The build scripts: FFmpeg-Builds, commit
+    6c9aec5fc9a72ec3abedd1fa84db141fa18cf52b (the autobuild tag's commit),
+    built for TARGET=win64 VARIANT=gpl with the 9.0 addin
+        https://github.com/BtbN/FFmpeg-Builds/tree/6c9aec5fc9a72ec3abedd1fa84db141fa18cf52b
+    Each script in its scripts.d pins one library's upstream repository and
+    commit (or tarball and hash); the build's full configuration is printed
+    by `ffmpeg -buildconf`.
+
+The libraries under the GNU GPL, the GNU LGPL or the Mozilla Public License
+2.0 - x264, x265, Xvid, LAME, FriBidi, libssh, SRT, ZeroMQ and the
+rest - are named with their pinned commits in the closing section of
+ffmpeg-bundled-notices.txt beside this file, and the notices of the
+permissively licensed ones are in its other sections.
+
+If any of these ever stops being available, open an issue on the DLSS Video
+Player repository (https://github.com/2600th/dlss5-video-player/issues) and
+the source will be provided.

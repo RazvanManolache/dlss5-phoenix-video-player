@@ -1,0 +1,300 @@
+#pragma once
+
+#include <windows.h>
+#include <dbghelp.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <cwchar>
+#include <filesystem>
+#include <string>
+
+#include "Log.h"
+
+// The handler below calls MiniDumpWriteDump, so whoever includes this links
+// what it needs rather than depending on the target's library list.
+#pragma comment(lib, "dbghelp.lib")
+
+// An unhandled access violation produced no artifact at all: no dump, and -
+// before the log learned to append - not even the log lines leading up to it,
+// because relaunching to collect them truncated the file.
+//
+// This writes a minidump beside the log, which is the one place the user has
+// already been told to look, and logs where it went so the line survives even
+// if the dump itself cannot be written.
+namespace crash_dump {
+
+namespace detail {
+
+// Twice MAX_PATH: the log sits beside the executable or under LOCALAPPDATA,
+// and a longer path only costs the dump, never the handler. Kept small because
+// the handler also runs for a stack overflow, on what is left of the stack.
+inline constexpr size_t kPathCapacity = 520;
+
+// Filled once by Prepare, at install time, and only read by the handler. The
+// handler used to build the dump path with std::filesystem and write its line
+// through LOG: both allocate, and LOG takes the log's mutex, so a fault inside
+// Log::Write - holding that mutex - deadlocked the handler, and a helper that
+// hung there kept the GPU until the parent's 120 s watchdog killed it.
+inline wchar_t g_dumpBase[kPathCapacity]{};   // log path without its extension
+inline wchar_t g_logPath[kPathCapacity]{};
+inline bool g_prepared{};
+// Tests only: the full dump reports ERROR_PARTIAL_COPY without being tried, so
+// the reduced retry below can be exercised on a machine where it never fails.
+inline bool g_failFullDumpForTest{};
+
+inline bool CopyWide(wchar_t (&out)[kPathCapacity], const std::wstring& text)
+{
+    if (text.size() >= kPathCapacity) return false;
+    wmemcpy(out, text.data(), text.size());
+    out[text.size()] = L'\0';
+    return true;
+}
+
+inline void Prepare(const std::filesystem::path& logPath)
+{
+    std::filesystem::path base = logPath.empty() ? std::filesystem::path(L"DLSSVideoPlayer") : logPath;
+    base.replace_extension();
+    g_prepared = CopyWide(g_dumpBase, base.wstring());
+    if (!CopyWide(g_logPath, logPath.wstring())) g_logPath[0] = L'\0';
+}
+
+// Bounded appenders over a caller's stack buffer: no allocation, no CRT
+// formatting, and a full buffer truncates rather than overruns.
+template <class Char>
+struct Text {
+    Char* data;
+    size_t capacity;   // including the terminator
+    size_t length{};
+
+    void Put(Char c)
+    {
+        if (length + 1 < capacity) data[length++] = c;
+        data[length] = Char{};
+    }
+    void Put(const Char* text)
+    {
+        while (*text) Put(*text++);
+    }
+    void Decimal(uint64_t value, int width = 1)
+    {
+        // Filled from the back, as Hex below is.
+        Char digits[20];
+        int first = 20;
+        do {
+            digits[--first] = static_cast<Char>('0' + value % 10);
+            value /= 10;
+        } while (value && first > 0);
+        for (int pad = 20 - first; pad < width; ++pad) Put(static_cast<Char>('0'));
+        for (int index = first; index < 20; ++index) Put(digits[index]);
+    }
+    void Hex(uint64_t value)
+    {
+        // Filled from the back, so the digits come out most significant first
+        // with no reverse pass (and nothing for /analyze to misread as an
+        // index of -1).
+        Char digits[16];
+        int first = 16;
+        do {
+            digits[--first] = static_cast<Char>("0123456789abcdef"[value & 0xF]);
+            value >>= 4;
+        } while (value && first > 0);
+        for (int index = first; index < 16; ++index) Put(digits[index]);
+    }
+};
+
+// "<base>-crash-YYYYMMDD-HHMMSS-<pid>.dmp", the name PathFor produced before.
+inline bool ComposeDumpPath(wchar_t* out, size_t capacity, const SYSTEMTIME& now, DWORD processId)
+{
+    if (!g_prepared || !capacity) return false;
+    Text<wchar_t> path{out, capacity};
+    path.Put(g_dumpBase);
+    path.Put(L"-crash-");
+    path.Decimal(now.wYear, 4);
+    path.Decimal(now.wMonth, 2);
+    path.Decimal(now.wDay, 2);
+    path.Put(L'-');
+    path.Decimal(now.wHour, 2);
+    path.Decimal(now.wMinute, 2);
+    path.Decimal(now.wSecond, 2);
+    path.Put(L'-');
+    path.Decimal(processId);
+    path.Put(L".dmp");
+    // Truncated means some other file's name; better no dump than that one.
+    return path.length + 1 < capacity;
+}
+
+// Starts a line in Log's own format: "[HH:MM:SS.mmm] ".
+inline void StampLine(Text<char>& line, const SYSTEMTIME& now)
+{
+    line.Put('[');
+    line.Decimal(now.wHour, 2);
+    line.Put(':');
+    line.Decimal(now.wMinute, 2);
+    line.Put(':');
+    line.Decimal(now.wSecond, 2);
+    line.Put('.');
+    line.Decimal(now.wMilliseconds, 3);
+    line.Put("] ");
+}
+
+// Appends one finished line straight to the log file, bypassing the Log object
+// and its mutex. Log flushes after every line and opens the file shared, so
+// the line lands after whatever was last logged.
+inline void AppendToLog(const Text<char>& line)
+{
+    if (!g_logPath[0]) return;
+    const HANDLE file = CreateFileW(g_logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(file, line.data, static_cast<DWORD>(line.length), &written, nullptr);
+    CloseHandle(file);
+}
+
+// One MiniDumpWriteDump call, made on a thread of its own: MiniDumpWriteDump
+// documents that a process dumping itself may not record the calling thread's
+// stack properly, and the faulting thread is the one that calls the handler.
+// It waits here instead, and the dump takes its registers from the exception.
+struct DumpCall {
+    HANDLE file;
+    MINIDUMP_TYPE type;
+    EXCEPTION_POINTERS* exception;
+    DWORD faultingThread;
+    BOOL ok;
+    DWORD error;
+};
+
+inline DWORD WINAPI WriteDump(void* parameter)
+{
+    auto& call = *static_cast<DumpCall*>(parameter);
+    MINIDUMP_EXCEPTION_INFORMATION information{};
+    information.ThreadId = call.faultingThread;
+    information.ExceptionPointers = call.exception;
+    information.ClientPointers = FALSE;
+    call.ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), call.file, call.type,
+                                call.exception ? &information : nullptr, nullptr, nullptr);
+    call.error = call.ok ? 0 : GetLastError();
+    return 0;
+}
+
+inline LONG WINAPI Handler(EXCEPTION_POINTERS* exception)
+{
+    // Everything here runs in a process that is already broken, so it stays on
+    // the stack, takes no lock this program owns, and treats every call as
+    // allowed to fail. MiniDumpWriteDump itself is the one thing left that
+    // allocates, and there is no dump without it.
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t dump[kPathCapacity + 64];
+    const bool named = ComposeDumpPath(dump, sizeof(dump) / sizeof(dump[0]), now, GetCurrentProcessId());
+
+    // One attempt: a fresh file, the dump, and the file removed again if the
+    // dump failed, so a failure never leaves a truncated .dmp behind. A process
+    // too broken to start a thread still gets the dump, from this one. A dump
+    // that has not finished in 30 s is abandoned with its file, since the
+    // thread still writes to it, and nothing more is tried.
+    bool hung = false;
+    const auto attempt = [&](MINIDUMP_TYPE type, DWORD& failure) {
+        const HANDLE file = CreateFileW(dump, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            failure = GetLastError();
+            return false;
+        }
+        DumpCall call{file, type, exception, GetCurrentThreadId(), FALSE, 0};
+        if (const HANDLE thread = CreateThread(nullptr, 0, &WriteDump, &call, 0, nullptr)) {
+            const DWORD waited = WaitForSingleObject(thread, 30'000);
+            CloseHandle(thread);
+            if (waited != WAIT_OBJECT_0) {
+                hung = true;
+                failure = WAIT_TIMEOUT;
+                return false;
+            }
+        } else {
+            WriteDump(&call);
+        }
+        if (!call.ok) failure = call.error;
+        CloseHandle(file);
+        if (!call.ok) DeleteFileW(dump);
+        return call.ok != FALSE;
+    };
+    // WithIndirectlyReferencedMemory costs a few MB and is what makes the frame
+    // buffers and the failing pointer readable in a debugger; without it a dump
+    // of this player shows the stack and almost nothing else.
+    const auto fullType = static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory |
+                                                     MiniDumpWithDataSegs |
+                                                     MiniDumpWithThreadInfo |
+                                                     MiniDumpWithUnloadedModules);
+    // A process dumping itself is the case MiniDumpWriteDump documents as able
+    // to fail, and the full type is the likelier to: it reads memory the
+    // stacks point at while the process's other threads may be freeing it. A
+    // minimal dump - stacks, modules, the exception - is still the difference
+    // between a crash that can be read and one that cannot, so it follows a
+    // failed full one, and the full dump's error goes in the line either way.
+    // On CI runners, and never in 88 local runs, both have failed together
+    // (ERROR_PARTIAL_COPY, then ERROR_INVALID_USER_BUFFER as an HRESULT): the
+    // signature of a thread starting or exiting mid-dump. That passes, so the
+    // pair is tried once more after a pause.
+    bool written = false, reduced = false;
+    DWORD error = ERROR_BAD_PATHNAME, fullError = 0;
+    for (int round = 0; named && !written && !hung && round < 2; ++round) {
+        if (round) Sleep(250);
+        if (g_failFullDumpForTest) error = ERROR_PARTIAL_COPY;
+        else written = attempt(fullType, error);
+        if (!written && !hung) {
+            fullError = error;
+            written = reduced = attempt(MiniDumpNormal, error);
+        }
+    }
+
+    const DWORD code = exception && exception->ExceptionRecord
+                           ? exception->ExceptionRecord->ExceptionCode : 0u;
+    const void* at = exception && exception->ExceptionRecord
+                         ? exception->ExceptionRecord->ExceptionAddress : nullptr;
+    char buffer[kPathCapacity * 3 + 128];
+    Text<char> line{buffer, sizeof(buffer)};
+    StampLine(line, now);
+    line.Put("Unhandled exception 0x");
+    line.Hex(code);
+    line.Put(" at 0x");
+    line.Hex(reinterpret_cast<uintptr_t>(at));
+    if (written) {
+        if (reduced) {
+            line.Put("; the full minidump failed (winerr=");
+            line.Decimal(fullError);
+            line.Put(")");
+        }
+        line.Put("; minidump written to ");
+        // Converted in place into the line's remaining space.
+        const int room = static_cast<int>(line.capacity - line.length - 2);
+        const int bytes = room > 0 ? WideCharToMultiByte(CP_UTF8, 0, dump, -1, buffer + line.length, room,
+                                                         nullptr, nullptr) : 0;
+        if (bytes > 1) line.length += static_cast<size_t>(bytes - 1);
+        else line.Put("(unprintable path)");
+    } else {
+        line.Put("; a minidump could not be written (winerr=");
+        line.Decimal(error);
+        if (fullError && fullError != error) {
+            line.Put(", full dump winerr=");
+            line.Decimal(fullError);
+        }
+        line.Put(").");
+    }
+    line.Put('\n');
+    AppendToLog(line);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+} // namespace detail
+
+// Call once, as early as possible. Both the player and the helper install it:
+// a helper that dies leaves the parent reporting only an exit code. Resolving
+// the log's path here also opens the log, so the handler never has to.
+inline void Install()
+{
+    detail::Prepare(Log::Path());
+    SetUnhandledExceptionFilter(&detail::Handler);
+}
+
+} // namespace crash_dump

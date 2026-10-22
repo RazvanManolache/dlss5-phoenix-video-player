@@ -1,0 +1,16270 @@
+#include "CacheEvictionPolicy.h"
+#include "VariableFrameRatePolicy.h"
+#include "DroppedFilesPolicy.h"
+#include "StatusNotePolicy.h"
+#include "Log.h"
+#include "AudioFadePolicy.h"
+#include "AudioTrackPolicy.h"
+#include "SubtitlePolicy.h"
+#include "SourceDigestMemo.h"
+#include "AudioEndpointPolicy.h"
+#include "AudioPassthroughPolicy.h"
+#include "PlatformPaths.h"
+#include "RendererRecoveryPolicy.h"
+#include "TestSupport.h"
+#include "TestEnvironment.h"
+
+#include "RuntimePolicy.h"
+#include "GpuPreference.h"
+#include "ReShadeConfig.h"
+#include "Localization.h"
+#include "AppMenu.h"
+#include "UiLayout.h"
+#include "UiResources.h"
+#include "RuntimeLifetime.h"
+#include "YouTubeResolver.h"
+#include "ExampleVideos.h"
+#include "CompletionRegistry.h"
+#include "VideoDecoder.h"
+#include "HdrToneMap.h"
+#include "AudioPlayer.h"
+#include "Log.h"
+#include "NetworkMediaTransaction.h"
+#include "D3D12FenceWait.h"
+#include "FrameGenerationPass.h"
+#include "NgxSession.h"
+#include "D3D12Renderer.h"
+#include "TemporalGuides.h"
+#include "Log.h"
+#include "PlaybackTiming.h"
+#include "LiveSessionPolicy.h"
+#include "FrameRatePolicy.h"
+#include "PlaybackCadence.h"
+#include "NeuralCoverage.h"
+#include "RangeSelection.h"
+#include "ExportPipeline.h"
+#include "RenderCommandLine.h"
+#include "StageExport.h"
+#include "FrameResample.h"
+#include "UntaggedColorPolicy.h"
+#include "DisplayOrientationPolicy.h"
+#include "MediaFoundationSamplePolicy.h"
+#include "HdrPolicy.h"
+#include "SynchronizedPlayback.h"
+#include "HardErrorSuppression.h"
+#include "DeferredCapture.h"
+#include "AudioClockPolicy.h"
+#include "CachedRenderVerdict.h"
+#include "Nv12Convert.h"
+#include "NeuralPresets.h"
+#include "HexText.h"
+#include "AtomicFile.h"
+#include "MediaTools.h"
+#include "Utf8Text.h"
+#include "StatusChipPolicy.h"
+#include "ToolbarTipPolicy.h"
+#include "ChromeMotionPolicy.h"
+#include "EscapeKeyPolicy.h"
+#include "InitialWindowPolicy.h"
+#include "WindowPlacementPolicy.h"
+#include "SliderPolicy.h"
+#include "WarmUpPolicy.h"
+#include "TimelinePolicy.h"
+#include "ShortcutSheetPolicy.h"
+#include "DarkModePolicy.h"
+#include "MediaTransportPolicy.h"
+#include "StartScreenPolicy.h"
+#include "FrameGenAddon.h"
+#include "WindowsArgument.h"
+#include "NeuralWorkerProtocol.h"
+#include "UpdateCheck.h"
+#include "CompareBarPolicy.h"
+#include "CompareViewPolicy.h"
+#include "VsrPolicy.h"
+#include "CompareMaskPolicy.h"
+#include "CompareImageIO.h"
+#include <d3dcompiler.h>
+#include <d3d12shader.h>
+#include "TemporalStabilityPolicy.h"
+#include "NeuralMotionPolicy.h"
+#include "TemporalStabilityShader.h"
+#include "DitherPolicy.h"
+#include "DebandPolicy.h"
+#include "SeekPolicy.h"
+#include "RenderPacePolicy.h"
+#include "PlayerCommandLine.h"
+#include "PlaybackTickPolicy.h"
+#include "NeuralJobPolicy.h"
+#include "NvencDirect.h"
+#include "NvencDirectMux.h"
+#include "NvencDirectPolicy.h"
+#ifdef small
+#undef small
+#endif
+
+#include <windows.h>
+#include <shellapi.h>
+#include <tlhelp32.h>
+#include <winioctl.h>
+
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <cstddef>
+#include <limits>
+#include <iterator>
+#include <memory>
+#include <stop_token>
+#include <sstream>
+#include <string>
+#include <future>
+#include <thread>
+#include <vector>
+
+struct YouTubeResolverTestAccess {
+    static std::unique_ptr<YouTubeResolver> Create(
+        const std::filesystem::path& helperDirectory,
+        std::chrono::milliseconds deadline = std::chrono::milliseconds{500},
+        YouTubeResolver::FailureStage failureStage = YouTubeResolver::FailureStage::None)
+    {
+        YouTubeResolver::Settings settings;
+        settings.helperDirectory = helperDirectory;
+        settings.deadline = deadline;
+        settings.pollInterval = std::chrono::milliseconds{10};
+        settings.shutdownWait = std::chrono::milliseconds{500};
+        settings.failureStage = failureStage;
+        return std::unique_ptr<YouTubeResolver>(new YouTubeResolver(std::move(settings)));
+    }
+    static const std::string& LastStderrSummary(const YouTubeResolver& resolver)
+    {
+        return resolver.lastStderrSummary_;
+    }
+};
+
+struct VideoDecoderTestAccess {
+    // The defaults are for cases that need a probe and a first frame to simply
+    // arrive: the fake helpers are this binary re-entering itself, which a cold
+    // CI runner spawns in well over 250 ms, and that is how
+    // youtube_decoder_discards_only_expected_trailing_partial_frame_test failed
+    // once on GitHub while passing everywhere else. Every case that measures a
+    // timeout passes its own.
+    static std::unique_ptr<VideoDecoder> Create(
+        const std::filesystem::path& helperDirectory,
+        std::chrono::milliseconds probeTimeout = std::chrono::seconds{5},
+        std::chrono::milliseconds stallTimeout = std::chrono::seconds{2},
+        VideoDecoder::FailureStage failureStage = VideoDecoder::FailureStage::None,
+        bool resetAcceleration = true)
+    {
+        // Dead hardware paths are remembered per memo, so a test decoder gets a
+        // fresh one and never touches the process-wide memory. Passing false is
+        // how a test that is checking exactly that memory keeps the memo the
+        // previous Create handed out.
+        static std::shared_ptr<AccelerationMemo> memo;
+        if(resetAcceleration||!memo)memo=MakeAccelerationMemo();
+        VideoDecoder::Settings settings;
+        settings.helperDirectory=helperDirectory.wstring();settings.probeTimeout=probeTimeout;settings.stallTimeout=stallTimeout;settings.faults.resume=failureStage;
+        settings.accelerationMemo=memo;
+        return std::make_unique<VideoDecoder>(std::move(settings));
+    }
+
+    // main.cpp's two Swap callers hand a stream to the decoder that then answers
+    // ColorDescription(), PixelLayout() and Media() for it, so every one of
+    // those has to follow the swap. One side is opened as a known sibling (memo
+    // key handed in, no probe: nothing declared, Bgra), the other sequentially
+    // on the fixture's declared BT.709 4x2 stream (probed, NV12); afterwards
+    // each must describe the other's stream, in both directions.
+    static void CheckSwapCarriesSource(const std::filesystem::path& helperDirectory)
+    {
+        auto known=Create(helperDirectory);
+        VideoDecoder::KnownMedia media{};
+        media.width=4;media.height=2;media.fps=30.0;media.durationSec=30.0;media.hardwareProfile="hevc/yuv420p";
+        CHECK(known->OpenKnown(L"nv12geom",media,MediaSourceKind::LocalFile));
+        CHECK(known->PixelLayout()==VideoPixelLayout::Bgra);
+        CHECK(known->ColorDescription().matrix==ColorMatrix::Unspecified);
+        auto probed=Create(helperDirectory);
+        CHECK(probed->OpenSequential(L"nv12geom",MediaSourceKind::LocalFile));
+        CHECK(probed->PixelLayout()==VideoPixelLayout::Nv12);
+        CHECK(probed->ColorDescription().matrix==ColorMatrix::Bt709);
+        known->Swap(*probed);
+        CHECK(known->PixelLayout()==VideoPixelLayout::Nv12);
+        CHECK(known->ColorDescription().matrix==ColorMatrix::Bt709);
+        CHECK(known->ColorDescription().range==ColorRange::Limited);
+        CHECK(known->Media().hardwareProfile.empty());
+        CHECK(probed->PixelLayout()==VideoPixelLayout::Bgra);
+        CHECK(probed->ColorDescription().matrix==ColorMatrix::Unspecified);
+        CHECK(probed->ColorDescription().range==ColorRange::Unspecified);
+        CHECK_EQ(std::string("hevc/yuv420p"),probed->Media().hardwareProfile);
+        CHECK_EQ(uint32_t{4},probed->Width());
+        CHECK_EQ(uint32_t{2},known->Height());
+    }
+};
+
+struct AudioPlayerTestAccess {
+    static std::unique_ptr<AudioPlayer> Create(
+        const std::filesystem::path& helperDirectory,
+        bool failTerminateJob = false,
+        bool failInitialProcessWait = false,
+        bool failGetExitCodeProcess = false,
+        bool failFinalProcessWait = false,
+        bool failInitialReaderWait = false,
+        bool failFinalReaderWait = false)
+    {
+        AudioPlayer::Settings settings;
+        settings.helperDirectory=helperDirectory.wstring();settings.faults.disableAudioDevice=true;
+        settings.faults.failTerminateJob=failTerminateJob;
+        settings.faults.failInitialProcessWait=failInitialProcessWait;
+        settings.faults.failGetExitCodeProcess=failGetExitCodeProcess;
+        settings.faults.failFinalProcessWait=failFinalProcessWait;
+        settings.faults.failInitialReaderWait=failInitialReaderWait;
+        settings.faults.failFinalReaderWait=failFinalReaderWait;
+        return std::make_unique<AudioPlayer>(std::move(settings));
+    }
+    static double SeekBase(const AudioPlayer& player){return player.SeekBaseSeconds();}
+    static uint64_t SubmittedBuffers(const AudioPlayer& player){return player.SubmittedBuffers();}
+};
+
+struct RendererOwnedSentinel final : D3D12RendererTestOwnedResource {
+    explicit RendererOwnedSentinel(std::shared_ptr<int> destroyed):destroyed(std::move(destroyed)){}
+    ~RendererOwnedSentinel() override {++*destroyed;}
+    std::shared_ptr<int> destroyed;
+};
+
+struct D3D12RendererTestAccess {
+    // How many root constants the renderer sets for the Compose cbuffer.
+    static constexpr uint32_t ComposeConstantCount(){return D3D12Renderer::ComposeConstantCount;}
+    // The hooks object exists only once a test installs something.
+    static D3D12RendererTestHooks& Hooks(D3D12Renderer& renderer)
+    {
+        if(!renderer.m_testHooks)
+            renderer.m_testHooks=std::make_unique<D3D12RendererTestHooks>();
+        return *renderer.m_testHooks;
+    }
+
+    // The source conversion's program, compiled the way the renderer compiles it
+    // but without a device, so every arm is checkable on any machine.
+    static bool CompileSourceNv12(SourceNv12Conversion conversion,
+                                  Microsoft::WRL::ComPtr<ID3DBlob>& blob)
+    {
+        return D3D12Renderer::CompileSourceNv12(conversion,blob);
+    }
+    static bool CompilePresentProgram(const char* entry,Microsoft::WRL::ComPtr<ID3DBlob>& blob,bool hdrOutput=false)
+    {
+        return D3D12Renderer::CompilePresentProgram(entry,"ps_5_1",blob,hdrOutput);
+    }
+
+    static void ConfigureWait(D3D12Renderer& renderer,
+                              d3d12_renderer_detail::FenceWaitResult result,
+                              int& waits)
+    {
+        Hooks(renderer).waitGPU=[&waits,result]{++waits;return result;};
+    }
+    static void OwnSentinel(D3D12Renderer& renderer,
+                            std::unique_ptr<D3D12RendererTestOwnedResource> sentinel)
+    {
+        Hooks(renderer).ownedResource=std::move(sentinel);
+    }
+    static bool WaitForContinuedUse(D3D12Renderer& renderer)
+    {
+        return renderer.WaitGPUForContinuedUse();
+    }
+    static void ConfigureFrameSignal(D3D12Renderer& renderer,HRESULT signalResult,
+                                     HRESULT deviceRemovedReason,int& signalCalls,
+                                     int& reasonChecks)
+    {
+        Hooks(renderer).frameSignal=[&signalCalls,signalResult](uint64_t){
+            ++signalCalls;return signalResult;
+        };
+        Hooks(renderer).deviceRemovedReason=[&reasonChecks,deviceRemovedReason]{
+            ++reasonChecks;return deviceRemovedReason;
+        };
+    }
+    static void SetFrameTracking(D3D12Renderer& renderer,uint32_t frameSlot,
+                                 uint64_t fenceValue,uint32_t trackedSlot,
+                                 uint64_t trackedFence)
+    {
+        renderer.m_frameSlot=frameSlot;renderer.m_fenceValue=fenceValue;
+        renderer.m_frameFence[trackedSlot]=trackedFence;
+    }
+    static bool SignalFrameSlot(D3D12Renderer& renderer,uint32_t slot)
+    {
+        return renderer.SignalFrameSlot(slot);
+    }
+    static uint32_t FrameSlot(const D3D12Renderer& renderer){return renderer.m_frameSlot;}
+    static uint64_t FenceValue(const D3D12Renderer& renderer){return renderer.m_fenceValue;}
+    static uint64_t FrameFence(const D3D12Renderer& renderer,uint32_t slot){return renderer.m_frameFence[slot];}
+    static bool GPUUnusable(const D3D12Renderer& renderer){return renderer.m_gpuUnusable;}
+    static d3d12_renderer_detail::FenceWaitResult LastFenceResult(const D3D12Renderer& renderer){return renderer.m_lastFenceWaitResult;}
+    static void ConfigureCacheCapture(D3D12Renderer& renderer,uint32_t width,uint32_t height,
+                                      bool neuralUsed,
+                                      std::function<bool(std::vector<uint8_t>&)> capture)
+    {
+        renderer.m_outputW=width;renderer.m_outputH=height;
+        renderer.m_lastDLSSUsed=neuralUsed;Hooks(renderer).cacheCapture=std::move(capture);
+    }
+    static bool CaptureEvaluatedFrame(D3D12Renderer& renderer,CapturedVideoFrame& frame)
+    {
+        return renderer.CaptureEvaluatedFrame(frame);
+    }
+    static void SetLastRenderedIdentity(D3D12Renderer& renderer,const FrameIdentity& id)
+    {
+        renderer.m_lastRenderedId=id;
+    }
+    // The deleter ends the process on the second renderer it has to retain;
+    // a suite that retains one per case starts each such case from zero.
+    static void ResetRetainedRenderers(){D3D12Renderer::s_retainedRenderers.store(0);}
+    static void OnExitProcess(D3D12Renderer& renderer,std::function<void()> exit)
+    {
+        Hooks(renderer).exitProcess=std::move(exit);
+    }
+};
+
+namespace {
+
+constexpr std::string_view kNeuralAddon = "DLSS 5 Neural Rendering@renodx-dlss5.addon64";
+constexpr std::string_view kNeuralAddonName = "DLSS 5 Neural Rendering";
+constexpr std::string_view kNeuralAddonFilename = "renodx-dlss5.addon64";
+
+void runtime_shutdown_releases_player_before_media_foundation_and_com_test()
+{
+    std::vector<int> observed;
+    struct OwnedPlayer {
+        std::vector<int>& order;
+        ~OwnedPlayer() { order.push_back(1); }
+    };
+
+    const int result = RunPlayerRuntime(
+        [&] {
+            OwnedPlayer player{observed};
+            return 27;
+        },
+        [&] { observed.push_back(2); },
+        [&] { observed.push_back(3); });
+
+    CHECK_EQ(27, result);
+    CHECK_EQ(size_t{3}, observed.size());
+    if (observed.size() == 3) {
+        CHECK_EQ(1, observed[0]);
+        CHECK_EQ(2, observed[1]);
+        CHECK_EQ(3, observed[2]);
+    }
+}
+
+void runtime_shutdown_rethrows_only_after_single_ordered_cleanup_test()
+{
+    std::vector<int> observed;
+    int mediaFoundationShutdowns = 0;
+    int comUninitializations = 0;
+    bool caughtExpectedException = false;
+    struct ExpectedFailure {};
+    struct OwnedPlayer {
+        std::vector<int>& order;
+        ~OwnedPlayer() { order.push_back(1); }
+    };
+
+    try {
+        RunPlayerRuntime(
+            [&]() -> int {
+                OwnedPlayer player{observed};
+                throw ExpectedFailure{};
+            },
+            [&] {
+                ++mediaFoundationShutdowns;
+                observed.push_back(2);
+            },
+            [&] {
+                ++comUninitializations;
+                observed.push_back(3);
+            });
+    } catch (const ExpectedFailure&) {
+        caughtExpectedException = true;
+    }
+
+    CHECK(caughtExpectedException);
+    CHECK_EQ(1, mediaFoundationShutdowns);
+    CHECK_EQ(1, comUninitializations);
+    CHECK_EQ(size_t{3}, observed.size());
+    if (observed.size() == 3) {
+        CHECK_EQ(1, observed[0]);
+        CHECK_EQ(2, observed[1]);
+        CHECK_EQ(3, observed[2]);
+    }
+}
+
+// A path in %TEMP% that no other PolicyTests process uses. The suite runs as
+// more than one process at once (`ctest -j` runs its registrations side by
+// side), and two of them writing one fixed name read each other's fixtures.
+std::filesystem::path process_temp_path(std::wstring_view name)
+{
+    return std::filesystem::temp_directory_path() /
+        (std::to_wstring(GetCurrentProcessId()) + L"-" + std::wstring(name));
+}
+
+void write_binary_file(const std::filesystem::path& path, std::string_view content)
+{
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    CHECK(output.is_open());
+    if (!output.is_open()) return;
+    output.write(content.data(), static_cast<std::streamsize>(content.size()));
+    CHECK(output.good());
+    output.flush();
+    CHECK(output.good());
+    output.close();
+    CHECK(!output.fail());
+}
+
+std::string read_binary_file(const std::filesystem::path& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    CHECK(input.is_open());
+    if (!input.is_open()) return {};
+    input.seekg(0, std::ios::end);
+    CHECK(input.good());
+    const std::streamoff size = input.tellg();
+    CHECK(size >= 0);
+    if (size < 0) return {};
+    input.seekg(0, std::ios::beg);
+    CHECK(input.good());
+    std::string content(static_cast<size_t>(size), '\0');
+    if (!content.empty()) input.read(content.data(), static_cast<std::streamsize>(content.size()));
+    CHECK(input.good() || input.eof());
+    CHECK_EQ(static_cast<std::streamsize>(content.size()), input.gcount());
+    input.close();
+    CHECK(!input.fail());
+    return content;
+}
+
+void remove_file_if_present(const std::filesystem::path& path)
+{
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    CHECK(!error);
+    CHECK(!std::filesystem::exists(path, error));
+    CHECK(!error);
+}
+
+struct MenuEntry {
+    std::wstring text;
+    UINT command;
+    UINT state;
+};
+
+void collect_menu_entries(HMENU menu, std::vector<MenuEntry>& entries)
+{
+    const int count = GetMenuItemCount(menu);
+    for (int index = 0; index < count; ++index) {
+        MENUITEMINFOW item{sizeof(item)};
+        item.fMask = MIIM_STRING | MIIM_ID | MIIM_SUBMENU | MIIM_STATE;
+        GetMenuItemInfoW(menu, static_cast<UINT>(index), TRUE, &item);
+
+        std::wstring text(item.cch + 1, L'\0');
+        item.dwTypeData = text.data();
+        item.cch = static_cast<UINT>(text.size());
+        GetMenuItemInfoW(menu, static_cast<UINT>(index), TRUE, &item);
+        text.resize(item.cch);
+        entries.push_back({std::move(text), item.wID, item.fState});
+        if (item.hSubMenu) collect_menu_entries(item.hSubMenu, entries);
+    }
+}
+
+bool has_menu_entry(const std::vector<MenuEntry>& entries, std::wstring_view text, UINT command)
+{
+    for (const auto& entry : entries) {
+        if (entry.text == text && entry.command == command) return true;
+    }
+    return false;
+}
+
+bool has_menu_text(const std::vector<MenuEntry>& entries, std::wstring_view text)
+{
+    for (const auto& entry : entries) {
+        if (entry.text == text) return true;
+    }
+    return false;
+}
+
+HMENU find_top_level_submenu(HMENU menu, std::wstring_view text)
+{
+    const int count = GetMenuItemCount(menu);
+    for (int index = 0; index < count; ++index) {
+        MENUITEMINFOW item{sizeof(item)};
+        item.fMask = MIIM_STRING | MIIM_SUBMENU;
+        GetMenuItemInfoW(menu, static_cast<UINT>(index), TRUE, &item);
+        std::wstring label(item.cch + 1, L'\0');
+        item.dwTypeData = label.data();
+        item.cch = static_cast<UINT>(label.size());
+        GetMenuItemInfoW(menu, static_cast<UINT>(index), TRUE, &item);
+        label.resize(item.cch);
+        if (label == text) return item.hSubMenu;
+    }
+    return nullptr;
+}
+
+std::vector<ToolbarAction> toolbar_actions(const std::vector<ToolbarItem>& items)
+{
+    std::vector<ToolbarAction> actions;
+    actions.reserve(items.size());
+    for (const auto& item : items) actions.push_back(item.action);
+    return actions;
+}
+
+const ToolbarItem* find_toolbar_item(const std::vector<ToolbarItem>& items, ToolbarAction action)
+{
+    for (const auto& item : items) {
+        if (item.action == action) return &item;
+    }
+    return nullptr;
+}
+
+void check_toolbar_items_do_not_overlap(const std::vector<ToolbarItem>& items)
+{
+    for (size_t left = 0; left < items.size(); ++left) {
+        for (size_t right = left + 1; right < items.size(); ++right) {
+            const RECT& a = items[left].bounds;
+            const RECT& b = items[right].bounds;
+            CHECK(a.right <= b.left || b.right <= a.left ||
+                  a.bottom <= b.top || b.bottom <= a.top);
+        }
+    }
+}
+
+void toolbar_layout_selects_stable_action_sets_for_width_modes_test()
+{
+    const std::vector<ToolbarAction> allActions{
+        ToolbarAction::Open,
+        ToolbarAction::Back10,
+        ToolbarAction::PlayPause,
+        ToolbarAction::Stop,
+        ToolbarAction::Forward10,
+        ToolbarAction::Mute,
+        ToolbarAction::ToggleNeuralRendering,
+        ToolbarAction::ToggleUpscaling,
+        ToolbarAction::ToggleFrameGeneration,
+        ToolbarAction::Aspect,
+        ToolbarAction::Adjustments,
+        ToolbarAction::DebugView,
+        ToolbarAction::Fullscreen,
+    };
+
+    // The required set is whatever the layout keeps at its own minimum width,
+    // measured here rather than restated: a copy of the list only reported
+    // that somebody had edited the toolbar, which is how this test failed when
+    // the frame-generation pill stopped being required.
+    const auto normal = LayoutToolbar(MinimumToolbarClientWidth(96), 180, 96);
+    const std::vector<ToolbarAction> required = toolbar_actions(normal);
+    CHECK(!required.empty());
+    for (const auto& item : normal) CHECK(!item.compact);
+
+    // Below that width nothing required drops off the bar - the pills only go
+    // compact - so every action reachable at 320 px is reachable at any width.
+    const auto narrow = LayoutToolbar(320, 180, 96);
+    CHECK_EQ(required, toolbar_actions(narrow));
+    for (const auto& item : narrow) CHECK(item.compact);
+
+    const auto wide = LayoutToolbar(1600, 180, 96);
+    CHECK_EQ(allActions, toolbar_actions(wide));
+    for (const auto& item : wide) CHECK(!item.compact);
+
+    // Whatever the required set holds, it keeps the wide bar's order, so a
+    // pill never jumps across its neighbours when the window is resized. And
+    // opening a file, starting playback and leaving fullscreen have to stay
+    // reachable at the narrowest window the player allows.
+    const auto is_ordered_subset = [](const std::vector<ToolbarAction>& subset,
+                                      const std::vector<ToolbarAction>& full) {
+        auto cursor = full.begin();
+        for (const ToolbarAction action : subset) {
+            cursor = std::find(cursor, full.end(), action);
+            if (cursor == full.end()) return false;
+            ++cursor;
+        }
+        return true;
+    };
+    CHECK(is_ordered_subset(required, allActions));
+    for (const ToolbarAction action : {ToolbarAction::Open, ToolbarAction::PlayPause,
+                                       ToolbarAction::Fullscreen}) {
+        CHECK(std::find(required.begin(), required.end(), action) != required.end());
+    }
+}
+
+void toolbar_layout_preserves_group_separation_test()
+{
+    const auto items = LayoutToolbar(1600, 180, 96);
+    const ToolbarItem* back = find_toolbar_item(items, ToolbarAction::Back10);
+    const ToolbarItem* play = find_toolbar_item(items, ToolbarAction::PlayPause);
+    const ToolbarItem* mute = find_toolbar_item(items, ToolbarAction::Mute);
+    const ToolbarItem* neural = find_toolbar_item(items, ToolbarAction::ToggleNeuralRendering);
+    const ToolbarItem* upscaling = find_toolbar_item(items, ToolbarAction::ToggleUpscaling);
+    const ToolbarItem* frameGeneration = find_toolbar_item(items, ToolbarAction::ToggleFrameGeneration);
+    const ToolbarItem* adjustments = find_toolbar_item(items, ToolbarAction::Adjustments);
+    const ToolbarItem* debug = find_toolbar_item(items, ToolbarAction::DebugView);
+    const ToolbarItem* fullscreen = find_toolbar_item(items, ToolbarAction::Fullscreen);
+    CHECK(back && play && mute && neural && upscaling && frameGeneration && adjustments && debug && fullscreen);
+    if (!(back && play && mute && neural && upscaling && frameGeneration && adjustments && debug && fullscreen)) return;
+
+    CHECK_EQ(4L, play->bounds.left - back->bounds.right);
+    CHECK_EQ(12L, neural->bounds.left - mute->bounds.right);
+    CHECK_EQ(4L, upscaling->bounds.left - neural->bounds.right);
+    CHECK_EQ(4L, frameGeneration->bounds.left - upscaling->bounds.right);
+    CHECK_EQ(12L, debug->bounds.left - adjustments->bounds.right);
+    CHECK_EQ(4L, fullscreen->bounds.left - debug->bounds.right);
+}
+
+void toolbar_layout_scales_hit_height_and_avoids_overlap_test()
+{
+    const auto narrow = LayoutToolbar(320, 180, 96);
+    const auto normal = LayoutToolbar(900, 180, 96);
+    const auto wide = LayoutToolbar(1600, 180, 96);
+    const auto scaled = LayoutToolbar(960, 300, 144);
+
+    for (const auto* items : {&narrow, &normal, &wide}) {
+        CHECK(!items->empty());
+        for (const auto& item : *items) {
+            CHECK(item.bounds.bottom - item.bounds.top >= 36);
+        }
+        check_toolbar_items_do_not_overlap(*items);
+    }
+    CHECK(!scaled.empty());
+    for (const auto& item : scaled) {
+        CHECK(item.bounds.bottom - item.bounds.top >= 54);
+    }
+    check_toolbar_items_do_not_overlap(scaled);
+
+    CHECK_EQ(16L, wide.front().bounds.left);
+    CHECK(wide.back().bounds.right <= 1600 - 16);
+    CHECK_EQ(24L, scaled.front().bounds.left);
+    CHECK(scaled.back().bounds.right <= 960 - 24);
+}
+
+void toolbar_hit_testing_is_half_open_and_boundary_stable_test()
+{
+    const auto items = LayoutToolbar(640, 180, 96);
+    CHECK(!items.empty());
+    for (const auto& item : items) {
+        const LONG middleX = item.bounds.left + (item.bounds.right - item.bounds.left) / 2;
+        const LONG middleY = item.bounds.top + (item.bounds.bottom - item.bounds.top) / 2;
+        CHECK_EQ(item.action, HitTestToolbar(items, POINT{item.bounds.left, middleY}));
+        CHECK_EQ(item.action, HitTestToolbar(items, POINT{item.bounds.right - 1, middleY}));
+        CHECK_EQ(ToolbarAction::None, HitTestToolbar(items, POINT{item.bounds.right, middleY}));
+        CHECK_EQ(item.action, HitTestToolbar(items, POINT{middleX, item.bounds.bottom - 1}));
+        CHECK_EQ(ToolbarAction::None, HitTestToolbar(items, POINT{middleX, item.bounds.bottom}));
+    }
+    CHECK_EQ(ToolbarAction::None, HitTestToolbar(items, POINT{-1, -1}));
+}
+
+void minimum_toolbar_client_width_owns_required_target_floor_across_dpi_test()
+{
+    // Measured from the layout at 96 dpi instead of listed: the set's
+    // membership is the toolbar's business, and what this test owns is that
+    // the floor produces the same set, uncompacted, at every dpi.
+    const std::vector<ToolbarAction> requiredNarrow =
+        toolbar_actions(LayoutToolbar(MinimumToolbarClientWidth(96), 400, 96));
+    CHECK(!requiredNarrow.empty());
+
+    for (const UINT dpi : {0u, 96u, 120u, 144u, 192u}) {
+        const UINT effectiveDpi = dpi == 0 ? 96 : dpi;
+        const int clientWidth = MinimumToolbarClientWidth(dpi);
+        const int clientHeight = MulDiv(400, static_cast<int>(effectiveDpi), 96);
+        const auto items = LayoutToolbar(clientWidth, clientHeight, dpi);
+        CHECK_EQ(requiredNarrow, toolbar_actions(items));
+        // The floor is exact: one pixel less and the same pills have to shrink
+        // to their compact form, which is what the minimum track size buys.
+        const auto belowFloor = LayoutToolbar(clientWidth - 1, clientHeight, dpi);
+        CHECK_EQ(requiredNarrow, toolbar_actions(belowFloor));
+        for (const auto& item : belowFloor) CHECK(item.compact);
+        for (const auto& item : items) {
+            CHECK(!item.compact);
+            CHECK(item.bounds.bottom - item.bounds.top >= MulDiv(36, static_cast<int>(effectiveDpi), 96));
+        }
+        check_toolbar_items_do_not_overlap(items);
+        if (!items.empty()) {
+            CHECK_EQ(static_cast<LONG>(MulDiv(kToolbarOuterGutterDip, static_cast<int>(effectiveDpi), 96)), items.front().bounds.left);
+            CHECK_EQ(static_cast<LONG>(clientWidth - MulDiv(kToolbarOuterGutterDip, static_cast<int>(effectiveDpi), 96)), items.back().bounds.right);
+        }
+    }
+}
+
+bool rectangles_intersect(const RECT& left, const RECT& right)
+{
+    return left.left < right.right && left.right > right.left &&
+           left.top < right.bottom && left.bottom > right.top;
+}
+
+void volume_slider_never_intersects_compact_or_threshold_toolbar_test()
+{
+    for (const int width : {320}) {
+        const auto items = LayoutToolbar(width, 180, 96);
+        CHECK(!LayoutVolumeSlider(width, 180, 96, items).has_value());
+    }
+
+    // The slider needs the room the pills leave once they are at full width;
+    // below that they take every pixel between the gutters.
+    const int thresholdWidth = FullPillToolbarClientWidth(96) + 185;
+    const auto thresholdItems = LayoutToolbar(thresholdWidth, 180, 96);
+    const auto slider = LayoutVolumeSlider(thresholdWidth, 180, 96, thresholdItems);
+    CHECK(slider.has_value());
+    if (!slider) return;
+    for (const auto& item : thresholdItems) {
+        CHECK(!rectangles_intersect(*slider, item.bounds));
+    }
+    CHECK_EQ(static_cast<LONG>(thresholdWidth - 185), slider->left);
+    CHECK_EQ(static_cast<LONG>(thresholdWidth - 95), slider->right);
+    // On the button row's centre line, and as tall as a button to grab.
+    for (const UINT dpi : {96u, 168u}) {
+        const int width = MulDiv(thresholdWidth, static_cast<int>(dpi), 96);
+        const int height = MulDiv(180, static_cast<int>(dpi), 96);
+        const auto items = LayoutToolbar(width, height, dpi);
+        const auto placed = LayoutVolumeSlider(width, height, dpi, items);
+        CHECK(placed.has_value());
+        if (!placed || items.empty()) continue;
+        CHECK_EQ(items.front().bounds.top + items.front().bounds.bottom, placed->top + placed->bottom);
+        CHECK(placed->bottom - placed->top >= MulDiv(kToolbarMinHitHeightDip, static_cast<int>(dpi), 96));
+    }
+}
+
+void toolbar_focus_order_includes_idle_open_and_skips_disabled_actions_test()
+{
+    const std::array idleItems{ToolbarItem{ToolbarAction::Open, RECT{0, 0, 190, 42}, false}};
+    const ToolbarAvailability idle{};
+    CHECK(IsToolbarActionEnabled(ToolbarAction::Open, idle));
+    CHECK_EQ(ToolbarAction::Open,
+             NextFocusableToolbarAction(idleItems, ToolbarAction::None, false, idle));
+    CHECK_EQ(ToolbarAction::Open,
+             NextFocusableToolbarAction(idleItems, ToolbarAction::None, true, idle));
+    CHECK_EQ(ToolbarAction::Open,
+             NextFocusableToolbarAction(idleItems, ToolbarAction::Open, true, idle));
+
+    const auto loadedItems = LayoutToolbar(1600, 180, 96);
+    const ToolbarAvailability withoutRenderer{true, false, false};
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::ToggleNeuralRendering, withoutRenderer));
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::ToggleUpscaling, withoutRenderer));
+    // Frame generation is not on the renderer's gate here: the assertion that
+    // used to sit at this line read as "no renderer, so no conversion" while
+    // passing only because availability was false. Its real rule is below.
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::Adjustments, withoutRenderer));
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::DebugView, withoutRenderer));
+    const ToolbarAvailability seeking{true, true, true};
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::Aspect, seeking));
+    CHECK(IsToolbarActionEnabled(ToolbarAction::Adjustments, seeking));
+    CHECK(IsToolbarActionEnabled(ToolbarAction::DebugView, seeking));
+    CHECK_EQ(ToolbarAction::Adjustments,
+             NextFocusableToolbarAction(loadedItems, ToolbarAction::Mute, false,
+                                        seeking));
+}
+
+// The frame-generation pill answers to exactly two facts, and a seek is not
+// one of them: a conversion reads the whole file, so it can be started while
+// the playhead is moving. Restating the seek gate here is what greyed the pill
+// out mid-seek while the identically-named menu item stayed live.
+void frame_generation_pill_follows_media_and_availability_only_test()
+{
+    ToolbarAvailability ready{};
+    ready.mediaLoaded = true;
+    ready.frameGenerationAvailable = true;
+    CHECK(IsToolbarActionEnabled(ToolbarAction::ToggleFrameGeneration, ready));
+
+    ToolbarAvailability withoutMedia = ready;
+    withoutMedia.mediaLoaded = false;
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::ToggleFrameGeneration, withoutMedia));
+
+    ToolbarAvailability withoutAvailability = ready;
+    withoutAvailability.frameGenerationAvailable = false;
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::ToggleFrameGeneration, withoutAvailability));
+
+    ToolbarAvailability seekingReady = ready;
+    seekingReady.seeking = true;
+    CHECK(IsToolbarActionEnabled(ToolbarAction::ToggleFrameGeneration, seekingReady));
+    // The pills beside it do stop during a seek, so the difference is the
+    // point and not an accident of this availability value.
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::ToggleUpscaling, seekingReady));
+
+    // The pill reads "Frame Generation · Cancel" while a conversion runs, and a
+    // control that says Cancel has to be clickable. Availability is false then
+    // by construction - nothing can be started - so gating the pill on it alone
+    // made the label a lie: the click never reached CancelFrameGeneration.
+    ToolbarAvailability converting{};
+    converting.mediaLoaded = true;
+    converting.frameGenerationAvailable = false;
+    converting.frameGenerationConverting = true;
+    CHECK(IsToolbarActionEnabled(ToolbarAction::ToggleFrameGeneration, converting));
+    // Still nothing without media, whatever a stale conversion flag says.
+    ToolbarAvailability convertingWithoutMedia = converting;
+    convertingWithoutMedia.mediaLoaded = false;
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::ToggleFrameGeneration, convertingWithoutMedia));
+    // And the flag is frame generation's alone: it must not revive a neighbour.
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::ToggleUpscaling, converting));
+}
+
+void open_action_content_keeps_idle_and_toolbar_copy_distinct_test()
+{
+    Localizer localizer;
+    const std::wstring idle = localizer.Get(OpenActionLabelKey(true).data());
+    const std::wstring toolbar = localizer.Get(OpenActionLabelKey(false).data());
+
+    CHECK_EQ(std::wstring(L"Open file"), idle);
+    CHECK_EQ(std::wstring(L"Open"), toolbar);
+    CHECK(idle != toolbar);
+    CHECK(idle.find(L"Abrir") == std::wstring::npos);
+    CHECK(toolbar.find(L"Abrir") == std::wstring::npos);
+}
+
+void focused_toolbar_action_reconciles_layout_and_availability_changes_test()
+{
+    const ToolbarAvailability loaded{true, false, true, false};
+    const auto wide = LayoutToolbar(1600, 180, 96);
+    const auto narrow = LayoutToolbar(320, 180, 96);
+    const auto contains = [](std::span<const ToolbarItem> items, ToolbarAction action) {
+        return std::any_of(items.begin(), items.end(),
+                           [action](const ToolbarItem& item) { return item.action == action; });
+    };
+
+    CHECK(contains(wide, ToolbarAction::DebugView));
+    CHECK(!contains(narrow, ToolbarAction::DebugView));
+    CHECK(contains(wide, ToolbarAction::ToggleNeuralRendering));
+    CHECK(contains(wide, ToolbarAction::ToggleUpscaling));
+    CHECK(contains(wide, ToolbarAction::ToggleFrameGeneration));
+    CHECK(contains(wide, ToolbarAction::PlayPause));
+
+    CHECK_EQ(ToolbarAction::Open,
+             ReconcileFocusedToolbarAction(narrow, ToolbarAction::DebugView, loaded));
+
+    ToolbarAvailability withoutRenderer = loaded;
+    withoutRenderer.rendererReady = false;
+    CHECK_EQ(ToolbarAction::Open,
+             ReconcileFocusedToolbarAction(wide, ToolbarAction::ToggleNeuralRendering,
+                                            withoutRenderer));
+
+    CHECK_EQ(ToolbarAction::PlayPause,
+             ReconcileFocusedToolbarAction(wide, ToolbarAction::PlayPause, loaded));
+}
+
+void idle_surface_exposes_file_and_disabled_youtube_without_focusing_it_test()
+{
+    const IdleSurfaceLayout wide = LayoutIdleSurface(900, 520, 96);
+    CHECK(!wide.stacked);
+    CHECK_EQ(ToolbarAction::Open, wide.actions[0].action);
+    CHECK_EQ(ToolbarAction::OpenYouTube, wide.actions[1].action);
+    CHECK(wide.actions[0].bounds.right <= wide.actions[1].bounds.left);
+
+    const IdleSurfaceLayout small = LayoutIdleSurface(320, 360, 96);
+    CHECK(small.stacked);
+    for (const auto& action : small.actions) {
+        CHECK(action.bounds.left >= 0);
+        CHECK(action.bounds.top >= 0);
+        CHECK(action.bounds.right <= 320);
+        CHECK(action.bounds.bottom <= 360);
+        CHECK(action.bounds.right > action.bounds.left);
+        CHECK(action.bounds.bottom > action.bounds.top);
+    }
+    CHECK(small.actions[0].bounds.bottom <= small.actions[1].bounds.top);
+    CHECK(small.youtubeReason.bottom <= 360);
+
+    struct HeightCase { UINT dpi; int clientHeight; int hitHeight; };
+    constexpr HeightCase heights[]{
+        {96, 150, 36},
+        {120, 188, 45},
+        {144, 225, 54},
+        {192, 300, 72},
+    };
+    for (const auto& test : heights) {
+        CHECK_EQ(test.clientHeight, MinimumIdleClientHeight(test.dpi));
+        const IdleSurfaceLayout shortLayout = LayoutIdleSurface(
+            MinimumToolbarClientWidth(test.dpi), test.clientHeight, test.dpi);
+        CHECK(!shortLayout.stacked);
+        for (const auto& action : shortLayout.actions) {
+            CHECK(action.bounds.top >= 0);
+            CHECK(action.bounds.bottom <= test.clientHeight);
+            CHECK(action.bounds.bottom - action.bounds.top >= test.hitHeight);
+        }
+        CHECK(shortLayout.youtubeReason.top >= shortLayout.actions[1].bounds.bottom);
+        CHECK(shortLayout.youtubeReason.bottom >= shortLayout.youtubeReason.top);
+        CHECK(shortLayout.youtubeReason.bottom <= test.clientHeight);
+    }
+
+    const bool youtubeAvailable = YouTubePlaybackAvailable();
+    CHECK(youtubeAvailable);
+    const ToolbarAvailability intermediate{false, false, false, false};
+    CHECK(IsToolbarActionEnabled(ToolbarAction::Open, intermediate));
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::OpenYouTube, intermediate));
+    CHECK_EQ(ToolbarAction::Open,
+             NextFocusableToolbarAction(small.actions, ToolbarAction::None, false,
+                                        intermediate));
+    CHECK_EQ(ToolbarAction::Open,
+             NextFocusableToolbarAction(small.actions, ToolbarAction::Open, false,
+                                        intermediate));
+
+    ToolbarAvailability later = intermediate;
+    later.youtubeAvailable = true;
+    CHECK_EQ(ToolbarAction::OpenYouTube,
+             NextFocusableToolbarAction(small.actions, ToolbarAction::Open, false, later));
+}
+
+void dpi_change_suggested_rect_respects_new_monitor_minimum_track_size_test()
+{
+    const RECT tooSmall{120, 80, 520, 300};
+    const RECT clamped = ClampWindowRectToMinimumTrackSize(tooSmall, POINT{451, 361});
+    CHECK_EQ(120L, clamped.left);
+    CHECK_EQ(80L, clamped.top);
+    CHECK_EQ(571L, clamped.right);
+    CHECK_EQ(441L, clamped.bottom);
+
+    const RECT alreadyLarge{120, 80, 700, 600};
+    const RECT unchanged = ClampWindowRectToMinimumTrackSize(alreadyLarge, POINT{451, 361});
+    CHECK_EQ(alreadyLarge.left, unchanged.left);
+    CHECK_EQ(alreadyLarge.top, unchanged.top);
+    CHECK_EQ(alreadyLarge.right, unchanged.right);
+    CHECK_EQ(alreadyLarge.bottom, unchanged.bottom);
+}
+
+void timeline_reads_chapters_the_way_ffprobe_prints_them_test()
+{
+    // Captured from the staged ffprobe on a Matroska file with two chapters,
+    // one of them with a comma in its title - the reason this is not CSV.
+    const std::string output =
+        "start_time=20.000000\r\nend_time=60.000000\r\nTAG:title=Main\r\n"
+        "start_time=0.000000\r\nend_time=20.000000\r\nTAG:title=Intro, part one\r\n"
+        "start_time=N/A\r\nend_time=70.000000\r\n"
+        "start_time=65.500000\r\nend_time=70.000000\r\n";
+    const auto chapters = timeline::ParseFfprobeChapters(output);
+    REQUIRE(chapters.size() == 3);
+    // Sorted by start; the one with an unreadable start is dropped rather
+    // than drawn somewhere made up; a missing title stays empty.
+    CHECK_EQ(0.0, chapters[0].startSeconds);
+    CHECK(chapters[0].title == L"Intro, part one");
+    CHECK_EQ(20.0, chapters[1].startSeconds);
+    CHECK_EQ(60.0, chapters[1].endSeconds);
+    CHECK(chapters[1].title == L"Main");
+    CHECK_EQ(65.5, chapters[2].startSeconds);
+    CHECK(chapters[2].title.empty());
+    CHECK(timeline::ParseFfprobeChapters("").empty());
+    CHECK(timeline::ParseFfprobeChapters("garbage\n=\n").empty());
+    // UTF-8 titles come back as the characters they are.
+    const auto accented = timeline::ParseFfprobeChapters("start_time=1.0\nTAG:title=Caf\xc3\xa9\n");
+    REQUIRE(accented.size() == 1);
+    CHECK(accented[0].title == L"Caf\u00e9");
+
+    CHECK(timeline::ChapterAt(chapters, 10.0) == &chapters[0]);
+    CHECK(timeline::ChapterAt(chapters, 20.0) == &chapters[1]);
+    CHECK(timeline::ChapterAt(chapters, 99.0) == &chapters[2]);
+    const std::vector<timeline::Chapter> late{{5.0, 9.0, L"Late"}};
+    CHECK(timeline::ChapterAt(late, 1.0) == nullptr);
+    const auto arguments = timeline::ChapterProbeArguments(L"C:\\media\\a b.mkv");
+    CHECK(std::find(arguments.begin(), arguments.end(), L"default=noprint_wrappers=1") != arguments.end());
+    CHECK(arguments.back() == L"C:\\media\\a b.mkv");
+}
+
+void timeline_hover_says_where_and_what_the_render_map_says_there_test()
+{
+    timeline::HoverFacts facts{};
+    facts.seconds = 83.9;
+    // An ordinary video: only the time.
+    CHECK(timeline::HoverText(facts) == L"1:23");
+    facts.chapter = L"Main";
+    facts.rendered = false;
+    facts.secondsToFullCoverage = 129.2;
+    CHECK(timeline::HoverText(facts) == L"1:23 \u00b7 Main \u00b7 Not rendered yet \u00b7 All rendered in 2:10");
+    facts.rendered = true;
+    facts.secondsToFullCoverage.reset();
+    facts.seconds = 3723.0;
+    CHECK(timeline::HoverText(facts) == L"1:02:03 \u00b7 Main \u00b7 Rendered");
+    // A source with no length says how to seek instead of a position it cannot have.
+    facts.durationKnown = false;
+    CHECK(timeline::HoverText(facts).find(L"Length unknown") == 0);
+
+    // The hatched head: capped, floored, and nothing off the track.
+    const auto span = timeline::RenderingNowSpan(0, 1000, 400, 900, 4, 28);
+    REQUIRE(span.has_value());
+    CHECK_EQ(400L, span->first);
+    CHECK_EQ(428L, span->second);
+    const auto atHoleEnd = timeline::RenderingNowSpan(0, 1000, 400, 401, 4, 28);
+    REQUIRE(atHoleEnd.has_value());
+    CHECK_EQ(404L, atHoleEnd->second);
+    const auto atTrackEnd = timeline::RenderingNowSpan(0, 1000, 998, 1200, 4, 28);
+    REQUIRE(atTrackEnd.has_value());
+    CHECK_EQ(1000L, atTrackEnd->second);
+    CHECK(!timeline::RenderingNowSpan(0, 1000, 1000, 1200, 4, 28).has_value());
+    CHECK(!timeline::RenderingNowSpan(0, 1000, -5, 1200, 4, 28).has_value());
+}
+
+void timeline_thumbnails_are_bucketed_cached_and_cheap_to_ask_for_test()
+{
+    // 200 buckets over a long video, never finer than a second over a short one.
+    CHECK_EQ(int64_t{0}, timeline::ThumbnailBucket(4.9, 1000.0));
+    CHECK_EQ(int64_t{1}, timeline::ThumbnailBucket(5.0, 1000.0));
+    CHECK_EQ(int64_t{199}, timeline::ThumbnailBucket(999.9, 1000.0));
+    CHECK_EQ(int64_t{200}, timeline::ThumbnailBucket(1000.0, 1000.0));
+    CHECK_EQ(int64_t{12}, timeline::ThumbnailBucket(12.5, 60.0));
+    CHECK_EQ(12.5, timeline::ThumbnailBucketSeconds(12, 60.0));
+    CHECK_EQ(1000.0, timeline::ThumbnailBucketSeconds(200, 1000.0));
+    CHECK_EQ(int64_t{0}, timeline::ThumbnailBucket(5.0, 0.0));
+    const SIZE wide = timeline::ThumbnailSize(16.0 / 9.0, 176);
+    CHECK_EQ(176L, wide.cx);
+    CHECK_EQ(98L, wide.cy);
+    const SIZE odd = timeline::ThumbnailSize(4.0 / 3.0, 175);
+    CHECK_EQ(174L, odd.cx);
+    CHECK_EQ(130L, odd.cy);
+    CHECK_EQ(98L, timeline::ThumbnailSize(0.0, 176).cy);
+    // A keyframe seek, one frame, raw BGRA at exactly the size asked for: the
+    // reader checks the byte count against that size.
+    const auto arguments = timeline::ThumbnailArguments(L"C:\\v.mkv", 12.5, SIZE{176, 98});
+    const auto has = [&](std::wstring_view value) {
+        return std::find(arguments.begin(), arguments.end(), value) != arguments.end();
+    };
+    CHECK(has(L"-noaccurate_seek"));
+    CHECK(has(L"12.500"));
+    CHECK(has(L"scale=176:98:flags=bilinear"));
+    CHECK(has(L"bgra"));
+    CHECK(arguments.back() == L"pipe:1");
+
+    timeline::LruCache<int> cache(2);
+    cache.Insert(1, 10);
+    cache.Insert(2, 20);
+    REQUIRE(cache.Find(1) != nullptr);
+    cache.Insert(3, 30);
+    // 2 was the least recently used once 1 was read.
+    CHECK(cache.Find(2) == nullptr);
+    CHECK_EQ(10, *cache.Find(1));
+    CHECK_EQ(30, *cache.Find(3));
+    cache.Insert(3, 31);
+    CHECK_EQ(size_t{2}, cache.Size());
+    CHECK_EQ(31, *cache.Find(3));
+    cache.Clear();
+    CHECK_EQ(size_t{0}, cache.Size());
+
+    // The preview stands on the track, centred on the cursor, inside the work area.
+    const RECT work{0, 0, 1920, 1040};
+    const auto centred = timeline::LayoutPreview(POINT{960, 1000}, SIZE{176, 98}, SIZE{120, 18}, 5, 10, work);
+    CHECK_EQ(990L, centred.window.bottom);
+    CHECK_EQ(LONG(960 - (176 + 10) / 2), centred.window.left);
+    CHECK_EQ(LONG(98 + 18 + 15), centred.window.bottom - centred.window.top);
+    CHECK_EQ(5L, centred.thumbnail.top);
+    CHECK_EQ(centred.thumbnail.bottom + 5, centred.text.top);
+    const auto edge = timeline::LayoutPreview(POINT{3, 1000}, SIZE{}, SIZE{300, 18}, 5, 10, work);
+    CHECK_EQ(0L, edge.window.left);
+    CHECK(edge.thumbnail.right == edge.thumbnail.left);
+    CHECK_EQ(5L, edge.text.top);
+    const auto right = timeline::LayoutPreview(POINT{1918, 1000}, SIZE{}, SIZE{300, 18}, 5, 10, work);
+    CHECK_EQ(1920L, right.window.right);
+}
+
+void keyboard_cheat_sheet_is_read_from_the_menus_test()
+{
+    const Localizer localizer;
+    const HMENU bar = app_menu::CreateMenuBar(localizer, true);
+    REQUIRE(bar != nullptr);
+    const auto rows = app_menu::CollectShortcuts(bar, localizer);
+    const auto has = [&](std::wstring_view group, std::wstring_view action, std::wstring_view keys) {
+        return std::any_of(rows.begin(), rows.end(), [&](const app_menu::ShortcutRow& row) {
+            return row.group == group && row.action == action && row.keys == keys;
+        });
+    };
+    CHECK(has(L"File", L"Open file", L"Ctrl+O"));
+    CHECK(has(L"Playback", L"Stop", L"S"));
+    CHECK(has(L"Playback", L"Mark In", L"I"));
+    // The subtitle keys live in Playback > Subtitles, greyed until a source is
+    // loaded, and are listed all the same.
+    CHECK(has(L"Playback", L"Next subtitles", L"V"));
+    CHECK(has(L"Playback", L"Subtitles earlier (−0.1 s)", L"H"));
+    CHECK(has(L"Playback", L"Subtitles later (+0.1 s)", L"J"));
+    // Runs of spaces in a menu's accelerator column close up on the sheet.
+    CHECK(has(L"Playback", L"Play / Pause", L"Space (Overlay: Ctrl+Alt+Space)"));
+    // A submenu's commands are found, under the top-level menu they live in.
+    CHECK(has(L"Video", L"Mix less", L"["));
+    CHECK(has(L"Video", L"Next mode", L"C"));
+    CHECK(has(L"DLSS", L"Convert marked clip to neural video", L"Ctrl+R"));
+    CHECK(has(L"Advanced", L"Recreate NGX / re-hook DLSS 5", L"F6"));
+    CHECK(has(L"Help", L"Keyboard shortcuts", L"? / F1"));
+    // A processing-scale rung's measured cost sits in the accelerator column; it
+    // is not a key and is not listed as one.
+    CHECK(std::none_of(rows.begin(), rows.end(), [](const app_menu::ShortcutRow& row) {
+        return row.keys.find(L"fps") != std::wstring::npos;
+    }));
+    // Nor are the upscaling-history rungs' measured VMAF ranges ("49-80", "63-94"),
+    // which the sheet used to list as if they were keys.
+    CHECK(std::none_of(rows.begin(), rows.end(), [](const app_menu::ShortcutRow& row) {
+        return row.keys == L"49-80" || row.keys == L"63-94";
+    }));
+    CHECK(has(localizer.Get(L"shortcuts.group.keyboard"), localizer.Get(L"shortcuts.step"), L"."));
+    // Groups come in menu-bar order, each one contiguous, and nothing without
+    // a key is listed.
+    std::vector<std::wstring> order;
+    for (const auto& row : rows) {
+        CHECK(!row.keys.empty());
+        CHECK(!row.action.empty());
+        CHECK(row.action.find(L'&') == std::wstring::npos || row.action.find(L"&&") == std::wstring::npos);
+        if (order.empty() || order.back() != row.group) order.push_back(row.group);
+    }
+    const std::vector<std::wstring> expected{L"File", L"Playback", L"Video", L"DLSS", L"Advanced", L"Help",
+                                             localizer.Get(L"shortcuts.group.keyboard")};
+    CHECK(order == expected);
+    // The drift check: every key the player maps to a menu command is printed
+    // by that command's menu item, so it reaches the sheet.
+    for (const bool control : {false, true}) {
+        for (const bool shift : {false, true}) {
+            for (UINT key = 0x08; key <= 0xFE; ++key) {
+                const auto command = app_menu::CommandForPlayerKey(key, control, shift);
+                if (!command) continue;
+                wchar_t text[256]{};
+                CHECK(GetMenuStringW(bar, *command, text, static_cast<int>(std::size(text)), MF_BYCOMMAND) > 0);
+                CHECK(std::wstring_view(text).find(L'\t') != std::wstring_view::npos);
+            }
+        }
+    }
+    DestroyMenu(bar);
+}
+
+// A message that sends someone to "DLSS > Something" has to name a menu that
+// exists. Two did not: "DLSS > Convert & save" (fixed in 4f3150a) and the frame
+// generation prompt's "DLSS > Show converted file". Every string is read the way a
+// person reads it - from a top-level menu, each " > " stepping into the item whose
+// visible label comes next - and the walk has to find every step it is given.
+void menu_paths_named_in_text_exist_test()
+{
+    struct Node {
+        std::wstring label;
+        std::vector<Node> children;
+    };
+    const auto plain = [](std::wstring_view text) {
+        text = text.substr(0, std::min(text.size(), text.find(L'\t')));
+        std::wstring out;
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (text[i] == L'&') {
+                if (i + 1 < text.size() && text[i + 1] == L'&') { out.push_back(L'&'); ++i; }
+                continue;
+            }
+            out.push_back(text[i]);
+        }
+        return out;
+    };
+    const auto read = [&](auto& self, HMENU menu) -> std::vector<Node> {
+        std::vector<Node> nodes;
+        const int count = GetMenuItemCount(menu);
+        for (int index = 0; index < count; ++index) {
+            wchar_t text[256]{};
+            MENUITEMINFOW item{sizeof(item)};
+            item.fMask = MIIM_FTYPE | MIIM_SUBMENU | MIIM_STRING;
+            item.dwTypeData = text;
+            item.cch = static_cast<UINT>(std::size(text));
+            if (!GetMenuItemInfoW(menu, static_cast<UINT>(index), TRUE, &item) || (item.fType & MFT_SEPARATOR)) continue;
+            nodes.push_back(Node{plain(text), item.hSubMenu ? self(self, item.hSubMenu) : std::vector<Node>{}});
+        }
+        return nodes;
+    };
+    const Localizer localizer;
+    const HMENU bar = app_menu::CreateMenuBar(localizer, true);
+    REQUIRE(bar != nullptr);
+    std::vector<Node> top = read(read, bar);
+    DestroyMenu(bar);
+    // A command that relabels itself while it runs is reachable under both labels:
+    // Generate frames becomes "Cancel frame generation" during a conversion.
+    for (Node& menu : top)
+        if (menu.label == L"DLSS") menu.children.push_back(Node{localizer.Get(L"menu.cancel_frame_generation"), {}});
+    // A path may leave out an item's trailing qualifier: "RTX VSR Upscaling" names
+    // "RTX VSR Upscaling (recommended)".
+    const auto spelled = [](const std::wstring& label) {
+        const size_t open = label.rfind(L" (");
+        return open != std::wstring::npos && label.back() == L')' ? label.substr(0, open) : label;
+    };
+
+    size_t walked = 0;
+    std::wstring broken;
+    for (const auto& [key, text] : Localizer::All()) {
+        for (const Node& menu : top) {
+            const std::wstring start = menu.label + L" > ";
+            for (size_t at = text.find(start); at != std::wstring::npos; at = text.find(start, at + 1)) {
+                if (at > 0 && std::iswalpha(text[at - 1])) continue;
+                const Node* node = &menu;
+                size_t pos = at + start.size();
+                for (;;) {
+                    const Node* next = nullptr;
+                    size_t length = 0;
+                    for (const Node& child : node->children) {
+                        for (const std::wstring& name : {child.label, spelled(child.label)}) {
+                            if (!name.empty() && text.compare(pos, name.size(), name) == 0 && name.size() > length) {
+                                next = &child;
+                                length = name.size();
+                            }
+                        }
+                    }
+                    if (!next) {
+                        broken += key + L": " + text.substr(at, 60) + L" | ";
+                        break;
+                    }
+                    ++walked;
+                    pos += length;
+                    if (text.compare(pos, 3, L" > ") != 0) break;
+                    pos += 3;
+                    node = next;
+                }
+            }
+        }
+    }
+    if (!broken.empty()) std::wcerr << L"menu paths that do not exist: " << broken << L'\n';
+    CHECK(broken.empty());
+    // The strings do name menu paths; a walk that found none would prove nothing.
+    CHECK(walked >= 5);
+}
+
+void keyboard_cheat_sheet_flows_whole_groups_into_columns_test()
+{
+    const shortcut_sheet::Metrics metrics{20, 30, 10, 300, 24, 16, 36, 20};
+    // Tall enough: one column, groups stacked with a gap.
+    const std::array<size_t, 3> rows{2, 4, 3};
+    const auto tall = shortcut_sheet::LayoutSheet(rows, metrics, 2000, 2000);
+    CHECK_EQ(1, tall.columns);
+    CHECK_EQ(0, tall.groups[0].top);
+    CHECK_EQ(70 + 10, tall.groups[1].top);
+    CHECK_EQ(80 + 110 + 10, tall.groups[2].top);
+    CHECK_EQ(2 * 16 + 300, tall.width);
+    CHECK_EQ(16 + 36 + (200 + 90) + 20 + 16, tall.height);
+    // Shorter: a group that does not fit starts the next column, whole.
+    const auto shorter = shortcut_sheet::LayoutSheet(rows, metrics, 2000, 16 + 36 + 200 + 20 + 16);
+    CHECK_EQ(2, shorter.columns);
+    CHECK_EQ(0, shorter.groups[1].column);
+    CHECK_EQ(1, shorter.groups[2].column);
+    CHECK_EQ(0, shorter.groups[2].top);
+    CHECK_EQ(2 * 16 + 2 * 300 + 24, shorter.width);
+    for (const auto& group : shorter.groups) CHECK(group.visible);
+    // Narrower than two columns: what does not fit is hidden, not drawn off
+    // the sheet.
+    const auto narrow = shortcut_sheet::LayoutSheet(rows, metrics, 400, 16 + 36 + 200 + 20 + 16);
+    CHECK_EQ(1, narrow.columns);
+    CHECK(narrow.groups[0].visible);
+    CHECK(narrow.groups[1].visible);
+    CHECK(!narrow.groups[2].visible);
+}
+
+void dark_menu_bar_and_dialog_scaling_follow_the_palette_and_the_dpi_test()
+{
+    // At rest an item sits on the bar; hot or open lifts it to the toolbar's
+    // hover surface; disabled is the quiet grey whatever else is set.
+    const auto rest = dark_mode::MenuBarItemColors(0);
+    CHECK_EQ(dark_mode::DialogBackground, rest.fill);
+    CHECK_EQ(dark_mode::Text, rest.text);
+    CHECK_EQ(ui_palette::Hover, dark_mode::MenuBarItemColors(ODS_HOTLIGHT).fill);
+    CHECK_EQ(ui_palette::Hover, dark_mode::MenuBarItemColors(ODS_SELECTED).fill);
+    const auto disabled = dark_mode::MenuBarItemColors(ODS_GRAYED | ODS_HOTLIGHT);
+    CHECK_EQ(dark_mode::DialogBackground, disabled.fill);
+    CHECK_EQ(dark_mode::QuietText, disabled.text);
+    CHECK((dark_mode::MenuBarTextFormat(ODS_NOACCEL) & DT_HIDEPREFIX) != 0);
+    CHECK((dark_mode::MenuBarTextFormat(0) & DT_HIDEPREFIX) == 0);
+    // The dialog font is Segoe UI 9 pt at every dpi, not 8 pt at 96 only.
+    CHECK_EQ(-12, dark_mode::DialogFontHeight(96));
+    CHECK_EQ(-18, dark_mode::DialogFontHeight(144));
+    CHECK_EQ(-24, dark_mode::DialogFontHeight(192));
+    CHECK_EQ(-12, dark_mode::DialogFontHeight(0));
+    // Carried per edge, so neighbours that met still meet.
+    const RECT scaled = dark_mode::ScaleRectForDpi(RECT{16, 28, 132, 48}, 96, 144);
+    CHECK_EQ(24L, scaled.left);
+    CHECK_EQ(42L, scaled.top);
+    CHECK_EQ(198L, scaled.right);
+    CHECK_EQ(72L, scaled.bottom);
+    const RECT neighbour = dark_mode::ScaleRectForDpi(RECT{132, 22, 368, 52}, 96, 144);
+    CHECK_EQ(scaled.right, neighbour.left);
+    const RECT back = dark_mode::ScaleRectForDpi(scaled, 144, 96);
+    CHECK_EQ(16L, back.left);
+    CHECK_EQ(132L, back.right);
+}
+
+void media_controls_ask_for_a_state_and_push_the_timeline_sparingly_test()
+{
+    using namespace media_transport;
+    // Play and Pause are requests for a state: a repeat is a no-op, never a toggle.
+    CHECK(ActionForButton(kSmtcPlay, true, false) == Action::TogglePause);
+    CHECK(ActionForButton(kSmtcPlay, true, true) == Action::None);
+    CHECK(ActionForButton(kSmtcPause, true, true) == Action::TogglePause);
+    CHECK(ActionForButton(kSmtcPause, true, false) == Action::None);
+    CHECK(ActionForButton(kSmtcStop, true, true) == Action::Stop);
+    CHECK(ActionForButton(kSmtcPlay, false, false) == Action::None);
+    CHECK(ActionForButton(6 /* Next */, true, true) == Action::None);
+    CHECK(StatusFor(false, false) == Status::Closed);
+    CHECK(StatusFor(true, true) == Status::Playing);
+    CHECK(StatusFor(true, false) == Status::Paused);
+
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point start{};
+    CHECK(ShouldPushTimeline({}, 0.0, true, start));
+    const TimelinePush pushed{true, true, 10.0, start};
+    // Playing on schedule: the flyout extrapolates, so nothing is pushed...
+    CHECK(!ShouldPushTimeline(pushed, 12.0, true, start + std::chrono::seconds(2)));
+    // ...until five seconds have passed, the playhead jumps, or play stops.
+    CHECK(ShouldPushTimeline(pushed, 15.0, true, start + std::chrono::seconds(5)));
+    CHECK(ShouldPushTimeline(pushed, 40.0, true, start + std::chrono::seconds(2)));
+    CHECK(ShouldPushTimeline(pushed, 12.0, false, start + std::chrono::seconds(2)));
+    const TimelinePush paused{true, false, 10.0, start};
+    CHECK(!ShouldPushTimeline(paused, 10.0, false, start + std::chrono::seconds(3)));
+    CHECK(ShouldPushTimeline(paused, 25.0, false, start + std::chrono::seconds(3)));
+}
+
+void taskbar_thumbnail_buttons_are_fixed_and_follow_the_player_test()
+{
+    using namespace media_transport;
+    ThumbState state{};
+    const ThumbBar idle = ThumbButtonsFor(state, 200, 300, 491);
+    // Always three, in one order, sending the menu's own commands; nothing
+    // is enabled with no media.
+    CHECK_EQ(UINT{200}, idle[0].command);
+    CHECK_EQ(UINT{300}, idle[1].command);
+    CHECK_EQ(UINT{491}, idle[2].command);
+    for (const auto& button : idle) CHECK(!button.enabled);
+    CHECK(idle[0].icon == UiIcon::Play);
+    state.loaded = true;
+    state.playing = true;
+    state.neuralAvailable = true;
+    state.neuralOn = true;
+    const ThumbBar playing = ThumbButtonsFor(state, 200, 300, 491);
+    CHECK(playing[0].icon == UiIcon::Pause);
+    CHECK(std::wstring_view(playing[0].tipKey) == L"thumb.pause");
+    CHECK(playing[1].enabled);
+    CHECK(std::wstring_view(playing[1].tipKey) == L"thumb.neural_off");
+    // Compare needs a rendered pair to compare against.
+    CHECK(!playing[2].enabled);
+    state.compareAvailable = true;
+    state.comparing = true;
+    const ThumbBar comparing = ThumbButtonsFor(state, 200, 300, 491);
+    CHECK(comparing[2].enabled);
+    CHECK(comparing[2].icon == UiIcon::Compare);
+    CHECK(std::wstring_view(comparing[2].tipKey) == L"thumb.compare_off");
+    CHECK(!(comparing == playing));
+    // Every tip key names an English string.
+    const Localizer localizer;
+    for (const auto* bar : {&idle, &playing, &comparing})
+        for (const auto& button : *bar) CHECK(localizer.Get(button.tipKey) != button.tipKey);
+}
+
+void start_screen_checks_say_what_passed_and_what_failed_test()
+{
+    using namespace start_screen;
+    Facts facts{};
+    facts.gpu = L"NVIDIA GeForce RTX 4080 SUPER";
+    facts.generation = GpuGeneration::Rtx40Ada;
+    facts.driverVersion = L"32.0.16.1047";   // 610.47, exactly the floor
+    facts.runtime = RuntimeState::Verified;
+    facts.runtimeVersion = L"6.5.3";
+    auto lines = CapabilityLines(facts);
+    REQUIRE(lines.size() == 3);
+    CHECK(lines[0].mark == Mark::Pass);
+    CHECK(lines[1].mark == Mark::Pass);
+    CHECK(lines[1].value == L"610.47 · meets the 610.47 minimum");
+    CHECK(lines[2].mark == Mark::Pass);
+    CHECK(lines[2].value.find(L"6.5.3") != std::wstring::npos);
+    CHECK(!OfferSafeMode(lines, false));
+    // No forecast line without a forecast: nothing is invented.
+    for (const auto& line : lines) CHECK(line.value.find(L"fps") == std::wstring::npos);
+    facts.fps1080 = 119.6;
+    facts.fps1440 = 65.2;
+    lines = CapabilityLines(facts);
+    REQUIRE(lines.size() == 4);
+    CHECK(lines[3].value == L"about 120 fps at 1080p · about 65 fps at 1440p");
+    facts.fps1080.reset();
+    CHECK(CapabilityLines(facts)[3].value == L"about 65 fps at 1440p");
+
+    // Below the floor, a drifted runtime, a GPU without DLSS: each fails, and
+    // a failure offers safe mode unless the player is already in it.
+    facts.driverVersion = L"32.0.15.6614";   // 566.14
+    lines = CapabilityLines(facts);
+    CHECK(lines[1].mark == Mark::Fail);
+    CHECK(lines[1].value == L"566.14 · neural rendering needs 610.47 or newer");
+    CHECK(OfferSafeMode(lines, false));
+    CHECK(!OfferSafeMode(lines, true));
+    facts.driverVersion.clear();
+    CHECK(CapabilityLines(facts)[1].mark == Mark::Info);
+    facts.runtime = RuntimeState::Drifted;
+    CHECK(CapabilityLines(facts)[2].mark == Mark::Fail);
+    facts.runtime = RuntimeState::Checking;
+    CHECK(CapabilityLines(facts)[2].mark == Mark::Pending);
+    facts.runtime = RuntimeState::Absent;
+    CHECK(CapabilityLines(facts)[2].mark == Mark::Info);
+    facts.generation = GpuGeneration::OtherNvidia;
+    CHECK(CapabilityLines(facts)[0].mark == Mark::Fail);
+    facts.safeMode = true;
+    lines = CapabilityLines(facts);
+    CHECK(std::any_of(lines.begin(), lines.end(), [](const Line& line) { return line.label == L"Mode"; }));
+
+    CHECK(CoverageBadge(0, 0, 900000000, std::nullopt) == L"Rendered 100%");
+    CHECK(CoverageBadge(100000000, 400000000, 300000000, int64_t{1200000000}) == L"Rendered 25%");
+    CHECK(CoverageBadge(100000000, 400000000, 300000000, std::nullopt) == L"Rendered 30 s");
+    CHECK(CoverageBadge(0, 1199000000, 1199000000, int64_t{1200000000}) == L"Rendered 99%");
+}
+
+// Issue #14: the dlssg_for_sm86 add-on is announced on the start screen, as
+// information rather than a failure, so it never offers safe mode by itself.
+void start_screen_names_a_loaded_frame_generation_addon_test()
+{
+    using namespace start_screen;
+    Facts facts{};
+    facts.gpu = L"NVIDIA GeForce RTX 3060";
+    facts.generation = GpuGeneration::Rtx30Ampere;
+    facts.driverVersion = L"32.0.16.1692";   // 616.92
+    facts.runtime = RuntimeState::Absent;
+    const auto plain = CapabilityLines(facts);
+    CHECK(std::none_of(plain.begin(), plain.end(), [](const Line& line) { return line.label == L"Frame Generation"; }));
+    facts.frameGenAddon = L"version.dll";
+    const auto lines = CapabilityLines(facts);
+    // RTX VSR says what it does, or why it does not; never a failure that offers safe mode.
+    const auto vsrLine = [&](VsrState state) {
+        Facts copy = facts;
+        copy.rtxVsr = state;
+        const auto all = CapabilityLines(copy);
+        const auto found = std::find_if(all.begin(), all.end(), [](const Line& line) { return line.label == L"RTX VSR"; });
+        return found == all.end() ? std::optional<Line>{} : std::optional<Line>(*found);
+    };
+    CHECK(!vsrLine(VsrState::Unknown));
+    REQUIRE(vsrLine(VsrState::On));
+    CHECK(vsrLine(VsrState::On)->mark == Mark::Pass);
+    for (const VsrState state : {VsrState::Off, VsrState::NotInBuild, VsrState::MissingRuntime}) {
+        REQUIRE(vsrLine(state));
+        CHECK(vsrLine(state)->mark == Mark::Info);
+    }
+    const auto addon = std::find_if(lines.begin(), lines.end(), [](const Line& line) { return line.label == L"Frame Generation"; });
+    REQUIRE(addon != lines.end());
+    CHECK(addon->mark == Mark::Info);
+    CHECK(addon->value.find(L"dlssg_sm86") != std::wstring::npos);
+    // A build other than the pinned one loads too - the user put it there - but is named.
+    CHECK(addon->value.find(L"not the build") == std::wstring::npos);
+    {
+        Facts unpinned = facts;
+        unpinned.frameGenAddonPinned = false;
+        const auto all = CapabilityLines(unpinned);
+        const auto found = std::find_if(all.begin(), all.end(), [](const Line& line) { return line.label == L"Frame Generation"; });
+        REQUIRE(found != all.end());
+        CHECK(found->value.find(L"not the build") != std::wstring::npos);
+        CHECK(found->mark == Mark::Info);
+    }
+    CHECK(!OfferSafeMode(lines, false));
+}
+
+// Issue #14: 0.27.0 pins the player's load-time imports to System32, so the
+// dlssg_for_sm86 proxy beside it was never loaded. It is loaded by full path
+// instead - only when its own ini marks it as that add-on, and never under a
+// name the player refuses beside itself (dxgi.dll) or renders through.
+// The ffmpeg command lines quote every path; a trailing backslash or a quote must
+// come back out of CommandLineToArgvW as written.
+// A segment name the parent opens inside its staging directory: never a device.
+void segment_names_refuse_devices_and_trailing_dots_test()
+{
+    using neural_worker_protocol::IsValidSegmentName;
+    CHECK(IsValidSegmentName(L"segment-0001.mkv"));
+    for (const std::wstring_view name : {L"CON", L"nul", L"COM1", L"lpt9.mkv", L"aux.txt", L"seg.mkv.", L"seg.mkv ", L"..", L"a\\b"})
+        CHECK(!IsValidSegmentName(name));
+    CHECK(IsValidSegmentName(L"console.mkv"));
+}
+
+// Renders outlive releases: the cache's application term is a revision moved only
+// when render output changes, and it can never name a release after this one.
+void render_cache_revision_is_a_release_no_later_than_this_one_test()
+{
+    const auto revision = ParseSemanticVersion(kRenderCacheRevision);
+    const auto player = ParseSemanticVersion(DLSS_VIDEO_PLAYER_VERSION);
+    REQUIRE(revision.has_value());
+    REQUIRE(player.has_value());
+    CHECK(!(*player < *revision));
+    // Two identities that differ only in the player that made them are one key.
+    NeuralCacheIdentity a{};
+    a.sourceDigest = std::string(64, 'a');
+    a.width = 1920; a.height = 1080;
+    a.applicationVersion = std::string(kRenderCacheRevision);
+    NeuralCacheIdentity b = a;
+    CHECK(BuildNeuralCacheKey(a) == BuildNeuralCacheKey(b));
+    b.applicationVersion = "0.27.0";
+    CHECK(BuildNeuralCacheKey(a) != BuildNeuralCacheKey(b));
+}
+
+void command_argument_quoting_round_trips_through_argv_test()
+{
+    for (const std::wstring argument : {std::wstring(L"C:\\Videos\\clip one.mp4"), std::wstring(L"C:\\dir with space\\"),
+                                        std::wstring(L"a\"b"), std::wstring(L"x\\\"y"), std::wstring(L"")}) {
+        const std::wstring line = L"tool.exe " + QuoteCommandArgument(argument);
+        int count = 0;
+        LPWSTR* argv = CommandLineToArgvW(line.c_str(), &count);
+        REQUIRE(argv != nullptr);
+        CHECK_EQ(2, count);
+        if (count == 2) CHECK(std::wstring(argv[1]) == argument);
+        LocalFree(argv);
+    }
+    CHECK(QuoteCommandArgument(L"C:\\a b\\") == L"\"C:\\a b\\\\\"");
+}
+
+void framegen_addon_picks_the_dlssg_sm86_proxy_beside_the_player_test()
+{
+    using framegen_addon::ProxyToLoad;
+    const auto beside = [](std::initializer_list<std::wstring_view> files) {
+        return [files](std::wstring_view name) {
+            return std::find(files.begin(), files.end(), name) != files.end();
+        };
+    };
+    CHECK(ProxyToLoad(beside({})).empty());
+    // A version.dll alone is not the add-on: nothing loads silently.
+    CHECK(ProxyToLoad(beside({L"version.dll"})).empty());
+    CHECK(ProxyToLoad(beside({L"dlssg_sm86.ini"})).empty());
+    CHECK(ProxyToLoad(beside({L"dlssg_sm86.ini", L"version.dll"})) == L"version.dll");
+    CHECK(ProxyToLoad(beside({L"dlssg_sm86.ini", L"winmm.dll"})) == L"winmm.dll");
+    CHECK(ProxyToLoad(beside({L"dlssg_sm86.ini", L"dinput8.dll", L"version.dll"})) == L"version.dll");
+    CHECK(ProxyToLoad(beside({L"dlssg_sm86.ini", L"dxgi.dll"})).empty());
+    CHECK(ProxyToLoad(beside({L"dlssg_sm86.ini", L"d3d12.dll"})).empty());
+}
+
+// Issue #14: on an RTX 20 or 30 the runtime refuses because NVIDIA ships
+// Frame Generation for RTX 40 and 50 only, and "update the driver" sent the
+// reporter after something no driver changes.
+void framegen_addon_refusal_advice_names_the_gpu_not_the_driver_on_rtx20_and_rtx30_test()
+{
+    using framegen_addon::RefusalAdvice;
+    using framegen_addon::AdviceFor;
+    CHECK(AdviceFor(GpuGeneration::Rtx30Ampere, false) == RefusalAdvice::NeedsRtx40);
+    CHECK(AdviceFor(GpuGeneration::Rtx20Turing, false) == RefusalAdvice::NeedsRtx40);
+    CHECK(AdviceFor(GpuGeneration::Rtx40Ada, false) == RefusalAdvice::UpdateDriver);
+    CHECK(AdviceFor(GpuGeneration::Rtx50Blackwell, false) == RefusalAdvice::UpdateDriver);
+    CHECK(AdviceFor(GpuGeneration::OtherRtx, false) == RefusalAdvice::UpdateDriver);
+    CHECK(AdviceFor(GpuGeneration::Rtx30Ampere, true) == RefusalAdvice::AddonRefused);
+    CHECK(AdviceFor(GpuGeneration::Rtx40Ada, true) == RefusalAdvice::AddonRefused);
+    const Localizer localizer;
+    for (const RefusalAdvice advice : {RefusalAdvice::UpdateDriver, RefusalAdvice::NeedsRtx40, RefusalAdvice::AddonRefused}) {
+        for (const wchar_t* key : {framegen_addon::AdviceKey(advice), framegen_addon::AdviceShortKey(advice)}) {
+            const std::wstring text = localizer.Get(key);
+            CHECK(!text.empty() && text != key);
+        }
+    }
+    CHECK(localizer.Get(framegen_addon::AdviceKey(RefusalAdvice::NeedsRtx40)).find(L"driver") == std::wstring::npos);
+}
+
+// The load itself, against the real loader: a version.dll beside the player
+// must come in as a second module even though System32's VERSION.dll is
+// already loaded by name - which is exactly what an import could not do.
+void framegen_addon_loads_its_proxy_as_a_second_module_beside_system32_test()
+{
+    const HMODULE system = LoadLibraryExW(L"version.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    REQUIRE(system != nullptr);
+    std::error_code error;
+    const auto directory = test_support::FixtureTempRoot() / (L"PolicyTests-framegen-addon-" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::remove_all(directory, error);
+    REQUIRE(std::filesystem::create_directories(directory, error));
+    wchar_t systemPath[MAX_PATH]{};
+    REQUIRE(GetModuleFileNameW(system, systemPath, MAX_PATH) != 0);
+    REQUIRE(std::filesystem::copy_file(systemPath, directory / L"version.dll", error));
+
+    // Without its ini the same file is left alone.
+    auto result = framegen_addon::LoadBeside(directory);
+    CHECK(!result.loaded);
+    CHECK(result.proxy.empty());
+
+    { std::ofstream(directory / L"dlssg_sm86.ini") << "[General]\n"; }
+    result = framegen_addon::LoadBeside(directory);
+    CHECK(result.loaded);
+    CHECK(result.proxy == L"version.dll");
+    REQUIRE(result.module != nullptr);
+    CHECK(result.module != system);
+    wchar_t loadedPath[MAX_PATH]{};
+    REQUIRE(GetModuleFileNameW(result.module, loadedPath, MAX_PATH) != 0);
+    CHECK(std::filesystem::equivalent(loadedPath, directory / L"version.dll", error));
+    FreeLibrary(result.module);
+    FreeLibrary(system);
+    std::filesystem::remove_all(directory, error);
+}
+
+// The add-on is offered, never bundled: only where the runtime refuses for the
+// GPU's sake and nothing is loaded yet.
+void framegen_addon_download_is_offered_only_on_rtx20_and_rtx30_without_it_test()
+{
+    using framegen_addon::OfferDownload;
+    CHECK(OfferDownload(GpuGeneration::Rtx30Ampere, false));
+    CHECK(OfferDownload(GpuGeneration::Rtx20Turing, false));
+    CHECK(!OfferDownload(GpuGeneration::Rtx30Ampere, true));
+    CHECK(!OfferDownload(GpuGeneration::Rtx40Ada, false));
+    CHECK(!OfferDownload(GpuGeneration::Rtx50Blackwell, false));
+    CHECK(!OfferDownload(GpuGeneration::OtherRtx, false));
+    CHECK(!OfferDownload(GpuGeneration::Unsupported, false));
+    // The pins install exactly what the loader then picks up.
+    const auto pinned = [](std::wstring_view name) {
+        return std::any_of(framegen_addon::kPinnedFiles.begin(), framegen_addon::kPinnedFiles.end(),
+                           [&](const framegen_addon::PinnedFile& file) { return file.saveAs == name; });
+    };
+    CHECK(framegen_addon::ProxyToLoad(pinned) == L"version.dll");
+    CHECK(framegen_addon::SourcePath(framegen_addon::kPinnedFiles[0]) ==
+          L"/sdli1995/dlssg_for_sm86/9621db573e07ed54f50c15bbb585ed9a7bdfac28/version.dll");
+    for (const auto& file : framegen_addon::kPinnedFiles) {
+        CHECK(file.sha256.size() == 64);
+        CHECK(file.bytes > 0);
+    }
+}
+
+// Every file is fetched and held to its pin before any is written, so a bad
+// download leaves nothing behind, and the ini - the loader's marker - lands
+// last. A version.dll that is someone else's is never overwritten.
+void framegen_addon_install_verifies_every_pin_before_writing_test()
+{
+    using framegen_addon::InstallStep;
+    using framegen_addon::PinnedFile;
+    const std::string dll = "MZ fake proxy", ini = "[General]\nEnabled=1\n";
+    const std::string dllHash = Sha256Bytes(dll).value(), iniHash = Sha256Bytes(ini).value();
+    const std::array<PinnedFile, 2> pins{{
+        {L"version.dll", dllHash, dll.size(), L"version.dll"},
+        {L"dlssg_sm86.ini", iniHash, ini.size(), L"dlssg_sm86.ini"},
+    }};
+    const auto serve = [&](const std::string& dllBody) {
+        return [&, dllBody](const PinnedFile& file) -> std::optional<std::string> {
+            return file.name == L"version.dll" ? std::optional<std::string>(dllBody) : std::optional<std::string>(ini);
+        };
+    };
+    const auto read = [](const std::filesystem::path& path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), {});
+    };
+    std::error_code error;
+    const auto directory = test_support::FixtureTempRoot() / (L"PolicyTests-framegen-install-" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::remove_all(directory, error);
+    REQUIRE(std::filesystem::create_directories(directory, error));
+
+    auto result = framegen_addon::Install(directory, serve("MZ tampered!!"), pins);
+    CHECK(result.failed == InstallStep::Verify);
+    CHECK(result.file == L"version.dll");
+    CHECK(!std::filesystem::exists(directory / L"version.dll"));
+    CHECK(!std::filesystem::exists(directory / L"dlssg_sm86.ini"));
+
+    result = framegen_addon::Install(directory, [](const PinnedFile&) { return std::optional<std::string>{}; }, pins);
+    CHECK(result.failed == InstallStep::Download);
+    CHECK(std::filesystem::is_empty(directory, error));
+
+    { std::ofstream(directory / L"version.dll", std::ios::binary) << "another mod's proxy"; }
+    result = framegen_addon::Install(directory, serve(dll), pins);
+    CHECK(result.failed == InstallStep::Conflict);
+    CHECK(result.file == L"version.dll");
+    CHECK(read(directory / L"version.dll") == "another mod's proxy");
+    CHECK(!std::filesystem::exists(directory / L"dlssg_sm86.ini"));
+    std::filesystem::remove(directory / L"version.dll", error);
+
+    result = framegen_addon::Install(directory, serve(dll), pins);
+    CHECK(result.failed == InstallStep::None);
+    CHECK(read(directory / L"version.dll") == dll);
+    CHECK(read(directory / L"dlssg_sm86.ini") == ini);
+    // Installing over itself is not a conflict.
+    CHECK(framegen_addon::Install(directory, serve(dll), pins).failed == InstallStep::None);
+    std::filesystem::remove_all(directory, error);
+}
+
+void start_screen_stacks_the_panel_and_tiles_and_gives_way_to_small_windows_test()
+{
+    using namespace start_screen;
+    // The default window: everything, centred, in order, inside the client.
+    const Layout full = LayoutStartScreen(1440, 880, 96, 4, true, 5, 6);
+    REQUIRE(full.full);
+    CHECK_EQ(size_t{4}, full.lines.size());
+    CHECK(full.safeMode.right > full.safeMode.left);
+    CHECK_EQ(size_t{5}, full.recentTiles.size());
+    CHECK_EQ(size_t{6}, full.trailerTiles.size());
+    CHECK(full.core.actions[1].bounds.bottom <= full.lines.front().top);
+    CHECK(full.lines.back().bottom <= full.safeMode.top);
+    CHECK(full.safeMode.bottom <= full.recentHeading.top);
+    CHECK(full.recentHeading.bottom <= full.recentTiles.front().top);
+    CHECK(full.recentTiles.front().bottom <= full.trailersHeading.top);
+    CHECK(full.trailerTiles.front().bottom <= full.hint.top);
+    CHECK(full.core.title.top >= 16);
+    CHECK(full.hint.bottom <= 880 - 16);
+    CHECK_EQ(LONG(kTileWidthDip), full.recentTiles[0].right - full.recentTiles[0].left);
+    CHECK_EQ(LONG(kTileGapDip), full.recentTiles[1].left - full.recentTiles[0].right);
+    // Each row is centred.
+    CHECK(std::abs((full.trailerTiles.front().left - 0) - (1440 - full.trailerTiles.back().right)) <= 1);
+    // A narrow window holds fewer whole tiles, never a cut one.
+    const Layout narrow = LayoutStartScreen(900, 880, 96, 4, false, 5, 6);
+    REQUIRE(narrow.full);
+    CHECK_EQ(size_t{4}, narrow.trailerTiles.size());
+    for (const RECT& tile : narrow.trailerTiles) CHECK(tile.left >= 16 && tile.right <= 900 - 16);
+    // Shorter: the trailers go first, then the recent row, then the panel.
+    const Layout shorter = LayoutStartScreen(1440, 600, 96, 4, false, 5, 6);
+    REQUIRE(shorter.full);
+    CHECK(shorter.trailerTiles.empty());
+    CHECK_EQ(size_t{5}, shorter.recentTiles.size());
+    const Layout shorterStill = LayoutStartScreen(1440, 400, 96, 4, false, 5, 6);
+    REQUIRE(shorterStill.full);
+    CHECK(shorterStill.recentTiles.empty());
+    CHECK_EQ(size_t{4}, shorterStill.lines.size());
+    // Too small for any of it: exactly the idle surface the idle tests pin.
+    const Layout tiny = LayoutStartScreen(400, 300, 96, 4, false, 5, 6);
+    CHECK(!tiny.full);
+    const IdleSurfaceLayout idle = LayoutIdleSurface(400, 300, 96);
+    CHECK_EQ(idle.title.top, tiny.core.title.top);
+    CHECK_EQ(idle.actions[0].bounds.left, tiny.core.actions[0].bounds.left);
+    CHECK_EQ(idle.actions[1].bounds.top, tiny.core.actions[1].bounds.top);
+    // Scaled with dpi.
+    const Layout scaled = LayoutStartScreen(2160, 1320, 144, 4, false, 5, 6);
+    REQUIRE(scaled.full);
+    REQUIRE(!scaled.recentTiles.empty());
+    CHECK_EQ(LONG(MulDiv(kTileWidthDip, 144, 96)), scaled.recentTiles[0].right - scaled.recentTiles[0].left);
+
+    // A fresh profile in the default window at 175% (1440 x 880 client): no
+    // recent videos, six trailers. The first start screen showed the panel and
+    // no tiles at all, because a 192 dip row did not fit beside it; the row now
+    // takes smaller tiles and the empty YouTube-reason line gives its space up.
+    const Layout fresh = LayoutStartScreen(1440, 880, 168, 4, false, 0, 6, PanelText{}, false);
+    REQUIRE(fresh.full);
+    CHECK_EQ(size_t{4}, fresh.lines.size());
+    CHECK(fresh.recentTiles.empty());
+    REQUIRE(!fresh.trailerTiles.empty());
+    CHECK(fresh.trailerTiles.front().right - fresh.trailerTiles.front().left < MulDiv(kTileWidthDip, 168, 96));
+    for (const RECT& tile : fresh.trailerTiles) {
+        CHECK(tile.left >= 28 && tile.right <= 1440 - 28);
+        // The thumbnail keeps 16:9 at the smaller width.
+        const RECT thumb = TileThumbnail(tile, 168);
+        CHECK(std::abs((thumb.right - thumb.left) * 9 - (thumb.bottom - thumb.top) * 16) <= 16);
+    }
+    CHECK(fresh.hint.bottom <= 880 - 28);
+    // With a reason under the buttons (YouTube unavailable, so main.cpp offers
+    // no trailers anyway) the panel still shows.
+    CHECK_EQ(size_t{4}, LayoutStartScreen(1440, 880, 168, 4, false, 0, 0, PanelText{}, true).lines.size());
+    // Measured columns: the panel is as wide as its text and centred as one block.
+    const Layout measured = LayoutStartScreen(1440, 880, 96, 4, true, 5, 6, PanelText{150, 330});
+    REQUIRE(measured.full);
+    CHECK_EQ(LONG{480}, measured.lines.front().right - measured.lines.front().left);
+    CHECK(std::abs((measured.lines.front().left - 0) - (1440 - measured.lines.front().right)) <= 1);
+    CHECK_EQ(150, measured.labelWidth);
+    CHECK_EQ(measured.lines.front().left + 150, measured.safeMode.left);
+}
+
+void status_chips_carry_the_rate_the_drops_and_the_render_test()
+{
+    using namespace status_chips;
+    // The format itself, not the digits in isolation, and rounded, never the
+    // raw double: "58.4" implies a precision a sampled rate does not have.
+    CHECK_EQ(std::wstring(L"58 / 60 fps"), FpsText(58.4, 59.94));
+    CHECK_EQ(std::wstring(L"Dropped 3"), DroppedText(3));
+    CHECK_EQ(std::wstring(L"Render 16% \u00b7 ETA 3:10"), RenderText(0.16, 190.0));
+    CHECK_EQ(std::wstring(L"Render 42% \u00b7 ETA 1:02:03"), RenderText(0.42, 3723.0));
+    // No ETA without a pace, and none once it is done.
+    CHECK_EQ(std::wstring(L"Render 42%"), RenderText(0.42, std::nullopt));
+    CHECK_EQ(std::wstring(L"Render 100%"), RenderText(1.0, 12.0));
+    // 99.6% rendered is not rendered: only a finished render says 100.
+    CHECK_EQ(std::wstring(L"Render 99%"), RenderText(0.996, std::nullopt));
+
+    CHECK(!SecondsToFullCoverage(30.0, 0.0).has_value());
+    CHECK_EQ(0.0, *SecondsToFullCoverage(0.0, 0.0));
+    CHECK_EQ(60.0, *SecondsToFullCoverage(30.0, 0.5));
+
+    // Nothing is shown without media; a still image has no rate to report; a
+    // render chip exists only while something renders.
+    const Snapshot empty = Build(false, {true, 0.5, 10.0}, 60.0, 60.0, 0);
+    for (const Content& chip : empty) CHECK(!chip.visible);
+    const Snapshot still = Build(true, {}, 0.0, 0.0, 0);
+    CHECK(!At(still, Chip::Fps).visible);
+    CHECK(!At(still, Chip::Dropped).visible);
+    CHECK(!At(still, Chip::Render).visible);
+    const Snapshot playing = Build(true, {true, 0.25, 90.0}, 59.7, 60.0, 0);
+    CHECK(At(playing, Chip::Render).visible);
+    CHECK_EQ(std::wstring(L"Render 25% \u00b7 ETA 1:30"), At(playing, Chip::Render).text);
+    CHECK_EQ(std::wstring(L"60 / 60 fps"), At(playing, Chip::Fps).text);
+    // No dropped frames is a fine state, so the chip says it quietly.
+    CHECK(At(playing, Chip::Dropped).quiet);
+    CHECK(!At(Build(true, {}, 60.0, 60.0, 4), Chip::Dropped).quiet);
+}
+
+void first_window_takes_a_share_of_the_work_area_and_keeps_the_pill_words_test()
+{
+    struct Display { LONG w, h; UINT dpi; };
+    // 4K at 175% and 150%, 1440p at 150%, 1080p at 125%: the bar has to keep
+    // its words (full-width pills) on every one of them.
+    for (const Display display : {Display{3840, 2076, 168}, Display{3840, 2076, 144}, Display{2560, 1400, 144},
+                                  Display{1920, 1032, 120}}) {
+        const auto dip = [&](int value) { return MulDiv(value, static_cast<int>(display.dpi), 96); };
+        const SIZE nonClient{dip(16), dip(59)};
+        const initial_window::Input in{SIZE{display.w, display.h}, nonClient, dip(156),
+                                       SIZE{MinimumToolbarClientWidth(display.dpi), MinimumIdleClientHeight(display.dpi)},
+                                       FullPillToolbarClientWidth(display.dpi)};
+        const SIZE client = initial_window::ClientSize(in);
+        CHECK(client.cx + nonClient.cx <= display.w * 0.8 + 1);
+        CHECK(client.cy + nonClient.cy <= display.h * 0.8 + 1);
+        // At least a 16:9 picture's width above the chrome (wider only for the pills).
+        CHECK(double(client.cx) / double(client.cy - dip(156)) >= 16.0 / 9.0 - 0.01);
+        CHECK(client.cx >= FullPillToolbarClientWidth(display.dpi));
+    }
+    // Where the height does not bind, the picture is exactly 16:9.
+    const initial_window::Input wide{SIZE{3840, 2076}, SIZE{28, 103}, 273, SIZE{1489, 262}, 1952};
+    const SIZE fitted = initial_window::ClientSize(wide);
+    CHECK(std::abs(double(fitted.cx) / double(fitted.cy - 273) - 16.0 / 9.0) < 0.01);
+    // A small screen: the minimum wins, and the work area still bounds it.
+    const initial_window::Input tiny{SIZE{1024, 700}, SIZE{16, 59}, 156, SIZE{900, 150}};
+    const SIZE small = initial_window::ClientSize(tiny);
+    CHECK_EQ(LONG{900}, small.cx);
+    CHECK(small.cy + 59 <= 700);
+    const initial_window::Input cramped{SIZE{800, 600}, SIZE{16, 59}, 156, SIZE{900, 150}};
+    CHECK_EQ(LONG{784}, initial_window::ClientSize(cramped).cx);
+}
+
+void slider_geometry_fills_from_its_origin_and_keeps_the_knob_and_bubble_inside_test()
+{
+    for (const UINT dpi : {96u, 168u}) {
+        const RECT area{100, 50, 300, 86};
+        const int inset = slider::Dip(slider::kKnobRestDip, dpi);
+        // A level fills from the left; the knob is whole at both ends.
+        const slider::Geometry zero = slider::Layout(area, 0.0, 0.0, 0.0, dpi);
+        CHECK_EQ(area.left + inset, zero.knob.x);
+        CHECK(zero.fill.right <= zero.fill.left);
+        const slider::Geometry full = slider::Layout(area, 1.0, 0.0, 0.0, dpi);
+        CHECK_EQ(area.right - inset, full.knob.x);
+        CHECK_EQ(full.track.left, full.fill.left);
+        CHECK_EQ(full.track.right, full.fill.right);
+        CHECK_EQ(LONG((area.top + area.bottom) / 2), full.knob.y);
+        // The rail and the pointer agree: the value under the knob is the value.
+        for (const double value : {0.0, 0.25, 0.62, 1.0}) {
+            const slider::Geometry g = slider::Layout(area, value, 0.0, 0.0, dpi);
+            CHECK(std::abs(slider::ValueFromX(area, g.knob.x, dpi) - value) < 0.02);
+        }
+        // A Mix fills from its middle, either way.
+        const slider::Geometry less = slider::Layout(area, 0.3, 0.5, 0.0, dpi);
+        CHECK_EQ(less.knob.x, less.fill.left);
+        CHECK(less.fill.right > less.knob.x);
+        // Hot grows the knob, from rest to the hot size and no further.
+        CHECK_EQ(slider::Dip(slider::kKnobRestDip, dpi), zero.knobRadius);
+        CHECK_EQ(slider::Dip(slider::kKnobHotDip, dpi), slider::Layout(area, 0.5, 0.0, 1.0, dpi).knobRadius);
+        CHECK_EQ(slider::Dip(slider::kKnobHotDip, dpi), slider::Layout(area, 0.5, 0.0, 7.0, dpi).knobRadius);
+        // The bubble sits over the knob, clear of the hot knob, and stays in bounds.
+        const slider::Geometry mid = slider::Layout(area, 0.5, 0.0, 1.0, dpi);
+        CHECK_EQ(mid.knob.x, (mid.bubble.left + mid.bubble.right) / 2);
+        CHECK(mid.bubble.bottom <= mid.knob.y - mid.knobRadius);
+        const RECT bounds{120, 20, 280, 86};
+        const slider::Geometry edge = slider::Layout(area, 1.0, 0.0, 1.0, dpi, bounds);
+        CHECK(edge.bubble.right <= bounds.right && edge.bubble.left >= bounds.left);
+        CHECK(edge.bubble.top >= bounds.top);
+    }
+}
+
+void window_placement_round_trips_and_is_dropped_off_the_current_screens_test()
+{
+    using window_placement::Saved;
+    const Saved saved{RECT{100, 80, 1700, 1000}, true};
+    const auto parsed = window_placement::Parse(window_placement::Format(saved));
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->normal.left == 100 && parsed->normal.top == 80 && parsed->normal.right == 1700 && parsed->normal.bottom == 1000);
+    CHECK(parsed->maximized);
+    CHECK(!window_placement::Parse(L"").has_value());
+    CHECK(!window_placement::Parse(L"1,2,3").has_value());
+    CHECK(!window_placement::Parse(L"10,10,5,5,0").has_value());
+    CHECK(!window_placement::Parse(L"0,0,800,600,2").has_value());
+    CHECK(!window_placement::Parse(L"0,0,800,600,0x").has_value());
+    // Two monitors side by side, then the right one gone.
+    const std::array<RECT, 2> both{RECT{0, 0, 3840, 2076}, RECT{3840, 0, 5760, 1040}};
+    const std::array<RECT, 1> one{RECT{0, 0, 3840, 2076}};
+    const SIZE minimum{900, 300};
+    const Saved onRight{RECT{4000, 100, 5600, 1000}, false};
+    CHECK(window_placement::Usable(onRight, both, minimum));
+    CHECK(!window_placement::Usable(onRight, one, minimum));
+    // Mostly off every screen, or with the caption above the top: dropped.
+    CHECK(!window_placement::Usable(Saved{RECT{3500, 100, 5100, 1000}, false}, one, minimum));
+    CHECK(!window_placement::Usable(Saved{RECT{100, -200, 1700, 900}, false}, one, minimum));
+    // Smaller than the player's minimum: dropped.
+    CHECK(!window_placement::Usable(Saved{RECT{100, 100, 700, 400}, false}, one, minimum));
+    CHECK(window_placement::Usable(Saved{RECT{100, 100, 1700, 1000}, false}, one, minimum));
+}
+
+void escape_leaves_fullscreen_before_it_stops_anything_test()
+{
+    using escape_key::Action;
+    using escape_key::Resolve;
+    // Everything running at once, in fullscreen: Esc gives the desktop back
+    // and leaves the render alone.
+    escape_key::State busy{false, true, true, true, true, true};
+    CHECK(Resolve(busy) == Action::LeaveFullscreen);
+    // The sheet is closed before anything else, fullscreen included.
+    busy.shortcutSheetOpen = true;
+    CHECK(Resolve(busy) == Action::CloseShortcutSheet);
+    // In a window the old order stands: the longest-running thing first.
+    escape_key::State window{false, false, true, true, true, true};
+    CHECK(Resolve(window) == Action::CancelFrameGeneration);
+    window.frameGenerationCancellable = false;
+    CHECK(Resolve(window) == Action::StopLiveSession);
+    window.liveSession = false;
+    CHECK(Resolve(window) == Action::CancelNeuralJob);
+    window.neuralJob = false;
+    CHECK(Resolve(window) == Action::CancelYouTube);
+    window.resolvingYouTube = false;
+    CHECK(Resolve(window) == Action::None);
+    // The sheet and the tooltip say the same thing.
+    const Localizer localizer;
+    CHECK(localizer.Get(L"shortcuts.escape").starts_with(L"Leave fullscreen"));
+    CHECK(localizer.Get(L"toolbar.tip.fullscreen").find(L"Esc or F11 leaves") != std::wstring::npos);
+}
+
+void toolbar_tips_name_every_control_and_the_key_its_menu_row_runs_test()
+{
+    const Localizer localizer;
+    // Every control on the bar and the start screen has a tip, and the tip
+    // text exists (Get hands back the key itself for a missing string).
+    for (size_t index = 0; index < static_cast<size_t>(ToolbarAction::None); ++index) {
+        const auto action = static_cast<ToolbarAction>(index);
+        const wchar_t* key = toolbar_tips::TipKey(action);
+        CHECK(key != nullptr);
+        if (!key) continue;
+        const std::wstring tip = localizer.Get(key);
+        CHECK(tip != key);
+        // A tip that names a key names the one its menu row carries; the
+        // Fullscreen tip said F, which previews a frame, while F11 is the key.
+        const wchar_t* menuKey = toolbar_tips::MenuKey(action);
+        const std::wstring_view shortcut = toolbar_tips::TipShortcut(tip);
+        if (!menuKey) {
+            CHECK(shortcut.empty());
+            continue;
+        }
+        const std::wstring menu = localizer.Get(menuKey);
+        const std::wstring_view accelerator = toolbar_tips::MenuAccelerator(menu);
+        CHECK(!accelerator.empty());
+        CHECK(!shortcut.empty());
+        CHECK(shortcut.starts_with(accelerator));
+    }
+    CHECK(toolbar_tips::TipKey(ToolbarAction::None) == nullptr);
+    CHECK(toolbar_tips::TipShortcut(localizer.Get(L"toolbar.tip.fullscreen")) == L"F11");
+    CHECK(toolbar_tips::MenuAccelerator(L"Play / Pause\tSpace   (Overlay: Ctrl+Alt+Space)") == L"Space");
+    CHECK(toolbar_tips::MenuAccelerator(L"Exit").empty());
+    CHECK(toolbar_tips::TipShortcut(L"Frame Generation\nWrites (a) file").empty());
+    // Resting reveals, sweeping does not; moving along the bar is immediate.
+    CHECK(toolbar_tips::kInitialDelayMs >= 400 && toolbar_tips::kInitialDelayMs <= 600);
+    CHECK(toolbar_tips::kReshowDelayMs < 100);
+}
+
+void warm_up_names_the_cold_start_step_and_the_chip_invents_no_eta_test()
+{
+    using warm_up::Resolve;
+    using warm_up::Step;
+    CHECK(Resolve(true, true, false, NeuralRenderPhase::CheckingCache, 0) == Step::CheckingCache);
+    CHECK(Resolve(true, true, false, NeuralRenderPhase::Preflight, 0) == Step::CheckingRuntime);
+    CHECK(Resolve(true, true, false, NeuralRenderPhase::NeuralRendering, 0) == Step::PreparingModel);
+    CHECK(Resolve(true, true, false, NeuralRenderPhase::NeuralRendering, 12) == Step::FirstSecond);
+    // Coverage, no session, or no job: not warming up.
+    CHECK(Resolve(true, true, true, NeuralRenderPhase::NeuralRendering, 0) == Step::None);
+    CHECK(Resolve(false, true, false, NeuralRenderPhase::NeuralRendering, 0) == Step::None);
+    CHECK(Resolve(true, false, false, NeuralRenderPhase::NeuralRendering, 0) == Step::None);
+    const Localizer localizer;
+    for (const Step step : {Step::CheckingCache, Step::CheckingRuntime, Step::PreparingModel, Step::FirstSecond}) {
+        const wchar_t* key = warm_up::TextKey(step);
+        CHECK(key != nullptr);
+        if (key) CHECK(localizer.Get(key) != key);
+    }
+    CHECK(warm_up::TextKey(Step::None) == nullptr);
+    // Starting: no percentage, no ETA, whatever the forecast would say.
+    const auto starting = status_chips::Build(true, {true, 0.0, 10.0, true}, 0.0, 30.0, 0);
+    CHECK(status_chips::At(starting, status_chips::Chip::Render).text == L"Render · starting");
+    const auto running = status_chips::Build(true, {true, 0.3, 10.0, false}, 30.0, 30.0, 0);
+    CHECK(status_chips::At(running, status_chips::Chip::Render).text.find(L"ETA") != std::wstring::npos);
+}
+
+void status_chip_tips_say_what_was_measured_test()
+{
+    using namespace status_chips;
+    TipFacts facts{};
+    facts.render = RenderProgress{true, 0.42, 75.0};
+    facts.rangeSeconds = 600.0;
+    facts.paceRatio = 1.37;
+    const std::wstring render = TipText(Chip::Render, facts);
+    CHECK(render.starts_with(L"Neural render\n42% of 10:00 of video rendered"));
+    CHECK(render.find(L"1.4\u00d7 real time") != std::wstring::npos);
+    CHECK(render.find(L"about 1:15") != std::wstring::npos);
+    // No pace yet: say when there will be one rather than inventing it.
+    facts.paceRatio = 0.0;
+    facts.render.etaSeconds.reset();
+    CHECK(TipText(Chip::Render, facts).find(L"measured once") != std::wstring::npos);
+    // 99.6% is not rendered; done says so.
+    facts.render.fraction = 0.996;
+    CHECK(TipText(Chip::Render, facts).find(L"99%") != std::wstring::npos);
+    facts.render.fraction = 1.0;
+    CHECK(TipText(Chip::Render, facts).find(L"whole range plays rendered") != std::wstring::npos);
+    facts.renderedFps = 29.6;
+    facts.sourceFps = 30.0;
+    CHECK(TipText(Chip::Fps, facts).find(L"30 frames a second reached the screen, against the source's 30") != std::wstring::npos);
+    facts.dropped = 1;
+    CHECK(TipText(Chip::Dropped, facts).find(L"1 frame was skipped") != std::wstring::npos);
+    facts.dropped = 12;
+    CHECK(TipText(Chip::Dropped, facts).find(L"12 frames were skipped") != std::wstring::npos);
+}
+
+void status_chips_flash_on_the_fact_not_on_every_repaint_test()
+{
+    using namespace status_chips;
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point start{};
+    Flash flash;
+    // The first frame rate measured flashes once; a wobble within the 2%
+    // tolerance does not, and falling behind does.
+    CHECK(flash.Observe(Build(true, {}, 60.0, 60.0, 0), start));
+    CHECK_EQ(1.0, flash.Level(Chip::Fps, start));
+    CHECK_EQ(0.0, flash.Level(Chip::Dropped, start));
+    const auto later = start + std::chrono::seconds(2);
+    CHECK(!flash.Animating(later));
+    CHECK(!flash.Observe(Build(true, {}, 59.2, 60.0, 0), later));
+    CHECK(flash.Observe(Build(true, {}, 41.0, 60.0, 0), later));
+    CHECK(flash.Level(Chip::Fps, later) > 0.99);
+    // Fades out over the flash duration, and holds flat without motion.
+    const auto midway = later + kFlashDuration / 2;
+    CHECK(std::abs(flash.Level(Chip::Fps, midway) - 0.5) < 0.01);
+    CHECK_EQ(1.0, flash.Level(Chip::Fps, midway, false));
+    CHECK_EQ(0.0, flash.Level(Chip::Fps, later + kFlashDuration));
+    // Every newly dropped frame flashes; a reload's reset to zero does not.
+    const auto dropAt = later + std::chrono::seconds(5);
+    CHECK(flash.Observe(Build(true, {}, 41.0, 60.0, 1), dropAt));
+    CHECK(flash.Level(Chip::Dropped, dropAt) > 0.99);
+    CHECK(!flash.Observe(Build(true, {}, 41.0, 60.0, 0), dropAt + std::chrono::seconds(5)));
+    // The render chip flashes as it appears and at each tenth, not each percent.
+    const auto renderAt = dropAt + std::chrono::seconds(10);
+    CHECK(flash.Observe(Build(true, {true, 0.01, {}}, 41.0, 60.0, 0), renderAt));
+    CHECK(!flash.Observe(Build(true, {true, 0.05, {}}, 41.0, 60.0, 0), renderAt));
+    CHECK(flash.Observe(Build(true, {true, 0.11, {}}, 41.0, 60.0, 0), renderAt));
+}
+
+void status_chips_keep_fixed_places_and_give_the_line_the_rest_test()
+{
+    using namespace status_chips;
+    const RECT row{145, 500, 1424, 523};
+    const RowLayout all = LayoutRow(row, 96, {true, true, true});
+    // Fixed order, fixed widths, right-aligned with a gap between.
+    CHECK_EQ(1424L, all.chips[2].right);
+    CHECK_EQ(LONG(kDroppedChipWidthDip), all.chips[2].right - all.chips[2].left);
+    CHECK_EQ(LONG(kFpsChipWidthDip), all.chips[1].right - all.chips[1].left);
+    CHECK_EQ(LONG(kRenderChipWidthDip), all.chips[0].right - all.chips[0].left);
+    CHECK_EQ(LONG(kChipGapDip), all.chips[2].left - all.chips[1].right);
+    CHECK_EQ(LONG(kChipGapDip), all.chips[1].left - all.chips[0].right);
+    CHECK_EQ(all.chips[0].left - LONG(kChipGapDip), all.text.right);
+    CHECK_EQ(LONG(kChipHeightDip), all.chips[0].bottom - all.chips[0].top);
+    // A chip that is not shown gives its room to the line, and the others do
+    // not move.
+    const RowLayout noRender = LayoutRow(row, 96, {false, true, true});
+    CHECK(noRender.chips[0].right == noRender.chips[0].left);
+    CHECK_EQ(all.chips[1].left, noRender.chips[1].left);
+    CHECK_EQ(all.chips[1].left - LONG(kChipGapDip), noRender.text.right);
+    // Too narrow for every chip and the line's minimum: the render chip goes
+    // first, never one from the middle.
+    const RECT narrow{145, 500, 145 + kMinimumTextWidthDip + 260, 523};
+    const RowLayout squeezed = LayoutRow(narrow, 96, {true, true, true});
+    CHECK(squeezed.chips[0].right == squeezed.chips[0].left);
+    CHECK(squeezed.chips[1].right > squeezed.chips[1].left);
+    CHECK(squeezed.chips[2].right > squeezed.chips[2].left);
+    CHECK(squeezed.text.right - squeezed.text.left >= kMinimumTextWidthDip);
+    // Scales with dpi.
+    const RowLayout scaled = LayoutRow(RECT{218, 750, 2136, 785}, 144, {true, true, true});
+    CHECK_EQ(LONG(MulDiv(kDroppedChipWidthDip, 144, 96)), scaled.chips[2].right - scaled.chips[2].left);
+}
+
+void feature_pills_shrink_before_the_bar_goes_compact_test()
+{
+    // The floor, measured in UiLayout terms: 1114 dip at 96 dpi while the
+    // three feature pills were fixed at 270/270/264, 850 now that they shrink
+    // to kFeaturePillNarrowWidthDip.
+    CHECK_EQ(850, MinimumToolbarClientWidth(96));
+    CHECK_EQ(1114, FullPillToolbarClientWidth(96));
+    const auto width = [](const std::vector<ToolbarItem>& items, ToolbarAction action) {
+        for (const auto& item : items) if (item.action == action) return int(item.bounds.right - item.bounds.left);
+        return 0;
+    };
+    // At the floor the pills are at their narrow width, not compact.
+    const auto floor = LayoutToolbar(850, 180, 96);
+    for (const ToolbarAction action : {ToolbarAction::ToggleNeuralRendering, ToolbarAction::ToggleUpscaling,
+                                       ToolbarAction::ToggleFrameGeneration}) {
+        CHECK_EQ(kFeaturePillNarrowWidthDip, width(floor, action));
+    }
+    // Between the floor and the full-pill width they share the room evenly,
+    // and the bar still ends exactly at the gutter.
+    const auto between = LayoutToolbar(970, 180, 96);
+    CHECK_EQ(220, width(between, ToolbarAction::ToggleNeuralRendering));
+    CHECK_EQ(220, width(between, ToolbarAction::ToggleUpscaling));
+    CHECK_EQ(220, width(between, ToolbarAction::ToggleFrameGeneration));
+    CHECK_EQ(970L - kToolbarOuterGutterDip, between.back().bounds.right);
+    for (const auto& item : between) CHECK(!item.compact);
+    check_toolbar_items_do_not_overlap(between);
+    // A pill that reaches its full width stops growing and the rest share the
+    // remainder: frame generation tops out at 264 before the other two at 270.
+    const auto nearlyFull = LayoutToolbar(1112, 180, 96);
+    CHECK_EQ(264, width(nearlyFull, ToolbarAction::ToggleFrameGeneration));
+    CHECK_EQ(538, width(nearlyFull, ToolbarAction::ToggleNeuralRendering) +
+                  width(nearlyFull, ToolbarAction::ToggleUpscaling));
+    // At the full-pill width the pills are exactly as they were.
+    const auto full = LayoutToolbar(1114, 180, 96);
+    CHECK_EQ(270, width(full, ToolbarAction::ToggleNeuralRendering));
+    CHECK_EQ(270, width(full, ToolbarAction::ToggleUpscaling));
+    CHECK_EQ(264, width(full, ToolbarAction::ToggleFrameGeneration));
+
+    // What a narrowed pill keeps: the state, never the name.
+    CHECK(FeaturePillStateLabel(L"Neural Rendering \u00b7 Queued for the seek") == L"Queued for the seek");
+    CHECK(FeaturePillStateLabel(L"Neural Rendering \u00b7 Seeking \u00b7 On") == L"Seeking \u00b7 On");
+    CHECK(FeaturePillStateLabel(L"Frame Generation \u00b7 Generate") == L"Generate");
+    CHECK(FeaturePillStateLabel(L"Open") == L"Open");
+}
+
+void player_status_formats_exact_runtime_and_playback_states_test()
+{
+    PlayerStatusSnapshot status{};
+    CHECK(BuildPlayerStatusText(status).empty());
+
+    status.activity = PlayerStatusActivity::ResolvingYouTube;
+    CHECK_EQ(std::wstring(L"Resolving YouTube\u2026"), BuildPlayerStatusText(status));
+
+    status.activity = PlayerStatusActivity::None;
+    status.mediaLoaded = true;
+    status.runtimeConfiguration = PlayerRuntimeConfiguration::NeuralAddonExperimental;
+    status.dlssState = PlayerDlssState::Active;
+    status.sourceWidth = 1920;
+    status.sourceHeight = 1080;
+    status.inputWidth = 1280;
+    status.inputHeight = 720;
+    status.outputWidth = 3840;
+    status.outputHeight = 2160;
+    status.quality = L"Quality";
+    // Stand-ins for whatever the two producers say: the bar does not compose
+    // this copy, it carries it, so the test states that and not the wording of
+    // the day. Both fields are always assigned by their producers, and the old
+    // "unavailable" fallbacks for an empty field are gone with them.
+    status.upscalingStatus = L"<upscaling segment>";
+    status.frameGenerationStatus = L"<frame generation segment>";
+    // The components a viewer reads off the bar: which runtime is active, both
+    // feature segments verbatim, the source geometry, the output geometry when
+    // the pipeline changed it and the quality name. Their separator and order
+    // are the bar's own business. The frame rates and the dropped count are
+    // status chips now, and are pinned in status_chips_* below.
+    //
+    // The DLSS input geometry is deliberately NOT here: it only ever repeated
+    // the source or the output, and this line is drawn into one ellipsised row
+    // where a repeated fact costs a fact that is not.
+    const auto shows = [](const std::wstring& text, std::wstring_view part) {
+        return text.find(part) != std::wstring::npos;
+    };
+    const std::wstring neural = BuildPlayerStatusText(status);
+    // The runtime is named as what the pill does not say: that it is experimental.
+    CHECK(shows(neural, L"DLSS 5 (experimental)"));
+    CHECK(shows(neural, status.upscalingStatus));
+    CHECK(shows(neural, status.frameGenerationStatus));
+    CHECK(shows(neural, L"Source 1920\u00d71080"));
+    CHECK(shows(neural, L"3840\u00d72160"));
+    CHECK(shows(neural, L"Quality"));
+    // Nothing the chips carry is repeated on the line: a repeat is exactly
+    // what used to push the feature states past the ellipsis.
+    CHECK(!shows(neural, L"fps"));
+    CHECK(!shows(neural, L"Dropped"));
+
+    // A source the pipeline did not resize prints ONE geometry, not the same
+    // numbers two or three times.
+    PlayerStatusSnapshot unresized = status;
+    unresized.outputWidth = unresized.sourceWidth;
+    unresized.outputHeight = unresized.sourceHeight;
+    const std::wstring passthrough = BuildPlayerStatusText(unresized);
+    const auto occurrences = [](const std::wstring& text, std::wstring_view part) {
+        size_t count = 0;
+        for (size_t at = text.find(part); at != std::wstring::npos; at = text.find(part, at + 1)) ++count;
+        return count;
+    };
+    CHECK_EQ(size_t(1), occurrences(passthrough, L"1920\u00d71080"));
+
+    // Changing one segment changes only that segment.
+    status.upscalingStatus = L"DLSS Upscaling on \u00b7 3840\u00d72160 (auto)";
+    const std::wstring upscaling = BuildPlayerStatusText(status);
+    CHECK(shows(upscaling, status.upscalingStatus));
+    CHECK(shows(upscaling, status.frameGenerationStatus));
+    CHECK(!shows(upscaling, L"<upscaling segment>"));
+
+    status.runtimeConfiguration = PlayerRuntimeConfiguration::DlssSrSafeMode;
+    status.dlssState = PlayerDlssState::Active;
+    CHECK(BuildPlayerStatusText(status).starts_with(L"DLSS SR safe mode"));
+    CHECK(!shows(BuildPlayerStatusText(status), L"Neural addon"));
+    status.dlssState = PlayerDlssState::ScalerFallback;
+    CHECK(BuildPlayerStatusText(status).starts_with(L"DLSS SR safe mode"));
+
+    const PlayerRuntimeStatus neuralActive = ResolvePlayerRuntimeStatus(false, true, true, true);
+    CHECK_EQ(PlayerRuntimeConfiguration::NeuralAddonExperimental, neuralActive.configuration);
+    CHECK_EQ(PlayerDlssState::Active, neuralActive.dlssState);
+    const PlayerRuntimeStatus neuralFallback = ResolvePlayerRuntimeStatus(false, true, false, true);
+    CHECK_EQ(PlayerRuntimeConfiguration::NeuralAddonExperimental, neuralFallback.configuration);
+    CHECK_EQ(PlayerDlssState::ScalerFallback, neuralFallback.dlssState);
+    const PlayerRuntimeStatus safeActive = ResolvePlayerRuntimeStatus(true, false, true, true);
+    CHECK_EQ(PlayerRuntimeConfiguration::DlssSrSafeMode, safeActive.configuration);
+    CHECK_EQ(PlayerDlssState::Active, safeActive.dlssState);
+    const PlayerRuntimeStatus safeFallback = ResolvePlayerRuntimeStatus(true, false, true, false);
+    CHECK_EQ(PlayerRuntimeConfiguration::DlssSrSafeMode, safeFallback.configuration);
+    CHECK_EQ(PlayerDlssState::ScalerFallback, safeFallback.dlssState);
+}
+
+void playback_timeline_follows_the_presented_frame_test()
+{
+    // A drag previews, a pending seek shows its target, and otherwise the
+    // timeline and a pause both report the frame that was last presented.
+    CHECK_EQ(12.0, playback_timing::TimelinePosition(false, 0.0, false, 0.0, 12.0));
+    CHECK_EQ(12.0, playback_timing::PausePosition(12.0));
+    CHECK_EQ(18.0, playback_timing::TimelinePosition(true, 18.0, false, 0.0, 12.0));
+    CHECK_EQ(24.0, playback_timing::TimelinePosition(false, 0.0, true, 24.0, 12.0));
+}
+
+void playback_lateness_is_bounded_to_one_and_a_half_frames_test()
+{
+    CHECK(std::abs(playback_timing::LateFrameThreshold(1.0 / 60.0) - 0.025) < 1e-9);
+    CHECK(std::abs(playback_timing::LateFrameThreshold(1.0 / 30.0) - 0.050) < 1e-9);
+    CHECK(std::abs(playback_timing::LateFrameThreshold(1.0 / 24.0) - 0.0625) < 1e-9);
+}
+
+void long_media_title_is_bounded_with_a_real_ellipsis_test()
+{
+    const std::wstring longTitle(240, L'X');
+    const std::wstring title = BuildPlayerWindowTitle(L"DLSS Video Player", longTitle, 64);
+    CHECK_EQ(static_cast<size_t>(64), title.size());
+    CHECK(title.starts_with(L"DLSS Video Player \u2014 "));
+    CHECK_EQ(L'\u2026', title.back());
+    CHECK_EQ(std::wstring(L"DLSS Video Player"),
+             BuildPlayerWindowTitle(L"DLSS Video Player", L"", 64));
+}
+
+void recovery_copy_and_rehook_confirmation_are_actionable_test()
+{
+    Localizer localizer;
+    const std::wstring decode = localizer.Get(L"error.decode");
+    const std::wstring renderer = localizer.Get(L"error.renderer");
+    const std::wstring rehook = localizer.Get(L"rehook.confirm");
+    const std::wstring compactYoutubeReason = localizer.Get(L"idle.youtube_unavailable_compact");
+    CHECK(decode.find(L"bundled FFmpeg") != std::wstring::npos);
+    CHECK(decode.find(L"try again") != std::wstring::npos);
+    CHECK(renderer.find(L"NVIDIA driver") != std::wstring::npos);
+    CHECK(renderer.find(L"safe mode") != std::wstring::npos);
+    CHECK(rehook.find(L"reset playback") != std::wstring::npos);
+    CHECK(rehook.find(L"hang") != std::wstring::npos);
+    CHECK(rehook.find(L"experimental neural add-on") != std::wstring::npos);
+    CHECK_EQ(std::wstring(L"YouTube unavailable in this build."), compactYoutubeReason);
+    int recreateRequests = 0;
+    const auto request = [&] { ++recreateRequests; };
+    CHECK(!ExecuteGuardedRehook(IDNO, request));
+    CHECK(!ExecuteGuardedRehook(IDCANCEL, request));
+    CHECK_EQ(0, recreateRequests);
+    CHECK(ExecuteGuardedRehook(IDYES, request));
+    CHECK_EQ(1, recreateRequests);
+    CHECK(app_menu::RoutesToRehook(app_menu::PlayerCommandRoute::KeyDown, VK_F6));
+    CHECK(app_menu::RoutesToRehook(app_menu::PlayerCommandRoute::NativeMenu, app_menu::IDM_REHOOK));
+    CHECK(!app_menu::RoutesToRehook(app_menu::PlayerCommandRoute::KeyDown, 'R'));
+    CHECK(!app_menu::RoutesToRehook(app_menu::PlayerCommandRoute::NativeMenu, app_menu::IDM_OPEN));
+}
+
+void unchanged_hover_action_has_no_dirty_rectangles_test()
+{
+    const std::array items{
+        ToolbarItem{ToolbarAction::Open, RECT{10, 20, 80, 56}, false},
+        ToolbarItem{ToolbarAction::PlayPause, RECT{84, 20, 146, 56}, false},
+    };
+
+    CHECK(HoverDirtyRectangles(items, ToolbarAction::Open, ToolbarAction::Open).empty());
+    CHECK(HoverDirtyRectangles(items, ToolbarAction::None, ToolbarAction::None).empty());
+}
+
+void changed_hover_action_dirties_only_present_old_and_new_actions_test()
+{
+    const RECT openBounds{10, 20, 80, 56};
+    const RECT playBounds{84, 20, 146, 56};
+    const std::array items{
+        ToolbarItem{ToolbarAction::Open, openBounds, false},
+        ToolbarItem{ToolbarAction::PlayPause, playBounds, false},
+    };
+
+    const auto changed = HoverDirtyRectangles(items, ToolbarAction::Open,
+                                               ToolbarAction::PlayPause);
+    CHECK_EQ(2u, changed.size());
+    if (changed.size() == 2) {
+        CHECK_EQ(openBounds.left, changed[0].left);
+        CHECK_EQ(openBounds.top, changed[0].top);
+        CHECK_EQ(openBounds.right, changed[0].right);
+        CHECK_EQ(openBounds.bottom, changed[0].bottom);
+        CHECK_EQ(playBounds.left, changed[1].left);
+        CHECK_EQ(playBounds.top, changed[1].top);
+        CHECK_EQ(playBounds.right, changed[1].right);
+        CHECK_EQ(playBounds.bottom, changed[1].bottom);
+    }
+
+    const auto entered = HoverDirtyRectangles(items, ToolbarAction::None,
+                                               ToolbarAction::PlayPause);
+    CHECK_EQ(1u, entered.size());
+    if (entered.size() == 1) {
+        CHECK_EQ(playBounds.left, entered[0].left);
+        CHECK_EQ(playBounds.right, entered[0].right);
+    }
+
+    const auto left = HoverDirtyRectangles(items, ToolbarAction::Open,
+                                            ToolbarAction::None);
+    CHECK_EQ(1u, left.size());
+    if (left.size() == 1) {
+        CHECK_EQ(openBounds.left, left[0].left);
+        CHECK_EQ(openBounds.right, left[0].right);
+    }
+
+    const auto absent = HoverDirtyRectangles(items, ToolbarAction::Stop,
+                                              ToolbarAction::Forward10);
+    CHECK(absent.empty());
+}
+
+void hover_resolution_tracks_layout_action_changes_and_disappearance_test()
+{
+    const POINT point{35, 35};
+    const ToolbarAvailability available{true, false, true};
+    const std::array oldLayout{
+        ToolbarItem{ToolbarAction::Open, RECT{10, 20, 80, 56}, false},
+    };
+    const std::array changedLayout{
+        ToolbarItem{ToolbarAction::PlayPause, RECT{10, 20, 80, 56}, false},
+    };
+    const std::array<ToolbarItem, 0> disappearedLayout{};
+
+    CHECK_EQ(ToolbarAction::Open,
+             ResolveToolbarHover(oldLayout, point, available));
+    CHECK_EQ(ToolbarAction::PlayPause,
+             ResolveToolbarHover(changedLayout, point, available));
+    CHECK_EQ(ToolbarAction::None,
+             ResolveToolbarHover(disappearedLayout, point, available));
+
+    const ToolbarAvailability disabledTransport{true, true, true};
+    CHECK_EQ(ToolbarAction::None,
+             ResolveToolbarHover(changedLayout, point, disabledTransport));
+}
+
+void current_cursor_hover_clears_when_cursor_query_is_unavailable_test()
+{
+    const std::array layout{
+        ToolbarItem{ToolbarAction::Open, RECT{10, 20, 80, 56}, false},
+    };
+    const ToolbarAvailability available{true, false, true};
+    CHECK_EQ(ToolbarAction::Open,
+             ResolveToolbarHoverForCursor(layout, POINT{35, 35}, available));
+    CHECK_EQ(ToolbarAction::None,
+             ResolveToolbarHoverForCursor(layout, std::nullopt, available));
+}
+
+void paint_buffer_layout_uses_only_the_clipped_nonzero_paint_rectangle_test()
+{
+    const RECT client{0, 0, 3840, 2160};
+    const auto partial = LayoutPaintBuffer(client, RECT{3011, 1990, 3039, 2018});
+    CHECK(partial.has_value());
+    if (partial) {
+        CHECK_EQ(3011L, partial->paintBounds.left);
+        CHECK_EQ(1990L, partial->paintBounds.top);
+        CHECK_EQ(3039L, partial->paintBounds.right);
+        CHECK_EQ(2018L, partial->paintBounds.bottom);
+        CHECK_EQ(28, partial->width);
+        CHECK_EQ(28, partial->height);
+        CHECK_EQ(-3011L, partial->viewportOrigin.x);
+        CHECK_EQ(-1990L, partial->viewportOrigin.y);
+    }
+
+    const auto clipped = LayoutPaintBuffer(client, RECT{-20, 2140, 50, 2200});
+    CHECK(clipped.has_value());
+    if (clipped) {
+        CHECK_EQ(0L, clipped->paintBounds.left);
+        CHECK_EQ(2140L, clipped->paintBounds.top);
+        CHECK_EQ(50L, clipped->paintBounds.right);
+        CHECK_EQ(2160L, clipped->paintBounds.bottom);
+        CHECK_EQ(50, clipped->width);
+        CHECK_EQ(20, clipped->height);
+        CHECK_EQ(0L, clipped->viewportOrigin.x);
+        CHECK_EQ(-2140L, clipped->viewportOrigin.y);
+    }
+
+    CHECK(!LayoutPaintBuffer(client, RECT{4000, 2300, 4010, 2310}).has_value());
+    CHECK(!LayoutPaintBuffer(client, RECT{120, 120, 120, 160}).has_value());
+}
+
+void tabler_glyph_mapping_uses_the_pinned_css_codepoints_test()
+{
+    CHECK_EQ(L'\xfaf7', GlyphForIcon(UiIcon::Open));
+    CHECK_EQ(L'\xfaba', GlyphForIcon(UiIcon::Rewind));
+    CHECK_EQ(L'\xed46', GlyphForIcon(UiIcon::Play));
+    CHECK_EQ(L'\xed45', GlyphForIcon(UiIcon::Pause));
+    CHECK_EQ(L'\xed4a', GlyphForIcon(UiIcon::Stop));
+    CHECK_EQ(L'\xfac2', GlyphForIcon(UiIcon::FastForward));
+    CHECK_EQ(L'\xeb51', GlyphForIcon(UiIcon::Volume));
+    CHECK_EQ(L'\xf1c3', GlyphForIcon(UiIcon::VolumeOff));
+    CHECK_EQ(L'\xf6d7', GlyphForIcon(UiIcon::Sparkles));
+    CHECK_EQ(L'\xea85', GlyphForIcon(UiIcon::Crop));
+    CHECK_EQ(L'\xea03', GlyphForIcon(UiIcon::Adjustments));
+    CHECK_EQ(L'\xea48', GlyphForIcon(UiIcon::Debug));
+    CHECK_EQ(L'\xeaea', GlyphForIcon(UiIcon::Maximize));
+    CHECK_EQ(L'\xec90', GlyphForIcon(UiIcon::YouTube));
+    CHECK_EQ(L'\xea06', GlyphForIcon(UiIcon::Warning));
+    CHECK_EQ(L'\xead4', GlyphForIcon(UiIcon::Compare));
+}
+
+void native_button_palette_has_distinct_interaction_states_test()
+{
+    const ButtonVisual defaultVisual = ResolveButtonVisual({});
+    CHECK_EQ(RGB(47, 49, 53), defaultVisual.fill);
+    CHECK_EQ(RGB(240, 240, 242), defaultVisual.text);
+
+    ButtonState state{};
+    state.hover = true;
+    CHECK_EQ(RGB(62, 65, 70), ResolveButtonVisual(state).fill);
+    state.pressed = true;
+    CHECK_EQ(RGB(27, 28, 31), ResolveButtonVisual(state).fill);
+    state.pressed = false;
+    state.hover = false;
+    state.active = true;
+    const ButtonVisual active = ResolveButtonVisual(state);
+    CHECK_EQ(RGB(55, 139, 226), active.fill);
+    CHECK(active.text != RGB(240, 240, 242));
+    // A lit pill answers the cursor by lifting toward white in its own hue,
+    // and its dark label keeps (and gains) contrast doing so.
+    state.hover = true;
+    const ButtonVisual activeHover = ResolveButtonVisual(state);
+    CHECK(activeHover.fill != active.fill);
+    CHECK(GetRValue(activeHover.fill) >= GetRValue(active.fill) && GetGValue(activeHover.fill) >= GetGValue(active.fill) &&
+          GetBValue(activeHover.fill) >= GetBValue(active.fill));
+    CHECK_EQ(active.text, activeHover.text);
+    state.pressed = true;
+    CHECK_EQ(RGB(27, 28, 31), ResolveButtonVisual(state).fill);
+    state.focus = true;
+    state.enabled = false;
+    const ButtonVisual disabled = ResolveButtonVisual(state);
+    CHECK_EQ(RGB(27, 28, 31), disabled.fill);
+    CHECK_EQ(RGB(160, 164, 172), disabled.text);
+    CHECK(disabled.drawFocus == state.focus);
+}
+
+double linear_color_channel(BYTE value)
+{
+    const double channel = static_cast<double>(value) / 255.0;
+    return channel <= 0.04045 ? channel / 12.92 : std::pow((channel + 0.055) / 1.055, 2.4);
+}
+
+double contrast_ratio(COLORREF foreground, COLORREF background)
+{
+    const auto luminance = [](COLORREF color) {
+        return 0.2126 * linear_color_channel(GetRValue(color)) +
+               0.7152 * linear_color_channel(GetGValue(color)) +
+               0.0722 * linear_color_channel(GetBValue(color));
+    };
+    const double foregroundLuminance = luminance(foreground);
+    const double backgroundLuminance = luminance(background);
+    return (std::max(foregroundLuminance, backgroundLuminance) + 0.05) /
+           (std::min(foregroundLuminance, backgroundLuminance) + 0.05);
+}
+
+void active_button_small_text_meets_wcag_contrast_test()
+{
+    ButtonState state{};
+    state.active = true;
+    const ButtonVisual active = ResolveButtonVisual(state);
+    CHECK(contrast_ratio(active.text, active.fill) >= 4.5);
+    // Hovered, and the working (teal) state both ways, keep the same floor.
+    state.hover = true;
+    const ButtonVisual activeHover = ResolveButtonVisual(state);
+    CHECK(contrast_ratio(activeHover.text, activeHover.fill) >= contrast_ratio(active.text, active.fill));
+    state = ButtonState{};
+    state.working = true;
+    const ButtonVisual working = ResolveButtonVisual(state);
+    CHECK(contrast_ratio(working.text, working.fill) >= 4.5);
+    state.hover = true;
+    const ButtonVisual workingHover = ResolveButtonVisual(state);
+    CHECK(workingHover.fill != working.fill);
+    CHECK(contrast_ratio(workingHover.text, workingHover.fill) >= contrast_ratio(working.text, working.fill));
+}
+
+void chrome_motion_fades_ease_without_overshoot_and_honour_reduced_motion_test()
+{
+    using namespace chrome_motion;
+    // The curves start at 0, end at 1, never leave [0, 1] and never go back.
+    double lastOut = 0.0, lastIn = 0.0;
+    for (int step = 0; step <= 100; ++step) {
+        const double t = step / 100.0;
+        const double out = EaseOut(t), in = EaseIn(t);
+        CHECK(out >= lastOut && out <= 1.0);
+        CHECK(in >= lastIn && in <= 1.0);
+        lastOut = out;
+        lastIn = in;
+    }
+    CHECK_EQ(0.0, EaseOut(0.0));
+    CHECK_EQ(1.0, EaseOut(1.0));
+    CHECK_EQ(1.0, EaseIn(2.0));
+    // Ease-out answers early; ease-in leaves late.
+    CHECK(EaseOut(0.25) > 0.5);
+    CHECK(EaseIn(0.25) < 0.05);
+    CHECK_EQ(RGB(10, 20, 30), Mix(RGB(10, 20, 30), RGB(250, 250, 250), 0.0));
+    CHECK_EQ(RGB(250, 250, 250), Mix(RGB(10, 20, 30), RGB(250, 250, 250), 1.0));
+    CHECK_EQ(RGB(130, 135, 140), Mix(RGB(10, 20, 30), RGB(250, 250, 250), 0.5));
+
+    const Clock::time_point start{};
+    Fade fade;
+    CHECK_EQ(0.0, fade.Level(start));
+    CHECK(!fade.Animating(start));
+    fade.Set(true, start, true);
+    CHECK_EQ(0.0, fade.Level(start));
+    CHECK(fade.Animating(start + kHoverIn / 2));
+    const double half = fade.Level(start + kHoverIn / 2);
+    CHECK(half > 0.5 && half < 1.0);
+    CHECK_EQ(1.0, fade.Level(start + kHoverIn));
+    CHECK(!fade.Animating(start + kHoverIn));
+    // Setting the state it is already heading to changes nothing.
+    fade.Set(true, start + kHoverIn / 2, true);
+    CHECK_EQ(1.0, fade.Level(start + kHoverIn));
+    // Leaving halfway through arriving eases out from where it had got to,
+    // not from 1: the tint never jumps.
+    Fade reversal;
+    reversal.Set(true, start, true);
+    const auto turn = start + kHoverIn / 3;
+    const double reached = reversal.Level(turn);
+    reversal.Set(false, turn, true);
+    CHECK(std::abs(reversal.Level(turn) - reached) < 1e-9);
+    CHECK(reversal.Level(turn + kHoverOut / 2) < reached);
+    CHECK_EQ(0.0, reversal.Level(turn + kHoverOut));
+    // Durations sit inside DESIGN.md's 120-220 ms, and leaving is not quicker
+    // than arriving.
+    CHECK(kHoverIn.count() >= 120 && kHoverOut.count() <= 220 && kHoverOut >= kHoverIn);
+    // Without motion the level lands at once and nothing asks for a timer.
+    Fade still;
+    still.Set(true, start, false);
+    CHECK_EQ(1.0, still.Level(start));
+    CHECK(!still.Animating(start));
+    still.Set(false, start, false);
+    CHECK_EQ(0.0, still.Level(start));
+    // Reset drops a fade without animating it.
+    fade.Set(false, start + kHoverIn, true);
+    fade.Reset();
+    CHECK_EQ(0.0, fade.Level(start + kHoverIn));
+    CHECK(!fade.Animating(start + kHoverIn));
+}
+
+void chrome_motion_compare_mark_slides_from_the_old_mode_to_the_new_test()
+{
+    using namespace chrome_motion;
+    const Clock::time_point start{};
+    Slide slide;
+    slide.Start(100, 180, 300, 360, start, true);
+    CHECK(slide.Animating(start));
+    CHECK(slide.At(start) == std::make_pair(LONG{100}, LONG{180}));
+    // Ease-out: more than half-way at the half time, and moving only forward.
+    const auto half = slide.At(start + kMarkSlide / 2);
+    CHECK(half.first > 200 && half.first < 300);
+    CHECK(half.second > 270 && half.second < 360);
+    CHECK(slide.At(start + kMarkSlide) == std::make_pair(LONG{300}, LONG{360}));
+    CHECK(!slide.Animating(start + kMarkSlide));
+    CHECK(kMarkSlide.count() >= 120 && kMarkSlide.count() <= 220);
+    // Without motion it is at the end at once and never animates.
+    Slide still;
+    still.Start(100, 180, 300, 360, start, false);
+    CHECK(!still.Animating(start));
+    CHECK(still.At(start) == std::make_pair(LONG{300}, LONG{360}));
+}
+
+void chrome_motion_toast_rises_holds_and_goes_and_a_second_one_does_not_bounce_test()
+{
+    using namespace chrome_motion;
+    const Clock::time_point start{};
+    Toast toast;
+    CHECK(!toast.At(start).visible);
+    CHECK(!toast.NextChange(start).has_value());
+    toast.Show(start);
+    // Rising in: fading up while it climbs to where it settles.
+    const auto early = toast.At(start + kToastIn / 4);
+    CHECK(early.visible && early.alpha > 0.0 && early.alpha < 1.0 && early.rise > 0.0);
+    const auto held = toast.At(start + kToastIn + kToastHold / 2);
+    CHECK(held.alpha == 1.0 && held.rise == 0.0);
+    // Sitting still, the next change is the hold's end, not the next frame.
+    CHECK(toast.NextChange(start + kToastIn + kToastHold / 2).value() > std::chrono::milliseconds(1000));
+    CHECK(toast.NextChange(start + kToastIn / 2).value() == std::chrono::milliseconds(kPlaybackFrameMs));
+    const auto leaving = toast.At(start + kToastIn + kToastHold + kToastOut / 2);
+    CHECK(leaving.visible && leaving.alpha < 1.0 && leaving.rise == 0.0);
+    CHECK(!toast.At(start + kToastIn + kToastHold + kToastOut).visible);
+    // A second toast while one is up restarts the hold without rising again.
+    Toast again;
+    again.Show(start);
+    const auto later = start + kToastIn + std::chrono::milliseconds(500);
+    again.Show(later);
+    const auto replaced = again.At(later);
+    CHECK(replaced.alpha == 1.0 && replaced.rise == 0.0);
+    CHECK(again.At(later + kToastHold - std::chrono::milliseconds(10)).alpha == 1.0);
+    // Without motion: there for the hold, then gone, never fading.
+    Toast still;
+    still.Show(start);
+    CHECK(still.At(start, false).alpha == 1.0);
+    CHECK(still.At(start + kToastIn + kToastHold - std::chrono::milliseconds(1), false).alpha == 1.0);
+    CHECK(!still.At(start + kToastIn + kToastHold, false).visible);
+    CHECK(kToastIn.count() >= 120 && kToastIn.count() <= 220 && kToastOut.count() >= 120 && kToastOut.count() <= 220);
+}
+
+void chrome_motion_band_reveals_only_new_coverage_left_to_right_test()
+{
+    using namespace chrome_motion;
+    using I = BandGrowth::Interval;
+    const Clock::time_point start{};
+    BandGrowth band;
+    // The first observation is shown as it is: retained coverage does not replay.
+    CHECK(!band.Observe({{0, 100}}, start, true));
+    CHECK(band.Hidden(start).empty());
+    // A segment extends the span: only 100..160 reveals, from its left.
+    CHECK(band.Observe({{0, 160}}, start, true));
+    auto hidden = band.Hidden(start);
+    REQUIRE(hidden.size() == 1);
+    CHECK(hidden[0].start == 100 && hidden[0].end == 160);
+    const auto half = band.Hidden(start + kBandGrow / 2);
+    REQUIRE(half.size() == 1);
+    CHECK(half[0].start > 130 && half[0].end == 160);   // ease-out: past halfway
+    CHECK(band.Hidden(start + kBandGrow).empty());
+    CHECK(!band.Animating(start + kBandGrow));
+    // A hole filled between two spans reveals only the hole.
+    BandGrowth merge;
+    merge.Observe({{0, 100}, {200, 300}}, start, true);
+    CHECK(merge.Observe({{0, 300}}, start, true));
+    hidden = merge.Hidden(start);
+    REQUIRE(hidden.size() == 1);
+    CHECK(hidden[0].start == 100 && hidden[0].end == 200);
+    // Without motion nothing eases.
+    BandGrowth still;
+    still.Observe({{0, 100}}, start, false);
+    CHECK(!still.Observe({{0, 200}}, start, false));
+    CHECK(still.Hidden(start).empty());
+    // After a reset the next observation is a first one again.
+    band.Reset();
+    CHECK(!band.Observe({{0, 500}}, start, true));
+    CHECK(kBandGrow.count() >= 120 && kBandGrow.count() <= 220);
+    (void)I{};
+}
+
+void chrome_motion_render_complete_glow_sweeps_once_and_only_for_a_render_watched_happening_test()
+{
+    using namespace chrome_motion;
+    const Clock::time_point start{};
+    Glow glow;
+    CHECK(!glow.Animating(start));
+    CHECK_EQ(0.0, glow.Level(start, true));
+    glow.Start(start);
+    // Lights quickly, holds while the highlight crosses, settles to nothing.
+    CHECK(glow.Animating(start));
+    CHECK(glow.Level(start + kCompleteGlow / 10, true) > 0.5);
+    CHECK_EQ(1.0, glow.Level(start + kCompleteGlow / 2, true));
+    CHECK(glow.Level(start + kCompleteGlow * 19 / 20, true) < 0.5);
+    CHECK_EQ(0.0, glow.Level(start + kCompleteGlow, true));
+    CHECK(!glow.Animating(start + kCompleteGlow));
+    // The sweep crosses left to right, once, and is gone before the settle.
+    double last = -1.0;
+    for (int step = 0; step < 7; ++step) {
+        const auto sweep = glow.Sweep(start + kCompleteGlow * step / 10, true);
+        CHECK(sweep.has_value());
+        if (sweep) {
+            CHECK(*sweep > last && *sweep <= 1.0);
+            last = *sweep;
+        }
+    }
+    CHECK(!glow.Sweep(start + kCompleteGlow * 8 / 10, true).has_value());
+    // Without motion: lit for the same time, no sweep, then out.
+    CHECK_EQ(1.0, glow.Level(start + kCompleteGlow / 10, false));
+    CHECK(!glow.Sweep(start + kCompleteGlow / 10, false).has_value());
+    CHECK_EQ(0.0, glow.Level(start + kCompleteGlow, false));
+    glow.Cancel();
+    CHECK(!glow.Animating(start));
+
+    // Fires once, on the first finished observation after one with holes.
+    CompletionLatch latch;
+    CHECK(!latch.Observe(true, false));
+    CHECK(!latch.Observe(true, false));
+    CHECK(latch.Observe(true, true));
+    CHECK(!latch.Observe(true, true));
+    // A session that opens on a render already whole never earns it.
+    CompletionLatch whole;
+    CHECK(!whole.Observe(true, true));
+    CHECK(!whole.Observe(true, true));
+    // Holes seen in one session do not carry into the next.
+    CompletionLatch across;
+    CHECK(!across.Observe(true, false));
+    CHECK(!across.Observe(false, false));
+    CHECK(!across.Observe(true, true));
+    // A seek that opens new holes after completion earns a second moment
+    // when those are filled.
+    CHECK(!across.Observe(true, false));
+    CHECK(across.Observe(true, true));
+}
+
+void failed_icon_font_uses_label_only_presentation_test()
+{
+    UiResources resources;
+    CHECK(!resources.Load(nullptr));
+    CHECK(resources.CreateIconFont(96) == nullptr);
+    CHECK(ResolveButtonPresentation(false) == ButtonPresentation::LabelOnly);
+    CHECK(ResolveButtonPresentation(true) == ButtonPresentation::IconAndLabel);
+}
+
+void button_content_layout_preserves_required_insets_and_icon_gap_at_every_dpi_test()
+{
+    for(const UINT dpi:{96u,120u,144u,192u}){
+        const int width=MulDiv(180,int(dpi),96),height=MulDiv(40,int(dpi),96);
+        const SIZE icon{MulDiv(17,int(dpi),96),MulDiv(17,int(dpi),96)};
+        const SIZE text{MulDiv(64,int(dpi),96),MulDiv(15,int(dpi),96)};
+        const RECT outer{0,0,width,height};
+        const auto layout=LayoutButtonContent(outer,icon,text,false,dpi);
+        CHECK(outer.bottom-outer.top>=MulDiv(36,int(dpi),96));
+        CHECK(layout.icon.left-outer.left>=MulDiv(kButtonHorizontalInsetDip,int(dpi),96));
+        CHECK(outer.right-layout.text.right>=MulDiv(kButtonHorizontalInsetDip,int(dpi),96));
+        CHECK(layout.icon.top-outer.top>=MulDiv(kButtonVerticalInsetDip,int(dpi),96));
+        CHECK(outer.bottom-layout.icon.bottom>=MulDiv(kButtonVerticalInsetDip,int(dpi),96));
+        CHECK(layout.text.top-outer.top>=MulDiv(kButtonVerticalInsetDip,int(dpi),96));
+        CHECK(outer.bottom-layout.text.bottom>=MulDiv(kButtonVerticalInsetDip,int(dpi),96));
+        CHECK(layout.text.left-layout.icon.right>=MulDiv(kButtonIconLabelGapDip,int(dpi),96));
+    }
+}
+
+void button_content_layout_centers_combined_icon_and_label_without_outline_contact_test()
+{
+    for(const UINT dpi:{96u,120u,144u,192u}){
+        const RECT outer{0,0,MulDiv(220,int(dpi),96),MulDiv(44,int(dpi),96)};
+        const auto layout=LayoutButtonContent(
+            outer,SIZE{MulDiv(18,int(dpi),96),MulDiv(18,int(dpi),96)},
+            SIZE{MulDiv(72,int(dpi),96),MulDiv(16,int(dpi),96)},false,dpi);
+        const int leftSpace=layout.content.left-outer.left;
+        const int rightSpace=outer.right-layout.content.right;
+        CHECK(std::abs(leftSpace-rightSpace)<=1);
+        CHECK(leftSpace>=MulDiv(kButtonHorizontalInsetDip,int(dpi),96));
+        CHECK(layout.icon.right<=layout.text.left);
+    }
+}
+
+void prerender_surface_layout_keeps_progress_cancel_and_text_inside_client_bounds_test()
+{
+    const auto inside=[](const RECT& inner,const RECT& outer){
+        return inner.left>=outer.left&&inner.top>=outer.top&&inner.right<=outer.right&&
+               inner.bottom<=outer.bottom&&inner.right>=inner.left&&inner.bottom>=inner.top;
+    };
+    for(const UINT dpi:{96u,120u,144u,192u}){
+        const int width=MulDiv(640,int(dpi),96),height=MulDiv(420,int(dpi),96);
+        const RECT client{0,0,width,height};const auto layout=LayoutPreRenderSurface(width,height,dpi);
+        for(const RECT rect:{layout.title,layout.phase,layout.resolution,layout.frameCount,
+                             layout.elapsedEta,layout.size,layout.progressTrack,
+                             layout.progressFill,layout.cancelButton})CHECK(inside(rect,client));
+        CHECK(layout.cancelButton.right-layout.cancelButton.left<=MulDiv(120,int(dpi),96));
+        CHECK(layout.cancelButton.bottom-layout.cancelButton.top<=MulDiv(40,int(dpi),96));
+        CHECK(layout.progressFill.left==layout.progressTrack.left);
+    }
+}
+
+void advanced_menu_contains_clear_neural_cache_and_no_removed_quality_commands_test()
+{
+    Localizer localizer;const HMENU menu=app_menu::CreateMenuBar(localizer,true);CHECK(menu!=nullptr);
+    std::vector<MenuEntry> entries;if(menu)collect_menu_entries(menu,entries);
+    CHECK(has_menu_entry(entries,L"Clear Neural Cache",app_menu::IDM_CLEAR_NEURAL_CACHE));
+    CHECK(!has_menu_text(entries,L"720p"));CHECK(!has_menu_text(entries,L"480p"));
+    if(menu)DestroyMenu(menu);
+}
+
+void feature_menu_uses_distinct_controls_and_honest_availability_test()
+{
+    Localizer localizer;
+    const HMENU menu = app_menu::CreateMenuBar(localizer, true);
+    CHECK(menu != nullptr);
+    std::vector<MenuEntry> entries;
+    if (menu) collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, L"Neural Rendering\tD", app_menu::IDM_NEURAL_RENDERING));
+    CHECK(has_menu_entry(entries, L"DLSS Upscaling",
+                         app_menu::IDM_DLSS_UPSCALING));
+    // Frame generation is a command, not a permanently disabled label. The old
+    // entry read "Unavailable in this build", which was honest while no backend
+    // existed and would now be a lie.
+    CHECK(has_menu_entry(entries, L"Generate frames (higher frame rate)...",
+                         app_menu::IDM_FRAME_GENERATION));
+    // And there is no separate cancel row: the action reports a running
+    // conversion by BECOMING the cancel command, which is what the toolbar pill
+    // does. A row that is greyed in every state the user normally sees is a row
+    // that teaches them the menu is full of things that do nothing.
+    CHECK(!has_menu_text(entries, L"Cancel frame generation"));
+    CHECK(!has_menu_text(entries, L"Cancel saving"));
+    CHECK(!has_menu_text(entries, L"Enable DLSS\tD"));
+    CHECK(!has_menu_text(entries, L"Frame Generation\tUnavailable in this build"));
+
+    // The two real toggles report a mode, so they carry a checkmark. Frame
+    // generation is an action that starts a one-shot conversion: a check on it
+    // would state a mode the player never has, so it gets an enable state and
+    // nothing else, whatever its arguments say.
+    CHECK(app_menu::UpdateFeatureAvailability(menu, true, true, true,
+                                              false, false, false, false));
+    const UINT neural = GetMenuState(menu, app_menu::IDM_NEURAL_RENDERING, MF_BYCOMMAND);
+    const UINT upscaling = GetMenuState(menu, app_menu::IDM_DLSS_UPSCALING, MF_BYCOMMAND);
+    const UINT frameGeneration = GetMenuState(menu, app_menu::IDM_FRAME_GENERATION, MF_BYCOMMAND);
+    CHECK((neural & (MF_DISABLED | MF_GRAYED)) == 0);
+    CHECK((neural & MF_CHECKED) != 0);
+    CHECK((upscaling & (MF_DISABLED | MF_GRAYED)) != 0);
+    CHECK((frameGeneration & (MF_DISABLED | MF_GRAYED)) != 0);
+    CHECK((frameGeneration & MF_CHECKED) == 0);
+    // And it enables when the player says a conversion is possible, which the
+    // permanently-false argument could never show - still without a check,
+    // with both toggles on and checked beside it.
+    CHECK(app_menu::UpdateFeatureAvailability(menu, true, true, true,
+                                              true, true, true, true));
+    const UINT enabledFrameGeneration =
+        GetMenuState(menu, app_menu::IDM_FRAME_GENERATION, MF_BYCOMMAND);
+    CHECK((enabledFrameGeneration & (MF_DISABLED | MF_GRAYED)) == 0);
+    CHECK((enabledFrameGeneration & MF_CHECKED) == 0);
+    CHECK((GetMenuState(menu, app_menu::IDM_NEURAL_RENDERING, MF_BYCOMMAND) & MF_CHECKED) != 0);
+    CHECK((GetMenuState(menu, app_menu::IDM_DLSS_UPSCALING, MF_BYCOMMAND) & MF_CHECKED) != 0);
+    // The converted file is unreachable until one exists: the item that opens
+    // it is created greyed and only main.cpp's own state can enable it, so no
+    // availability argument here may light it up.
+    const UINT showOutput = GetMenuState(menu, app_menu::IDM_SHOW_FRAMEGEN_OUTPUT, MF_BYCOMMAND);
+    CHECK(showOutput != static_cast<UINT>(-1));
+    CHECK((showOutput & (MF_DISABLED | MF_GRAYED)) != 0);
+    if (menu) DestroyMenu(menu);
+}
+
+void debug_view_popup_contains_all_existing_views_and_selection_test()
+{
+    const HMENU menu = app_menu::CreateDebugViewMenu(app_menu::IDM_VIEW_DEPTH);
+    CHECK(menu != nullptr);
+    CHECK_EQ(4, menu ? GetMenuItemCount(menu) : 0);
+    std::vector<MenuEntry> entries;
+    if (menu) collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, L"Final image\t1", app_menu::IDM_VIEW_FINAL));
+    CHECK(has_menu_entry(entries, L"DLSS input\t2", app_menu::IDM_VIEW_INPUT));
+    CHECK(has_menu_entry(entries, L"Motion vectors\t3", app_menu::IDM_VIEW_MV));
+    CHECK(has_menu_entry(entries, L"Depth\t4", app_menu::IDM_VIEW_DEPTH));
+    for (const auto& entry : entries) {
+        if (entry.command == app_menu::IDM_VIEW_DEPTH) CHECK((entry.state & MFS_CHECKED) != 0);
+        else CHECK((entry.state & MFS_CHECKED) == 0);
+    }
+    if (menu) DestroyMenu(menu);
+}
+
+void range_preview_and_comparison_menus_route_keys_and_gate_availability_test()
+{
+    Localizer localizer;
+    const HMENU menu = app_menu::CreateMenuBar(localizer, true);
+    CHECK(menu != nullptr);
+    std::vector<MenuEntry> entries;
+    if (menu) collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, L"Mark In\tI", app_menu::IDM_MARK_IN));
+    CHECK(has_menu_entry(entries, L"Mark Out\tO", app_menu::IDM_MARK_OUT));
+    CHECK(has_menu_entry(entries, L"Clear Marks\tShift+I / Shift+O", app_menu::IDM_CLEAR_MARKS));
+    CHECK(has_menu_entry(entries, L"Go to timecode...\tCtrl+G", app_menu::IDM_GOTO_TIMECODE));
+    // Space pauses a running conversion and plays/pauses otherwise; the item says
+    // which of the two it is, so the sheet listing Space twice reads as two jobs.
+    CHECK(has_menu_entry(entries, L"Pause conversion\tSpace", app_menu::IDM_PAUSE_NEURAL_RENDER));
+    CHECK(has_menu_entry(entries, L"Preview this frame (neural)\tF", app_menu::IDM_PREVIEW_FRAME));
+    CHECK(has_menu_entry(entries, L"Preview 4 s clip (neural)\tShift+F", app_menu::IDM_PREVIEW_CLIP));
+    // Conversion writes a file; it lives in its own submenu beside saving.
+    CHECK(has_menu_entry(entries, L"Convert marked clip to neural video\tCtrl+R", app_menu::IDM_RENDER_RANGE));
+    CHECK(has_menu_entry(entries, L"Convert whole video to neural video", app_menu::IDM_RENDER_WHOLE));
+    CHECK(has_menu_entry(entries, L"Save converted video...", app_menu::IDM_EXPORT_CACHED_VIDEO));
+    // Microsoft's own rule: "About, Advanced, Help, Options, Properties, and
+    // Settings must display another window when clicked, but don't require
+    // additional information from the user. Therefore they don't need
+    // ellipses." Export DOES take one - it asks which stages before it runs.
+    CHECK(has_menu_entry(entries, L"Neural settings\tCtrl+N", app_menu::IDM_NEURAL_SETTINGS));
+    CHECK(has_menu_entry(entries, L"Encoder settings", app_menu::IDM_ENCODER_SETTINGS));
+    // Ctrl+S, not Ctrl+E. Ctrl+E has opened Image adjustments since long before
+    // this command existed, and the label claimed it anyway - a menu that
+    // advertises a key which does something else is worse than one with none.
+    CHECK(has_menu_entry(entries, L"Export with DLSS stages...\tCtrl+S", app_menu::IDM_EXPORT_STAGES));
+    // Every accelerator a label advertises must route to that command.
+    CHECK(app_menu::CommandForPlayerKey('S', true, false) == app_menu::IDM_EXPORT_STAGES);
+    CHECK(app_menu::CommandForPlayerKey('N', true, false) == app_menu::IDM_NEURAL_SETTINGS);
+    // Bare S stops playback, so the modifier is what tells them apart.
+    CHECK(!app_menu::CommandForPlayerKey('S', false, false).has_value());
+    CHECK(has_menu_entry(entries, L"Open render receipt", app_menu::IDM_OPEN_RENDER_RECEIPT));
+    CHECK(has_menu_entry(entries, L"Save comparison image\u2026\tCtrl+Shift+S", app_menu::IDM_SAVE_COMPARISON_IMAGE));
+    CHECK(has_menu_entry(entries, L"Zoom in (Fit, 1:1, 2x, 4x, 8x)\tZ", app_menu::IDM_COMPARE_ZOOM));
+    CHECK(has_menu_entry(entries, L"Zoom out\tShift+Z", app_menu::IDM_COMPARE_ZOOM_OUT));
+    CHECK(has_menu_entry(entries, L"Loupe\tL", app_menu::IDM_COMPARE_LOUPE));
+    CHECK(has_menu_entry(entries, L"1:1 pixels", app_menu::IDM_ASPECT_ONE_TO_ONE));
+    // Fit, Fill and 1:1 pixels are one radio group, by position.
+    CHECK(app_menu::CheckRadioCommand(menu, app_menu::IDM_ASPECT_FIT, app_menu::IDM_ASPECT_ONE_TO_ONE, app_menu::IDM_ASPECT_ONE_TO_ONE));
+    CHECK((GetMenuState(menu, app_menu::IDM_ASPECT_ONE_TO_ONE, MF_BYCOMMAND) & MF_CHECKED) != 0);
+    CHECK((GetMenuState(menu, app_menu::IDM_ASPECT_FIT, MF_BYCOMMAND) & MF_CHECKED) == 0);
+    CHECK((GetMenuState(menu, app_menu::IDM_FULLSCREEN, MF_BYCOMMAND) & MF_CHECKED) == 0);
+    CHECK(app_menu::CheckRadioCommand(menu, app_menu::IDM_ASPECT_FIT, app_menu::IDM_ASPECT_ONE_TO_ONE, app_menu::IDM_ASPECT_FILL));
+    CHECK((GetMenuState(menu, app_menu::IDM_ASPECT_FILL, MF_BYCOMMAND) & MF_CHECKED) != 0);
+    CHECK((GetMenuState(menu, app_menu::IDM_ASPECT_ONE_TO_ONE, MF_BYCOMMAND) & MF_CHECKED) == 0);
+    // Depth is a persisted guide switch in the neural settings dialog now.
+    CHECK(!has_menu_text(entries, L"Estimated / flat depth proxy\tG"));
+    HMENU video = find_top_level_submenu(menu, L"Video");
+    HMENU compare = find_top_level_submenu(video, L"Compare");
+    CHECK(compare != nullptr);
+    std::vector<MenuEntry> compareEntries;
+    if (compare) collect_menu_entries(compare, compareEntries);
+    CHECK(has_menu_entry(compareEntries, L"DLSS 5", app_menu::IDM_COMPARE_NEURAL));
+    CHECK(has_menu_entry(compareEntries, L"Original", app_menu::IDM_COMPARE_ORIGINAL));
+    CHECK(has_menu_entry(compareEntries, L"Split", app_menu::IDM_COMPARE_SPLIT));
+    CHECK(has_menu_entry(compareEntries, L"Wipe", app_menu::IDM_COMPARE_WIPE));
+    CHECK(has_menu_entry(compareEntries, L"Difference", app_menu::IDM_COMPARE_DIFFERENCE));
+    CHECK(has_menu_entry(compareEntries, L"Side by side", app_menu::IDM_COMPARE_SIDE_BY_SIDE));
+    CHECK(has_menu_entry(compareEntries, L"2 \u00d7 2", app_menu::IDM_COMPARE_QUAD));
+    CHECK(has_menu_entry(compareEntries, L"RTX VSR\tR", app_menu::IDM_COMPARE_VSR));
+    CHECK(has_menu_entry(compareEntries, L"Compare against RTX VSR\tShift+R", app_menu::IDM_COMPARE_AGAINST_VSR));
+    CHECK(has_menu_entry(compareEntries, L"High (default)", app_menu::IDM_COMPARE_VSR_QUALITY_FIRST + 2));
+    CHECK(has_menu_entry(compareEntries, L"More difference gain\tShift+]", app_menu::IDM_COMPARE_DIFFERENCE_MORE));
+    CHECK(has_menu_entry(compareEntries, L"Less difference gain\tShift+[", app_menu::IDM_COMPARE_DIFFERENCE_LESS));
+    // Blend was the Mix under another name; its row is gone and [ and ] step the Mix.
+    CHECK(!has_menu_text(compareEntries, L"Blend"));
+    CHECK(has_menu_entry(compareEntries, L"Mix less\t[", app_menu::IDM_COMPARE_BLEND_LESS));
+    CHECK(has_menu_entry(compareEntries, L"Mix more\t]", app_menu::IDM_COMPARE_BLEND_MORE));
+    CHECK(has_menu_entry(compareEntries, L"Swap sides\tX", app_menu::IDM_COMPARE_SWAP));
+
+    // A fresh bar has nothing loaded: every range, render and compare item is grayed.
+    const auto grayed = [&](UINT command) {
+        return (GetMenuState(menu, command, MF_BYCOMMAND) & (MF_DISABLED | MF_GRAYED)) != 0;
+    };
+    const auto checked = [&](UINT command) {
+        return (GetMenuState(menu, command, MF_BYCOMMAND) & MF_CHECKED) != 0;
+    };
+    for (const UINT command : {app_menu::IDM_MARK_IN, app_menu::IDM_GOTO_TIMECODE, app_menu::IDM_PREVIEW_FRAME,
+                               app_menu::IDM_RENDER_WHOLE, app_menu::IDM_PAUSE_NEURAL_RENDER, app_menu::IDM_OPEN_RENDER_RECEIPT,
+                               app_menu::IDM_COMPARE_ORIGINAL, app_menu::IDM_COMPARE_SWAP, app_menu::IDM_COMPARE_ZOOM})
+        CHECK(grayed(command));
+    CHECK(checked(app_menu::IDM_COMPARE_NEURAL));
+
+    CHECK(app_menu::UpdateRenderActionAvailability(menu, true, false, true, true, true));
+    CHECK(!grayed(app_menu::IDM_MARK_OUT));
+    CHECK(grayed(app_menu::IDM_PREVIEW_CLIP));
+    CHECK(!grayed(app_menu::IDM_PAUSE_NEURAL_RENDER));
+    CHECK(checked(app_menu::IDM_PAUSE_NEURAL_RENDER));
+    CHECK(!grayed(app_menu::IDM_OPEN_RENDER_RECEIPT));
+    CHECK(app_menu::UpdateRenderActionAvailability(menu, true, true, false, true, false));
+    CHECK(!grayed(app_menu::IDM_RENDER_RANGE));
+    CHECK(grayed(app_menu::IDM_PAUSE_NEURAL_RENDER));
+    CHECK(!checked(app_menu::IDM_PAUSE_NEURAL_RENDER)); // No job: a stale pause flag never shows.
+
+    CHECK(app_menu::UpdateComparisonMenu(menu, true, true, app_menu::IDM_COMPARE_SPLIT, true));
+    CHECK(!grayed(app_menu::IDM_COMPARE_WIPE));
+    CHECK(checked(app_menu::IDM_COMPARE_SPLIT));
+    CHECK(!checked(app_menu::IDM_COMPARE_NEURAL));
+    CHECK(!grayed(app_menu::IDM_COMPARE_ZOOM_OUT)); // Zoomed: there is somewhere to zoom out to.
+    CHECK(app_menu::UpdateComparisonMenu(menu, false, true, 999u, false));
+    CHECK(grayed(app_menu::IDM_COMPARE_SPLIT));
+    CHECK(!grayed(app_menu::IDM_COMPARE_ZOOM)); // Zoom is view-independent.
+    CHECK(grayed(app_menu::IDM_COMPARE_ZOOM_OUT) && grayed(app_menu::IDM_COMPARE_ZOOM_FIT));
+    CHECK(grayed(app_menu::IDM_COMPARE_LOUPE)); // The loupe shows the original: comparison only.
+    CHECK(checked(app_menu::IDM_COMPARE_NEURAL)); // Unknown selection falls back to Neural.
+    CHECK(!checked(app_menu::IDM_COMPARE_ZOOM));
+    CHECK(app_menu::UpdateComparisonMenu(menu, true, true, app_menu::IDM_COMPARE_NEURAL, false, false, true));
+    CHECK(checked(app_menu::IDM_COMPARE_LOUPE));
+    // The group is positional: Original sits between Neural and Split in the popup
+    // with an id outside that range, and still takes the one radio mark.
+    CHECK(app_menu::UpdateComparisonMenu(menu, true, true, app_menu::IDM_COMPARE_ORIGINAL, false, true));
+    CHECK(checked(app_menu::IDM_COMPARE_ORIGINAL));
+    CHECK(!checked(app_menu::IDM_COMPARE_NEURAL));CHECK(!checked(app_menu::IDM_COMPARE_SPLIT));
+    CHECK(checked(app_menu::IDM_COMPARE_SWAP));
+    CHECK(app_menu::UpdateComparisonMenu(menu, true, true, app_menu::IDM_COMPARE_WIPE, false, false));
+    CHECK(checked(app_menu::IDM_COMPARE_WIPE));CHECK(!checked(app_menu::IDM_COMPARE_ORIGINAL));
+    CHECK(!checked(app_menu::IDM_COMPARE_SWAP));
+    CHECK(app_menu::UpdateComparisonMenu(menu, true, true, app_menu::IDM_COMPARE_DIFFERENCE, false, false, false, false));
+    CHECK(checked(app_menu::IDM_COMPARE_DIFFERENCE));CHECK(!checked(app_menu::IDM_COMPARE_WIPE));
+    // 2x2 ends the group.
+    CHECK(app_menu::UpdateComparisonMenu(menu, true, true, app_menu::IDM_COMPARE_QUAD, false, false, false, false));
+    CHECK(checked(app_menu::IDM_COMPARE_QUAD));CHECK(!checked(app_menu::IDM_COMPARE_DIFFERENCE));
+    // RTX VSR sits in the group under Original with an id outside its range, and needs
+    // RTX VSR as well as a comparison: without it the row and the toggle are grey,
+    // and a selected RTX VSR reads as DLSS 5.
+    CHECK(grayed(app_menu::IDM_COMPARE_VSR));CHECK(grayed(app_menu::IDM_COMPARE_AGAINST_VSR));
+    CHECK(app_menu::UpdateComparisonMenu(menu, true, true, app_menu::IDM_COMPARE_VSR, false, false, false, false, false, true));
+    CHECK(checked(app_menu::IDM_COMPARE_NEURAL));CHECK(!checked(app_menu::IDM_COMPARE_VSR));CHECK(!checked(app_menu::IDM_COMPARE_AGAINST_VSR));
+    CHECK(app_menu::UpdateComparisonMenu(menu, true, true, app_menu::IDM_COMPARE_VSR, false, false, false, false, true, true));
+    CHECK(!grayed(app_menu::IDM_COMPARE_VSR));CHECK(checked(app_menu::IDM_COMPARE_VSR));CHECK(!checked(app_menu::IDM_COMPARE_QUAD));
+    CHECK(!grayed(app_menu::IDM_COMPARE_AGAINST_VSR));CHECK(checked(app_menu::IDM_COMPARE_AGAINST_VSR));
+    CHECK(app_menu::UpdateComparisonMenu(menu, false, true, app_menu::IDM_COMPARE_VSR, false, false, false, false, true, false));
+    CHECK(grayed(app_menu::IDM_COMPARE_VSR));CHECK(grayed(app_menu::IDM_COMPARE_AGAINST_VSR));
+    CHECK(app_menu::UpdateVsrQualityMenu(menu, true, 3));
+    CHECK(checked(app_menu::IDM_COMPARE_VSR_QUALITY_FIRST + 3));CHECK(!checked(app_menu::IDM_COMPARE_VSR_QUALITY_FIRST + 2));
+    CHECK(app_menu::UpdateVsrQualityMenu(menu, false, 2));
+    CHECK(grayed(app_menu::IDM_COMPARE_VSR_QUALITY_FIRST));CHECK(checked(app_menu::IDM_COMPARE_VSR_QUALITY_FIRST + 2));
+    CHECK(app_menu::UpdateSecondMixMenu(menu, true, 3));
+    CHECK(checked(app_menu::IDM_COMPARE_SECOND_MIX_FIRST + 3));CHECK(!checked(app_menu::IDM_COMPARE_SECOND_MIX_FIRST + 1));
+    CHECK(app_menu::UpdateSecondMixMenu(menu, false, 1));
+    CHECK(grayed(app_menu::IDM_COMPARE_SECOND_MIX_FIRST));
+    CHECK_EQ(size_t(app_menu::IDM_COMPARE_SECOND_MIX_COUNT), compare_settings::kSecondMixes.size());
+    CHECK(!checked(app_menu::IDM_COMPARE_DIFFERENCE_LUMA));
+    // The mask rows: Load needs a source, the rest a mask; the feather is a radio block.
+    CHECK(app_menu::UpdateMaskMenu(menu, false, false, false, 0));
+    CHECK(grayed(app_menu::IDM_COMPARE_MASK_LOAD) && grayed(app_menu::IDM_COMPARE_MASK_CLEAR));
+    CHECK(grayed(app_menu::IDM_COMPARE_MASK_FEATHER_FIRST + 2));
+    CHECK(app_menu::UpdateMaskMenu(menu, true, true, true, 2));
+    CHECK(!grayed(app_menu::IDM_COMPARE_MASK_LOAD) && !grayed(app_menu::IDM_COMPARE_MASK_INVERT));
+    CHECK(checked(app_menu::IDM_COMPARE_MASK_INVERT));
+    CHECK(checked(app_menu::IDM_COMPARE_MASK_FEATHER_FIRST + 2));
+    CHECK(!checked(app_menu::IDM_COMPARE_MASK_FEATHER_FIRST));
+    CHECK_EQ(size_t(app_menu::IDM_COMPARE_MASK_FEATHER_COUNT), compare_mask::kFeathers.size());
+
+    using app_menu::CommandForPlayerKey;
+    CHECK(CommandForPlayerKey('I', false, false) == app_menu::IDM_MARK_IN);
+    CHECK(CommandForPlayerKey('O', false, false) == app_menu::IDM_MARK_OUT);
+    CHECK(CommandForPlayerKey('I', false, true) == app_menu::IDM_CLEAR_MARKS);
+    CHECK(CommandForPlayerKey('O', false, true) == app_menu::IDM_CLEAR_MARKS);
+    CHECK(CommandForPlayerKey('G', true, false) == app_menu::IDM_GOTO_TIMECODE);
+    CHECK(CommandForPlayerKey('F', false, false) == app_menu::IDM_PREVIEW_FRAME);
+    CHECK(CommandForPlayerKey('F', false, true) == app_menu::IDM_PREVIEW_CLIP);
+    CHECK(CommandForPlayerKey('R', true, false) == app_menu::IDM_RENDER_RANGE);
+    CHECK(CommandForPlayerKey('N', true, false) == app_menu::IDM_NEURAL_SETTINGS);
+    CHECK(CommandForPlayerKey('Z', false, false) == app_menu::IDM_COMPARE_ZOOM);
+    CHECK(CommandForPlayerKey(VK_OEM_4, false, false) == app_menu::IDM_COMPARE_BLEND_LESS);
+    CHECK(CommandForPlayerKey(VK_OEM_6, false, false) == app_menu::IDM_COMPARE_BLEND_MORE);
+    CHECK(CommandForPlayerKey('X', false, false) == app_menu::IDM_COMPARE_SWAP);
+    CHECK(CommandForPlayerKey('Z', false, true) == app_menu::IDM_COMPARE_ZOOM_OUT);
+    CHECK(CommandForPlayerKey('L', false, false) == app_menu::IDM_COMPARE_LOUPE);
+    CHECK(CommandForPlayerKey(VK_OEM_4, false, true) == app_menu::IDM_COMPARE_DIFFERENCE_LESS);
+    CHECK(CommandForPlayerKey(VK_OEM_6, false, true) == app_menu::IDM_COMPARE_DIFFERENCE_MORE);
+    CHECK(CommandForPlayerKey('C', false, false) == app_menu::IDM_COMPARE_NEXT_MODE);
+    CHECK(CommandForPlayerKey('C', false, true) == app_menu::IDM_COMPARE_PREVIOUS_MODE);
+    // R shows RTX VSR and Shift+R compares against it; Ctrl+R still converts the range.
+    CHECK(CommandForPlayerKey('R', false, false) == app_menu::IDM_COMPARE_VSR);
+    CHECK(CommandForPlayerKey('R', false, true) == app_menu::IDM_COMPARE_AGAINST_VSR);
+    CHECK(CommandForPlayerKey('R', true, false) == app_menu::IDM_RENDER_RANGE);
+    CHECK(!CommandForPlayerKey('R', true, true).has_value());
+    // Subtitles: V steps through them, H and J move them earlier and later.
+    CHECK(CommandForPlayerKey('V', false, false) == app_menu::IDM_SUBTITLE_NEXT);
+    CHECK(CommandForPlayerKey('H', false, false) == app_menu::IDM_SUBTITLE_EARLIER);
+    CHECK(CommandForPlayerKey('J', false, false) == app_menu::IDM_SUBTITLE_LATER);
+    CHECK(!CommandForPlayerKey('V', false, true).has_value());
+    CHECK(!CommandForPlayerKey('V', true, false).has_value());
+    // Ctrl+Alt+C is the overlay hotkey for the adjustments; Ctrl+C stays unclaimed.
+    CHECK(!CommandForPlayerKey('C', true, false).has_value());
+    // Existing single-letter and Ctrl accelerators keep their owners. (Bare R was
+    // listed here while only Ctrl+R had one; it is RTX VSR's now, checked above.)
+    for (const UINT key : {UINT('D'), UINT('S'), UINT('A'), UINT('M'), UINT('G'), UINT('N'), UINT(VK_SPACE), UINT(VK_F6)})
+        CHECK(!CommandForPlayerKey(key, false, false).has_value());
+    for (const UINT key : {'O', 'E', 'L', 'I', 'F', 'Z'})
+        CHECK(!CommandForPlayerKey(key, true, false).has_value());
+    CHECK(!CommandForPlayerKey('G', true, true).has_value());
+    CHECK(!CommandForPlayerKey('S', false, true).has_value());
+    if (menu) DestroyMenu(menu);
+}
+
+void player_menu_is_english_only_and_retains_advanced_commands_test()
+{
+    Localizer localizer;
+    const HMENU menu = app_menu::CreateMenuBar(localizer, YouTubePlaybackAvailable());
+    CHECK(menu != nullptr);
+
+    std::vector<MenuEntry> entries;
+    if (menu) collect_menu_entries(menu, entries);
+    CHECK(!has_menu_text(entries, L"Language"));
+    CHECK(has_menu_text(entries, L"Advanced"));
+    CHECK(has_menu_entry(entries, L"Open file\tCtrl+O", app_menu::IDM_OPEN));
+    CHECK(has_menu_entry(entries, L"Open YouTube URL\u2026\tCtrl+L", app_menu::IDM_OPEN_YOUTUBE));
+    CHECK(has_menu_entry(entries, L"Stop\tS", app_menu::IDM_STOP));
+    CHECK(has_menu_entry(entries, L"Original aspect ratio (Fit)\tA", app_menu::IDM_ASPECT_FIT));
+    CHECK(has_menu_entry(entries, L"Restart in DLSS SR safe mode", app_menu::IDM_ADVANCED_SAFE_MODE));
+    CHECK(has_menu_entry(entries, L"Recreate NGX / re-hook DLSS 5\tF6", app_menu::IDM_REHOOK));
+    HMENU advanced = find_top_level_submenu(menu, L"Advanced");
+    CHECK(advanced != nullptr);
+    if (advanced) {
+        std::vector<MenuEntry> advancedEntries;
+        collect_menu_entries(advanced, advancedEntries);
+        CHECK(has_menu_entry(advancedEntries, L"Recreate NGX / re-hook DLSS 5\tF6", app_menu::IDM_REHOOK));
+    }
+    for (const auto& entry : entries) {
+        if (entry.command == app_menu::IDM_OPEN_YOUTUBE) {
+            CHECK((entry.state & (MFS_DISABLED | MFS_GRAYED)) == 0);
+        }
+    }
+    for (const auto& entry : entries) {
+        CHECK(entry.command < 500 || entry.command >= 600);
+    }
+
+    if (menu) DestroyMenu(menu);
+}
+
+void youtube_source_quality_menu_is_distinct_radio_group_and_updates_test()
+{
+    Localizer localizer;
+    const HMENU menu = app_menu::CreateMenuBar(localizer, true);
+    CHECK(menu != nullptr);
+    HMENU video = find_top_level_submenu(menu, L"Video");
+    HMENU quality = find_top_level_submenu(video, L"YouTube source quality");
+    CHECK(video != nullptr);
+    CHECK(quality != nullptr);
+
+    // The labels come from the localizer on purpose: this test defends the
+    // entry-to-command mapping and the radio group, not the wording, which
+    // changed when Auto stopped meaning "1080p preferred".
+    const std::array expected{
+        std::pair{localizer.Get(L"menu.youtube_quality_auto"), app_menu::IDM_YOUTUBE_QUALITY_AUTO},
+        std::pair{localizer.Get(L"menu.youtube_quality_2160"), app_menu::IDM_YOUTUBE_QUALITY_2160},
+        std::pair{localizer.Get(L"menu.youtube_quality_1440"), app_menu::IDM_YOUTUBE_QUALITY_1440},
+        std::pair{localizer.Get(L"menu.youtube_quality_1080"), app_menu::IDM_YOUTUBE_QUALITY_1080},
+    };
+    std::vector<MenuEntry> entries;
+    if (quality) collect_menu_entries(quality, entries);
+    CHECK_EQ(expected.size(), entries.size());
+    for (const auto& [label, command] : expected) {
+        CHECK(has_menu_entry(entries, label, command));
+        const auto selected = app_menu::YouTubeQualityForCommand(command);
+        CHECK(selected.has_value());
+        if (selected) CHECK_EQ(command, app_menu::CommandForYouTubeQuality(*selected));
+    }
+    for (const auto& entry : entries) {
+        CHECK_EQ(entry.command == app_menu::IDM_YOUTUBE_QUALITY_AUTO,
+                  (entry.state & MFS_CHECKED) != 0);
+    }
+
+    CHECK(app_menu::UpdateYouTubeQualitySelection(menu, YouTubeSourceQuality::P1080));
+    entries.clear();
+    if (quality) collect_menu_entries(quality, entries);
+    for (const auto& entry : entries) {
+        CHECK_EQ(entry.command == app_menu::IDM_YOUTUBE_QUALITY_1080,
+                 (entry.state & MFS_CHECKED) != 0);
+    }
+    CHECK(!app_menu::YouTubeQualityForCommand(330u /* removed legacy quality command */).has_value());
+    CHECK(!app_menu::YouTubeQualityForCommand(414).has_value());
+    CHECK(!app_menu::YouTubeQualityForCommand(415).has_value());
+    if (menu) DestroyMenu(menu);
+}
+
+void youtube_availability_drives_real_menu_and_idle_action_consistently_test()
+{
+    Localizer localizer;
+    for (const bool available : {false, true}) {
+        const HMENU menu = app_menu::CreateMenuBar(localizer, available);
+        CHECK(menu != nullptr);
+        std::vector<MenuEntry> entries;
+        if (menu) collect_menu_entries(menu, entries);
+        bool found = false;
+        for (const auto& entry : entries) {
+            if (entry.command != app_menu::IDM_OPEN_YOUTUBE) continue;
+            found = true;
+            const bool disabled = (entry.state & (MFS_DISABLED | MFS_GRAYED)) != 0;
+            CHECK_EQ(!available, disabled);
+        }
+        CHECK(found);
+        ToolbarAvailability state{};
+        state.youtubeAvailable = available;
+        CHECK_EQ(available, IsToolbarActionEnabled(ToolbarAction::OpenYouTube, state));
+        if (menu) DestroyMenu(menu);
+    }
+}
+
+void youtube_resolution_generation_accepts_only_the_current_completion_test()
+{
+    YouTubeResolutionLifecycle lifecycle;
+    const uint64_t first = lifecycle.Begin();
+    CHECK(lifecycle.IsResolving());
+    const uint64_t second = lifecycle.Begin();
+    CHECK(second > first);
+    CHECK(!lifecycle.Complete(first));
+    CHECK(lifecycle.IsResolving());
+    CHECK(lifecycle.Complete(second));
+    CHECK(!lifecycle.IsResolving());
+    CHECK(!lifecycle.Complete(second));
+
+    const uint64_t cancelled = lifecycle.Begin();
+    lifecycle.Invalidate();
+    CHECK(!lifecycle.IsResolving());
+    CHECK(!lifecycle.Complete(cancelled));
+}
+
+void youtube_resolution_disables_only_conflicting_source_actions_test()
+{
+    ToolbarAvailability state{};
+    state.mediaLoaded = true;
+    state.rendererReady = true;
+    state.youtubeAvailable = true;
+    CHECK(IsToolbarActionEnabled(ToolbarAction::Open, state));
+    CHECK(IsToolbarActionEnabled(ToolbarAction::OpenYouTube, state));
+    CHECK(IsToolbarActionEnabled(ToolbarAction::PlayPause, state));
+
+    state.resolvingYouTube = true;
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::Open, state));
+    CHECK(!IsToolbarActionEnabled(ToolbarAction::OpenYouTube, state));
+    CHECK(IsToolbarActionEnabled(ToolbarAction::PlayPause, state));
+}
+
+void youtube_resolution_error_mapping_is_actionable_and_distinct_test()
+{
+    CHECK_EQ(std::wstring_view(L"youtube.error.invalid"),
+             YouTubeResolveErrorMessageKey(ResolveError::InvalidUrl));
+    CHECK_EQ(std::wstring_view(L"youtube.error.helper_missing"),
+             YouTubeResolveErrorMessageKey(ResolveError::HelperMissing));
+    CHECK_EQ(std::wstring_view(L"youtube.error.start_failed"),
+             YouTubeResolveErrorMessageKey(ResolveError::StartFailed));
+    CHECK_EQ(std::wstring_view(L"youtube.error.timeout"),
+             YouTubeResolveErrorMessageKey(ResolveError::TimedOut));
+    CHECK_EQ(std::wstring_view(L"youtube.error.cancelled"),
+             YouTubeResolveErrorMessageKey(ResolveError::Cancelled));
+    CHECK_EQ(std::wstring_view(L"youtube.error.extraction"),
+             YouTubeResolveErrorMessageKey(ResolveError::ExtractionFailed));
+    CHECK_EQ(std::wstring_view(L"youtube.error.extraction"),
+             YouTubeResolveErrorMessageKey(ResolveError::OutputTooLarge));
+    CHECK_EQ(std::wstring_view(L"youtube.error.extraction"),
+             YouTubeResolveErrorMessageKey(ResolveError::InvalidOutput));
+    // Every key the mapping and the media path can hand the UI resolves to
+    // its own sentence: a missing entry would show the raw key, and two
+    // failures sharing a sentence would be indistinguishable to the user.
+    Localizer localizer;
+    std::vector<std::wstring> messages;
+    for (const wchar_t* key : {L"youtube.error.invalid", L"youtube.error.helper_missing",
+                               L"youtube.error.start_failed", L"youtube.error.timeout",
+                               L"youtube.error.cancelled", L"youtube.error.extraction",
+                               L"youtube.error.ffmpeg", L"youtube.error.media_timeout",
+                               L"youtube.error.media_stalled"}) {
+        const std::wstring message = localizer.Get(key);
+        CHECK(message != key);
+        CHECK(std::find(messages.begin(), messages.end(), message) == messages.end());
+        messages.push_back(message);
+    }
+}
+
+void youtube_source_forces_ffmpeg_and_never_allows_media_foundation_fallback_test()
+{
+    CHECK_EQ(DecoderOpenPolicy::FfmpegThenMediaFoundation,
+             DecoderPolicyForSource(MediaSourceKind::LocalFile));
+    CHECK_EQ(DecoderOpenPolicy::FfmpegOnly,
+             DecoderPolicyForSource(MediaSourceKind::YouTube));
+}
+
+void youtube_resolution_cancellation_runs_stop_cancel_join_in_order_test()
+{
+    std::vector<int> order;
+    ExecuteYouTubeCancellationSequence(
+        [&] { order.push_back(1); },
+        [&] { order.push_back(2); },
+        [&] { order.push_back(3); });
+    CHECK_EQ(std::vector<int>({1, 2, 3}), order);
+}
+
+void youtube_display_and_log_labels_never_expose_direct_urls_test()
+{
+    const std::wstring direct =
+        L"https://r1---sn.example.googlevideo.com/videoplayback?expire=1&token=secret";
+    CHECK_EQ(std::wstring(L"YouTube video"),
+             DisplayTitleForSource(MediaSourceKind::YouTube, L""));
+    CHECK_EQ(std::wstring(L"Official game trailer"),
+             DisplayTitleForSource(MediaSourceKind::YouTube, L"Official game trailer"));
+    CHECK_EQ(std::string_view("YouTube stream"),
+             SafeSourceLogLabel(MediaSourceKind::YouTube));
+    const std::wstring title = DisplayTitleForSource(MediaSourceKind::YouTube, direct);
+    CHECK(title.find(L"https://") == std::wstring::npos);
+    CHECK(title.find(L"secret") == std::wstring::npos);
+}
+
+void youtube_real_menu_and_ctrl_l_route_share_the_enabled_action_test()
+{
+    Localizer localizer;
+    const HMENU menu = app_menu::CreateMenuBar(localizer, true);
+    CHECK(menu != nullptr);
+    std::vector<MenuEntry> entries;
+    if (menu) collect_menu_entries(menu, entries);
+    bool enabled = false;
+    for (const auto& entry : entries) {
+        if (entry.command != app_menu::IDM_OPEN_YOUTUBE) continue;
+        enabled = (entry.state & (MFS_DISABLED | MFS_GRAYED)) == 0;
+    }
+    CHECK(enabled);
+    CHECK(app_menu::RoutesToOpenYouTube(app_menu::PlayerCommandRoute::NativeMenu,
+                                        app_menu::IDM_OPEN_YOUTUBE, false));
+    CHECK(app_menu::RoutesToOpenYouTube(app_menu::PlayerCommandRoute::KeyDown,
+                                        'L', true));
+    CHECK(!app_menu::RoutesToOpenYouTube(app_menu::PlayerCommandRoute::KeyDown,
+                                         'L', false));
+    CHECK(!app_menu::RoutesToOpenYouTube(app_menu::PlayerCommandRoute::KeyDown,
+                                         'O', true));
+    CHECK(app_menu::UpdateSourceActionAvailability(menu, false, false));
+    entries.clear();
+    collect_menu_entries(menu, entries);
+    for (const auto& entry : entries) {
+        if (entry.command == app_menu::IDM_OPEN ||
+            entry.command == app_menu::IDM_OPEN_YOUTUBE) {
+            CHECK((entry.state & (MFS_DISABLED | MFS_GRAYED)) != 0);
+        }
+    }
+    CHECK(app_menu::UpdateSourceActionAvailability(menu, true, true));
+    entries.clear();
+    collect_menu_entries(menu, entries);
+    for (const auto& entry : entries) {
+        if (entry.command == app_menu::IDM_OPEN ||
+            entry.command == app_menu::IDM_OPEN_YOUTUBE) {
+            CHECK((entry.state & (MFS_DISABLED | MFS_GRAYED)) == 0);
+        }
+    }
+    if (menu) DestroyMenu(menu);
+}
+
+void fixed_youtube_examples_are_complete_safe_and_menu_routable_test()
+{
+    CHECK_EQ(size_t{7}, kExampleVideos.size());
+
+    std::vector<std::wstring_view> urls;
+    for (const ExampleVideo& example : kExampleVideos) {
+        CHECK(!example.title.empty());
+        CHECK(!example.channel.empty());
+        CHECK(example.url.starts_with(L"https://www.youtube.com/watch?v="));
+        CHECK(IsSupportedYouTubeUrl(example.url));
+        CHECK(std::find(urls.begin(), urls.end(), example.url) == urls.end());
+        urls.push_back(example.url);
+    }
+
+    Localizer localizer;
+    const HMENU menu = app_menu::CreateMenuBar(localizer, true);
+    CHECK(menu != nullptr);
+    HMENU file = find_top_level_submenu(menu, L"File");
+    HMENU examples = find_top_level_submenu(file, L"Game trailers");
+    HMENU animeMenu = find_top_level_submenu(examples, L"Anime");
+    CHECK(file != nullptr);
+    CHECK(examples != nullptr);
+    CHECK(animeMenu == nullptr);
+    std::vector<MenuEntry> entries;
+    if (menu) collect_menu_entries(menu, entries);
+    for (size_t index = 0; index < kExampleVideos.size(); ++index) {
+        const UINT command = app_menu::IDM_EXAMPLE_VIDEO_FIRST + static_cast<UINT>(index);
+        CHECK(app_menu::ExampleVideoForCommand(command) == &kExampleVideos[index]);
+        CHECK(has_menu_entry(entries, kExampleVideos[index].title,
+                             command));
+    }
+    CHECK(app_menu::ExampleVideoForCommand(app_menu::IDM_OPEN_YOUTUBE) == nullptr);
+    if (menu) DestroyMenu(menu);
+}
+
+struct RegistryCompletion {
+    uint64_t generation{};
+    int value{};
+};
+
+void youtube_completion_registry_is_scalar_once_only_and_spoof_safe_test()
+{
+    CompletionRegistry<RegistryCompletion> registry;
+    const uint64_t first = registry.Register(std::make_unique<RegistryCompletion>(RegistryCompletion{7, 41}));
+    const uint64_t second = registry.Register(std::make_unique<RegistryCompletion>(RegistryCompletion{8, 42}));
+    CHECK(first != 0);
+    CHECK(second > first);
+    CHECK(!registry.Take(first + second + 1000));
+    auto owned = registry.Take(first);
+    CHECK(owned != nullptr);
+    if (owned) {
+        CHECK_EQ(uint64_t{7}, owned->generation);
+        CHECK_EQ(41, owned->value);
+    }
+    CHECK(!registry.Take(first));
+    CHECK_EQ(size_t{1}, registry.Size());
+    registry.Clear();
+    CHECK_EQ(size_t{0}, registry.Size());
+    CHECK(!registry.Take(second));
+}
+
+void youtube_completion_registry_post_failure_and_concurrency_are_owned_test()
+{
+    CompletionRegistry<RegistryCompletion> registry;
+    const uint64_t failed = registry.RegisterAndPost(
+        std::make_unique<RegistryCompletion>(RegistryCompletion{1, 9}),
+        [](uint64_t) { return false; });
+    CHECK_EQ(uint64_t{0}, failed);
+    CHECK_EQ(size_t{0}, registry.Size());
+
+    constexpr int count = 200;
+    std::atomic<int> taken{0};
+    std::vector<uint64_t> tokens;
+    tokens.reserve(count);
+    std::mutex tokensMutex;
+    std::jthread producer([&] {
+        for (int index = 0; index < count; ++index) {
+            const uint64_t token = registry.Register(
+                std::make_unique<RegistryCompletion>(RegistryCompletion{2, index}));
+            std::scoped_lock lock(tokensMutex);
+            tokens.push_back(token);
+        }
+    });
+    producer.join();
+    std::jthread firstTaker([&] {
+        for (const uint64_t token : tokens) if (registry.Take(token)) ++taken;
+    });
+    std::jthread secondTaker([&] {
+        for (const uint64_t token : tokens) if (registry.Take(token)) ++taken;
+    });
+    firstTaker.join();
+    secondTaker.join();
+    CHECK_EQ(count, taken.load());
+    CHECK_EQ(size_t{0}, registry.Size());
+
+    const uint64_t stale = registry.Register(
+        std::make_unique<RegistryCompletion>(RegistryCompletion{3, 17}));
+    registry.Clear(); // models destroy/new-source invalidation after worker join.
+    CHECK(!registry.Take(stale));
+
+    std::atomic<bool> registering{true};
+    std::jthread concurrentProducer([&]{for(int index=0;index<500;++index)registry.Register(std::make_unique<RegistryCompletion>(RegistryCompletion{4,index}));registering=false;});
+    std::jthread concurrentClearer([&]{while(registering.load()){registry.Clear();Sleep(0);}registry.Clear();});
+    std::jthread concurrentTaker([&]{uint64_t token=1;while(registering.load()){registry.Take(token++);Sleep(0);}});
+    concurrentProducer.join();concurrentClearer.join();concurrentTaker.join();registry.Clear();CHECK_EQ(size_t{0},registry.Size());
+}
+
+NetworkRenderConfiguration render_configuration(int quality,uint32_t decodeWidth=1280,uint32_t decodeHeight=720,uint32_t inputWidth=1280,uint32_t inputHeight=720)
+{
+    NetworkRenderConfiguration config{};config.sourceWidth=1920;config.sourceHeight=1080;config.decodeWidth=decodeWidth;config.decodeHeight=decodeHeight;config.inputWidth=inputWidth;config.inputHeight=inputHeight;config.outputWidth=1920;config.outputHeight=1080;config.guideWidth=320;config.guideHeight=180;config.quality=quality;return config;
+}
+
+void youtube_renderer_transaction_validates_every_open_seek_and_quality_candidate_geometry_test()
+{
+    const auto active=render_configuration(1);
+    CHECK(NetworkPreparedGeometryIsValid(active,1280,720,
+          static_cast<size_t>(1280)*720*4));
+    auto geometry=active;geometry.decodeWidth=960;geometry.inputWidth=960;
+    CHECK(NetworkPreparedGeometryIsValid(geometry,960,720,
+          static_cast<size_t>(960)*720*4));
+    // MaxPerf, Balanced, MaxQuality, UltraPerformance, and DLAA are every
+    // explicit quality route exposed by the native menu.
+    uint32_t decodeWidth=832;
+    for(const int quality:{0,1,2,3,5}){
+        const auto prepared=render_configuration(quality,decodeWidth,468,decodeWidth,468);
+        CHECK(prepared.decodeWidth==decodeWidth&&prepared.decodeHeight==468);
+        CHECK(prepared.inputWidth==decodeWidth&&prepared.inputHeight==468);
+        CHECK(prepared.outputWidth==1920&&prepared.outputHeight==1080);
+        CHECK(NetworkPreparedGeometryIsValid(prepared,decodeWidth,468,
+              static_cast<size_t>(decodeWidth)*468*4));
+        CHECK(!NetworkPreparedGeometryIsValid(prepared,decodeWidth+2,468,
+               static_cast<size_t>(decodeWidth)*468*4));
+        CHECK(!NetworkPreparedGeometryIsValid(prepared,decodeWidth,468,
+               static_cast<size_t>(decodeWidth)*468*4-1));
+        decodeWidth+=64;
+    }
+}
+
+// The byte count a prepared network frame is checked against is layout
+// dependent, and for most of this project's life it could only ever be BGRA -
+// so the check hardcoded four bytes per pixel. The moment a playback open
+// achieved NV12 it delivered w*h*3/2 bytes, the check compared those against
+// w*h*4, and a perfectly good frame was refused: the prepared renderer
+// transaction rolled back and the open reported that no video frame could be
+// decoded. Both layouts are pinned here, in both directions, so neither can be
+// made to stand in for the other again.
+void network_prepared_geometry_accepts_both_source_layouts_test()
+{
+    const auto config=render_configuration(1);
+    const size_t bgraBytes=static_cast<size_t>(1280)*720*4;
+    const size_t nv12Bytes=static_cast<size_t>(1280)*720*3/2;
+
+    // Each layout accepts exactly its own size.
+    CHECK(NetworkPreparedGeometryIsValid(config,1280,720,bgraBytes,PixelLayout::Bgra));
+    CHECK(NetworkPreparedGeometryIsValid(config,1280,720,nv12Bytes,PixelLayout::Nv12));
+
+    // ...and refuses the other's, which is the defect this covers. Without the
+    // layout argument the second of these was the shipped behaviour.
+    CHECK(!NetworkPreparedGeometryIsValid(config,1280,720,nv12Bytes,PixelLayout::Bgra));
+    CHECK(!NetworkPreparedGeometryIsValid(config,1280,720,bgraBytes,PixelLayout::Nv12));
+
+    // The default stays BGRA, so every caller that predates the argument keeps
+    // the meaning it was written with.
+    CHECK(NetworkPreparedGeometryIsValid(config,1280,720,bgraBytes));
+    CHECK(!NetworkPreparedGeometryIsValid(config,1280,720,nv12Bytes));
+
+    // Geometry still outranks layout: the right byte count for the wrong frame
+    // size is still wrong.
+    CHECK(!NetworkPreparedGeometryIsValid(config,1282,720,nv12Bytes,PixelLayout::Nv12));
+    CHECK(!NetworkPreparedGeometryIsValid(config,1280,720,nv12Bytes-1,PixelLayout::Nv12));
+
+    // Odd geometry has no half-resolution chroma plane, so PixelLayoutFrameBytes
+    // hands back the BGRA size for it and an NV12-sized buffer is refused.
+    auto odd=config;odd.decodeWidth=1281;odd.inputWidth=1281;
+    CHECK(NetworkPreparedGeometryIsValid(odd,1281,720,static_cast<size_t>(1281)*720*4,PixelLayout::Nv12));
+}
+
+void youtube_renderer_transaction_validates_before_atomic_handoff_and_rolls_back_test()
+{
+    struct Candidate{int id;};
+    std::vector<int> order;int activeRenderer=10,activeMedia=20,activeAudio=30;
+    const bool failed=ExecuteNetworkCandidateTransaction<Candidate>(
+        [&]{order.push_back(1);return std::make_unique<Candidate>(Candidate{11});},
+        [&](Candidate&){order.push_back(2);return false;},
+        [&](std::unique_ptr<Candidate>){order.push_back(3);activeRenderer=11;activeMedia=21;activeAudio=31;});
+    CHECK(!failed);CHECK_EQ(std::vector<int>({1,2}),order);CHECK_EQ(10,activeRenderer);CHECK_EQ(20,activeMedia);CHECK_EQ(30,activeAudio);
+    order.clear();
+    const bool committed=ExecuteNetworkCandidateTransaction<Candidate>(
+        [&]{order.push_back(1);return std::make_unique<Candidate>(Candidate{12});},
+        [&](Candidate&){order.push_back(2);return true;},
+        [&](std::unique_ptr<Candidate> candidate){order.push_back(3);activeAudio=0;order.push_back(4);activeMedia=22;activeRenderer=candidate->id;order.push_back(5);activeAudio=32;});
+    CHECK(committed);CHECK_EQ(std::vector<int>({1,2,3,4,5}),order);CHECK_EQ(12,activeRenderer);CHECK_EQ(22,activeMedia);CHECK_EQ(32,activeAudio);
+}
+
+void youtube_candidate_seek_render_failure_preserves_all_active_state_before_commit_test()
+{
+    struct PlaybackState {
+        int decoder{};
+        int audio{};
+        int renderer{};
+        int renderWindow{};
+        int quality{};
+        bool qualityExplicit{};
+        bool playing{};
+        double position{};
+        int64_t lastRenderedTimestamp{};
+        int guideHistory{};
+        int dlssHistory{};
+        bool operator==(const PlaybackState&) const = default;
+    };
+    struct Candidate {
+        bool renderFirst{};
+        int decoder{};
+        int audio{};
+        int renderer{};
+        int renderWindow{};
+        int quality{};
+    };
+
+    PlaybackState active{10,20,30,40,2,true,true,17.5,175000000,51,61};
+    const PlaybackState before=active;
+    std::vector<int> order;
+    bool commitCalled=false;
+    const bool renderFirst=false;
+    const bool rejected=ExecuteNetworkCandidateTransaction<Candidate>(
+        [&]{order.push_back(1);return std::make_unique<Candidate>(
+            Candidate{renderFirst,11,21,31,41,3});},
+        [&](Candidate& candidate){order.push_back(2);return candidate.renderFirst;},
+        [&](std::unique_ptr<Candidate> candidate){
+            order.push_back(3);commitCalled=true;
+            active={candidate->decoder,candidate->audio,candidate->renderer,
+                    candidate->renderWindow,candidate->quality,false,false,
+                    42.0,420000000,0,0};
+        });
+    CHECK(!rejected);
+    CHECK_EQ(std::vector<int>({1,2}),order);
+    CHECK(!commitCalled);
+    CHECK_EQ(before,active);
+
+    order.clear();
+    int oldStopCount=0,oldRendererDestroyCount=0;
+    const bool committed=ExecuteNetworkCandidateTransaction<Candidate>(
+        [&]{order.push_back(1);return std::make_unique<Candidate>(
+            Candidate{true,12,22,32,42,4});},
+        [&](Candidate& candidate){order.push_back(2);return candidate.renderFirst;},
+        [&](std::unique_ptr<Candidate> candidate){
+            CommitPreparedAudioHandoff(
+                [&]{order.push_back(3);active={candidate->decoder,candidate->audio,
+                    candidate->renderer,candidate->renderWindow,candidate->quality,
+                    false,false,24.0,240000000,0,0};},
+                [&]{order.push_back(4);return true;},
+                [&]{order.push_back(5);++oldStopCount;++oldRendererDestroyCount;},
+                [&]{order.push_back(6);active.playing=true;});
+        });
+    CHECK(committed);
+    CHECK_EQ(std::vector<int>({1,2,4,3,5,6}),order);
+    CHECK_EQ(1,oldStopCount);
+    CHECK_EQ(1,oldRendererDestroyCount);
+    CHECK_EQ(12,active.decoder);CHECK_EQ(22,active.audio);
+    CHECK_EQ(32,active.renderer);CHECK_EQ(42,active.renderWindow);
+    CHECK_EQ(4,active.quality);CHECK(!active.qualityExplicit);CHECK(active.playing);
+    CHECK_EQ(24.0,active.position);CHECK_EQ(int64_t{240000000},active.lastRenderedTimestamp);
+    CHECK_EQ(0,active.guideHistory);CHECK_EQ(0,active.dlssHistory);
+}
+
+void youtube_network_read_decisions_are_identical_and_once_only_at_both_positions_test()
+{
+    for(const NetworkReadPosition position:{NetworkReadPosition::BeforeRender,NetworkReadPosition::AfterRender}){
+        NetworkReadState state;
+        auto wait=state.Resolve(VideoReadResult::NotReady,position);CHECK_EQ(NetworkReadAction::Wait,wait.action);CHECK(!wait.notify);
+        auto ready=state.Resolve(VideoReadResult::FrameReady,position);CHECK_EQ(NetworkReadAction::UseFrame,ready.action);CHECK(!ready.notify);
+        auto stalled=state.Resolve(VideoReadResult::Stalled,position);CHECK_EQ(NetworkReadAction::StopError,stalled.action);CHECK(stalled.notify);CHECK_EQ(std::wstring_view(L"youtube.error.media_stalled"),stalled.messageKey);
+        auto repeated=state.Resolve(VideoReadResult::Stalled,position);CHECK_EQ(NetworkReadAction::StopError,repeated.action);CHECK(!repeated.notify);
+        state.Reset();auto error=state.Resolve(VideoReadResult::Error,position);CHECK_EQ(NetworkReadAction::StopError,error.action);CHECK(error.notify);CHECK_EQ(std::wstring_view(L"youtube.error.ffmpeg"),error.messageKey);
+        state.Reset();auto ended=state.Resolve(VideoReadResult::EndOfStream,position);CHECK_EQ(NetworkReadAction::StopClean,ended.action);CHECK(!ended.notify);
+        state.Reset();auto cancelled=state.Resolve(VideoReadResult::Cancelled,position);CHECK_EQ(NetworkReadAction::StopCancelled,cancelled.action);CHECK(!cancelled.notify);
+    }
+}
+
+void youtube_async_transaction_coalesces_and_discards_stale_work_before_handoff_test()
+{
+    struct Prepared {
+        uint64_t generation{};
+        NetworkRenderConfiguration configuration;
+        bool preparationOk{true};
+        int decoder{};
+        int audio{};
+    };
+
+    YouTubeResolutionLifecycle lifecycle;
+    CompletionRegistry<Prepared> registry;
+    const auto activeConfiguration=render_configuration(2);
+    int activeDecoder=10,activeRenderer=20,activeAudio=30;
+
+    const uint64_t firstGeneration=lifecycle.Begin();
+    const uint64_t firstToken=registry.Register(std::make_unique<Prepared>(Prepared{
+        firstGeneration,activeConfiguration,true,11,31}));
+    const uint64_t secondGeneration=lifecycle.Begin();
+    const uint64_t secondToken=registry.Register(std::make_unique<Prepared>(Prepared{
+        secondGeneration,activeConfiguration,true,12,32}));
+    const uint64_t thirdGeneration=lifecycle.Begin();
+    const auto qualityConfiguration=render_configuration(3,960,540,960,540);
+    const uint64_t thirdToken=registry.Register(std::make_unique<Prepared>(Prepared{
+        thirdGeneration,qualityConfiguration,false,13,33}));
+
+    auto first=registry.Take(firstToken);CHECK(first!=nullptr);CHECK(!lifecycle.Complete(first->generation));
+    auto second=registry.Take(secondToken);CHECK(second!=nullptr);CHECK(!lifecycle.Complete(second->generation));
+    auto third=registry.Take(thirdToken);CHECK(third!=nullptr);CHECK(lifecycle.Complete(third->generation));
+    if(!third->preparationOk){
+        CHECK_EQ(10,activeDecoder);CHECK_EQ(20,activeRenderer);CHECK_EQ(30,activeAudio);
+    }
+
+    const uint64_t fourthGeneration=lifecycle.Begin();
+    const uint64_t fourthToken=registry.Register(std::make_unique<Prepared>(Prepared{
+        fourthGeneration,qualityConfiguration,true,14,34}));
+    auto fourth=registry.Take(fourthToken);CHECK(fourth!=nullptr);CHECK(lifecycle.Complete(fourth->generation));
+    std::vector<int> handoff;int retiringAudio=activeAudio;
+    const bool committed=ExecuteNetworkCandidateTransaction<int>(
+        [&]{return std::make_unique<int>(24);},
+        [&](int& renderer){return renderer==24&&NetworkPreparedGeometryIsValid(
+            fourth->configuration,960,540,static_cast<size_t>(960)*540*4);},
+        [&](std::unique_ptr<int> renderer){
+            CommitPreparedAudioHandoff(
+                [&]{handoff.push_back(1);activeDecoder=fourth->decoder;activeRenderer=*renderer;activeAudio=fourth->audio;},
+                [&]{handoff.push_back(2);return true;},
+                [&]{handoff.push_back(3);retiringAudio=0;},
+                [&]{handoff.push_back(4);});
+        });
+    CHECK(committed);CHECK_EQ(std::vector<int>({2,1,3,4}),handoff);
+    CHECK_EQ(0,retiringAudio);
+    CHECK_EQ(14,activeDecoder);CHECK_EQ(24,activeRenderer);CHECK_EQ(34,activeAudio);
+    CHECK(!registry.Take(fourthToken));
+
+    const uint64_t cancelledGeneration=lifecycle.Begin();
+    const uint64_t cancelledToken=registry.Register(std::make_unique<Prepared>(Prepared{
+        cancelledGeneration,activeConfiguration,true,15,35}));
+    lifecycle.Invalidate();registry.Clear();
+    CHECK(!registry.Take(cancelledToken));CHECK(!lifecycle.Complete(cancelledGeneration));
+}
+
+void youtube_stale_and_cancelled_prepared_seek_ownership_is_destroyed_once_test()
+{
+    struct Prepared {
+        Prepared(uint64_t generation,int* destroyed)
+            : generation(generation),destroyed(destroyed) {}
+        ~Prepared(){if(destroyed)++*destroyed;}
+        uint64_t generation{};
+        int* destroyed{};
+    };
+
+    YouTubeResolutionLifecycle lifecycle;
+    CompletionRegistry<Prepared> registry;
+    int destroyed=0;
+    const uint64_t staleGeneration=lifecycle.Begin();
+    const uint64_t staleToken=registry.Register(
+        std::make_unique<Prepared>(staleGeneration,&destroyed));
+    const uint64_t currentGeneration=lifecycle.Begin();
+    const uint64_t currentToken=registry.Register(
+        std::make_unique<Prepared>(currentGeneration,&destroyed));
+
+    auto stale=registry.Take(staleToken);
+    CHECK(stale!=nullptr);
+    CHECK(!lifecycle.Complete(stale->generation));
+    stale.reset();
+    CHECK_EQ(1,destroyed);
+
+    auto current=registry.Take(currentToken);
+    CHECK(current!=nullptr);
+    CHECK(lifecycle.Complete(current->generation));
+    current.reset();
+    CHECK_EQ(2,destroyed);
+
+    const uint64_t cancelledGeneration=lifecycle.Begin();
+    const uint64_t cancelledToken=registry.Register(
+        std::make_unique<Prepared>(cancelledGeneration,&destroyed));
+    lifecycle.Invalidate();
+    registry.Clear();
+    CHECK_EQ(3,destroyed);
+    CHECK(!registry.Take(cancelledToken));
+    CHECK(!lifecycle.Complete(cancelledGeneration));
+}
+
+std::filesystem::path executable_directory()
+{
+    wchar_t executablePath[32768]{};
+    const DWORD length = GetModuleFileNameW(nullptr, executablePath, static_cast<DWORD>(std::size(executablePath)));
+    return std::filesystem::path(executablePath, executablePath + length).parent_path();
+}
+
+struct RestoredFile {
+    explicit RestoredFile(std::filesystem::path file)
+        : path(std::move(file))
+    {
+        std::error_code error;
+        existed = std::filesystem::exists(path, error);
+        CHECK(!error);
+        if (existed) original = read_binary_file(path);
+    }
+
+    ~RestoredFile()
+    {
+        Restore();
+    }
+
+    void Restore()
+    {
+        if (restored) return;
+        std::error_code error;
+        if (existed) {
+            write_binary_file(path, original);
+            CHECK_EQ(original, read_binary_file(path));
+        } else {
+            std::filesystem::remove(path, error);
+            CHECK(!error);
+            CHECK(!std::filesystem::exists(path, error));
+            CHECK(!error);
+        }
+        restored = true;
+    }
+
+    std::filesystem::path path;
+    bool existed = false;
+    std::string original;
+    bool restored = false;
+};
+
+void legacy_language_configuration_is_ignored_and_english_lookup_remains_builtin_test()
+{
+    const std::filesystem::path runtimeDirectory = executable_directory();
+    const std::filesystem::path configuration = runtimeDirectory / "DLSSVideoPlayer.ini";
+    const std::filesystem::path languageDirectory = runtimeDirectory / "languages";
+    const std::filesystem::path portuguesePack = languageDirectory / "pt-BR.lang";
+    std::error_code error;
+    const bool languageDirectoryExisted = std::filesystem::exists(languageDirectory, error);
+    CHECK(!error);
+    CHECK(!languageDirectoryExisted);
+    std::filesystem::create_directories(languageDirectory, error);
+    CHECK(!error);
+    RestoredFile restoreConfiguration(configuration);
+    RestoredFile restorePortuguesePack(portuguesePack);
+    write_binary_file(configuration, "[General]\r\nLanguage=pt-BR\r\n");
+    write_binary_file(portuguesePack, "app.title=Leitor em Portugues\r\nmenu.file=Arquivo\r\n");
+
+    Localizer localizer;
+
+    CHECK_EQ(std::wstring(L"DLSS 5 Video Player"), localizer.Get(L"app.title"));
+    CHECK_EQ(std::wstring(L"File"), localizer.Get(L"menu.file"));
+
+    restorePortuguesePack.Restore();
+    restoreConfiguration.Restore();
+    if (!languageDirectoryExisted) {
+        std::filesystem::remove(languageDirectory, error);
+        CHECK(!error);
+        CHECK(!std::filesystem::exists(languageDirectory, error));
+        CHECK(!error);
+    }
+}
+
+// The harness is the only thing standing between one bad case and the rest of
+// the suite, so it gets tested like anything else. CHECK(true) said nothing.
+//
+// These probes are run through the real runner by the case below. They are
+// deliberately not in kCases: all but the last fail on purpose.
+int g_harness_statements_after_require = 0;
+
+void harness_probe_require_stops_the_case()
+{
+    // Read through the counter so the condition is not a constant the
+    // compiler folds - /W4 reports C4127 for a literally false REQUIRE.
+    REQUIRE(g_harness_statements_after_require < 0);
+    ++g_harness_statements_after_require;  // must never run
+}
+
+void harness_probe_access_violation()
+{
+    volatile int* nowhere = nullptr;
+    *nowhere = 1;
+}
+
+// Returns without asserting anything, which is what a case whose body was
+// lost to an early return or a bad split looks like. The runner fails it.
+void harness_probe_asserts_nothing()
+{
+}
+
+void harness_probe_passes()
+{
+    CHECK(true);
+}
+
+// Four properties, all of which the suite lacked: a hard failure stops its
+// own case rather than the run; the case after a crash still executes; each
+// failure is attributed to the case that produced it by name; and a case that
+// asserts nothing is a failure, not a pass.
+void harness_isolates_a_failing_case_from_the_ones_after_it_test()
+{
+    static constexpr test_support::TestCase probes[] = {
+        TEST_CASE(harness_probe_require_stops_the_case),
+        TEST_CASE(harness_probe_access_violation),
+        TEST_CASE(harness_probe_asserts_nothing),
+        TEST_CASE(harness_probe_passes),
+    };
+
+    g_harness_statements_after_require = 0;
+    const int failuresBefore = test_support::failure_count;
+    // The probes report through the same stream every other case does, so it
+    // is borrowed for the duration rather than letting two expected failures
+    // print as if the suite were broken.
+    std::ostringstream captured;
+    std::streambuf* const previous = std::cerr.rdbuf(captured.rdbuf());
+    const test_support::RunSummary summary =
+        test_support::run_cases(probes, std::size(probes), {});
+    std::cerr.rdbuf(previous);
+    test_support::failure_count = failuresBefore;
+
+    CHECK_EQ(size_t{4}, summary.ran);
+    CHECK_EQ(size_t{3}, summary.failed);
+    // A failed REQUIRE abandons its case at the point of failure. A failed
+    // CHECK would have carried on to the increment.
+    CHECK_EQ(0, g_harness_statements_after_require);
+
+    const std::string report = captured.str();
+    CHECK(report.find("harness_probe_require_stops_the_case") != std::string::npos);
+    CHECK(report.find("harness_probe_access_violation") != std::string::npos);
+    // The access violation is reported as one, not as a silent abort.
+    CHECK(report.find("c0000005") != std::string::npos);
+    CHECK(report.find("[harness_probe_asserts_nothing] made no assertions") != std::string::npos);
+    // The case after the crash ran and did not fail.
+    CHECK(report.find("harness_probe_passes") == std::string::npos);
+}
+
+// There was no eviction at all. RemoveSource and RemoveRender existed with no
+// production caller; the only reclamation was Clear(), which is all or
+// nothing. Meanwhile the key deliberately retires entries wholesale -
+// applicationVersion, driverVersion, modelStoreDigest, runtimeDigest and the
+// manifest schema are all key terms - so an NVIDIA driver update changes every
+// key at once. A user with 40 GB of renders takes the update, all 40 GB
+// becomes unreachable, everything re-renders, and the cache grows to 80 GB.
+// The only remedy offered destroys the new renders too.
+//
+// Two rules, in order. An entry whose manifest can no longer be reused is
+// dead whatever the disk looks like. Everything else is only evicted when the
+// disk is actually under pressure, because re-rendering a film costs minutes
+// to hours and free space costs nothing until it runs out.
+namespace {
+cache_eviction::Entry EvictionEntry(std::string key, uintmax_t bytes, int64_t lastUsed,
+                                    bool reusable = true, bool active = false)
+{
+    return cache_eviction::Entry{std::move(key), bytes, lastUsed, reusable, active};
+}
+} // namespace
+
+void eviction_removes_entries_that_can_never_match_a_key_again_test()
+{
+    const cache_eviction::Entry entries[] = {
+        EvictionEntry("live", 10, 500),
+        EvictionEntry("retired", 25, 900, /*reusable=*/false),
+        EvictionEntry("also-live", 10, 100),
+    };
+    // Acres of free space: nothing is under pressure, and the dead entry still
+    // goes.
+    const auto plan = cache_eviction::PlanEviction(entries, /*freeBytes=*/1'000'000,
+                                                   /*freeFloorBytes=*/1000);
+    CHECK_EQ(size_t{1}, plan.evict.size());
+    if (plan.evict.size() == 1) CHECK_EQ(std::string("retired"), plan.evict.front());
+    CHECK_EQ(uintmax_t{25}, plan.freedBytes);
+}
+
+void eviction_keeps_everything_reusable_while_the_disk_has_room_test()
+{
+    const cache_eviction::Entry entries[] = {
+        EvictionEntry("old", 100, 1),
+        EvictionEntry("older", 100, 0),
+    };
+    const auto plan = cache_eviction::PlanEviction(entries, 1'000'000, 1000);
+    CHECK(plan.evict.empty());
+    CHECK_EQ(uintmax_t{0}, plan.freedBytes);
+}
+
+void eviction_frees_the_least_recently_used_until_the_floor_is_met_test()
+{
+    const cache_eviction::Entry entries[] = {
+        EvictionEntry("newest", 100, 300),
+        EvictionEntry("oldest", 100, 100),
+        EvictionEntry("middle", 100, 200),
+    };
+    // 250 free, floor 400: 150 short, so the two oldest go and the newest stays.
+    const auto plan = cache_eviction::PlanEviction(entries, 250, 400);
+    CHECK_EQ(size_t{2}, plan.evict.size());
+    if (plan.evict.size() == 2) {
+        CHECK_EQ(std::string("oldest"), plan.evict[0]);
+        CHECK_EQ(std::string("middle"), plan.evict[1]);
+    }
+    CHECK_EQ(uintmax_t{200}, plan.freedBytes);
+    // It stops as soon as the floor is met rather than emptying the cache.
+    CHECK(plan.freedBytes + 250 >= 400);
+}
+
+// A render in progress is reading and writing its own entry. Removing it under
+// the job is worse than running out of disk.
+void eviction_never_touches_an_active_entry_test()
+{
+    const cache_eviction::Entry entries[] = {
+        EvictionEntry("rendering-now", 100, 0, /*reusable=*/true, /*active=*/true),
+        EvictionEntry("dead-but-open", 100, 0, /*reusable=*/false, /*active=*/true),
+        EvictionEntry("free-to-go", 100, 50),
+    };
+    const auto plan = cache_eviction::PlanEviction(entries, 0, 1'000'000);
+    CHECK_EQ(size_t{1}, plan.evict.size());
+    if (plan.evict.size() == 1) CHECK_EQ(std::string("free-to-go"), plan.evict.front());
+}
+
+// The floor cannot always be met. It must free what it can and say so rather
+// than emptying the cache in a loop that can never succeed.
+void eviction_frees_what_it_can_when_the_floor_is_unreachable_test()
+{
+    const cache_eviction::Entry entries[] = {
+        EvictionEntry("a", 10, 1),
+        EvictionEntry("b", 10, 2, /*reusable=*/true, /*active=*/true),
+    };
+    const auto plan = cache_eviction::PlanEviction(entries, 0, 1'000'000);
+    CHECK_EQ(size_t{1}, plan.evict.size());
+    CHECK_EQ(uintmax_t{10}, plan.freedBytes);
+    CHECK(!plan.floorMet);
+}
+
+// A floor of zero disables pressure eviction, leaving only the dead entries.
+// That is the switch for anyone who would rather manage the cache by hand.
+void a_zero_floor_evicts_only_the_dead_test()
+{
+    const cache_eviction::Entry entries[] = {
+        EvictionEntry("dead", 10, 1, /*reusable=*/false),
+        EvictionEntry("alive", 10, 2),
+    };
+    const auto plan = cache_eviction::PlanEviction(entries, 0, 0);
+    CHECK_EQ(size_t{1}, plan.evict.size());
+    if (plan.evict.size() == 1) CHECK_EQ(std::string("dead"), plan.evict.front());
+}
+
+// The manifest recorded none of the key's environment, so an entry a driver
+// update had orphaned passed the reuse gate and stayed until the disk ran
+// short. Retirement is the certain case only: a false positive deletes a
+// render someone can still play.
+void identity_retirement_needs_certainty_and_respects_other_installations_test()
+{
+    using cache_eviction::Identity;
+    using cache_eviction::IdentityRetired;
+    const Identity current{"0.21.2", "c:/player", std::string(64, 'b'), "32.0.16.1047",
+                           std::string(64, 'd')};
+    CHECK(!IdentityRetired(current, current));
+
+    // Machine-wide terms retire an entry whoever made it.
+    auto changed = current;
+    changed.driver = "32.0.15.9999";
+    CHECK(IdentityRetired(changed, current));
+    changed = current;
+    changed.models = std::string(64, 'e');
+    CHECK(IdentityRetired(changed, current));
+    changed.installation = "d:/elsewhere";
+    CHECK(IdentityRetired(changed, current));
+
+    // Installation terms retire only this installation's own entries.
+    changed = current;
+    changed.application = "0.21.1";
+    CHECK(IdentityRetired(changed, current));
+    changed.installation = "d:/elsewhere";
+    CHECK(!IdentityRetired(changed, current));
+    changed.installation.clear();
+    CHECK(!IdentityRetired(changed, current));
+    changed = current;
+    changed.runtime = std::string(64, 'f');
+    CHECK(IdentityRetired(changed, current));
+    changed.installation = "d:/elsewhere";
+    CHECK(!IdentityRetired(changed, current));
+
+    // Nothing recorded, or nothing known about now: never retired.
+    changed = current;
+    changed.driver = "32.0.15.9999";
+    CHECK(!IdentityRetired(Identity{}, current));
+    auto unknown = current;
+    unknown.models.clear();
+    CHECK(!IdentityRetired(changed, unknown));
+    unknown = current;
+    unknown.runtime.clear();
+    CHECK(!IdentityRetired(changed, unknown));
+    auto partial = changed;
+    partial.application.clear();
+    CHECK(!IdentityRetired(partial, current));
+}
+
+// A quarantined entry was reaped by the very next sweep, before anyone could
+// look at why it failed. Partial payloads and set-aside directories keep the
+// rules they had.
+void staging_sweep_keeps_quarantined_entries_for_the_retention_test()
+{
+    using cache_eviction::ClassifyStagingEntry;
+    using cache_eviction::ReapStagingEntry;
+    using cache_eviction::StagingEntry;
+    CHECK(ClassifyStagingEntry(L"invalid-cache-4242-7") == StagingEntry::Quarantined);
+    CHECK(ClassifyStagingEntry(L"invalid-existing-4242-7") == StagingEntry::Quarantined);
+    CHECK(ClassifyStagingEntry(L"invalid-4242-7") == StagingEntry::SetAside);
+    CHECK(ClassifyStagingEntry(L"invalid-evicted-4242-7") == StagingEntry::SetAside);
+    CHECK(ClassifyStagingEntry(L"invalid-cleared-4242-7") == StagingEntry::SetAside);
+    CHECK(ClassifyStagingEntry(L"render-abc-4242-7") == StagingEntry::Partial);
+
+    const int64_t retention = cache_eviction::kQuarantineRetentionSeconds;
+    CHECK_EQ(int64_t{3 * 24 * 60 * 60}, retention);
+    CHECK(!ReapStagingEntry(StagingEntry::Quarantined, false, 0));
+    CHECK(!ReapStagingEntry(StagingEntry::Quarantined, false, retention - 1));
+    CHECK(ReapStagingEntry(StagingEntry::Quarantined, true, retention));
+    CHECK(ReapStagingEntry(StagingEntry::SetAside, true, 0));
+    CHECK(!ReapStagingEntry(StagingEntry::Partial, true, retention * 10));
+    CHECK(ReapStagingEntry(StagingEntry::Partial, false, 0));
+}
+
+// A dead session's live/pid<N> is swept at startup, so what counts as one has
+// to be exactly what SessionDirectory writes and nothing that merely looks
+// like it.
+void live_session_owner_is_read_only_from_names_session_directory_writes_test()
+{
+    uint32_t pid = 0;
+    CHECK(live_session::ParseSessionOwner(L"pid4242", pid));
+    CHECK_EQ(uint32_t{4242}, pid);
+    CHECK(live_session::ParseSessionOwner(L"pid0", pid));
+    CHECK_EQ(uint32_t{0}, pid);
+    CHECK(live_session::ParseSessionOwner(L"pid4294967295", pid));
+    CHECK_EQ(uint32_t{4294967295u}, pid);
+    const std::filesystem::path written = live_session::SessionDirectory(L"D:\\cache", 9001);
+    CHECK(live_session::ParseSessionOwner(written.filename().wstring(), pid));
+    CHECK_EQ(uint32_t{9001}, pid);
+    for (const wchar_t* name : {L"pid", L"pid04242", L"pid-1", L"pid42a", L"Pid42", L"notes",
+                                L"pid4294967296", L"pid99999999999", L"job1"})
+        CHECK(!live_session::ParseSessionOwner(name, pid));
+}
+
+// DLSSBackend.cpp and DLSSGBackend.cpp were byte-identical and both wrong:
+//
+//     wchar_t exePath[MAX_PATH]{};
+//     GetModuleFileNameW(nullptr, exePath, MAX_PATH);   // no return check
+//
+// On a path longer than 260 characters GetModuleFileNameW fills the buffer,
+// returns exactly the size it was given, sets ERROR_INSUFFICIENT_BUFFER, and
+// - before Windows 10 - does not even null-terminate. Both sites then took
+// parent_path() of a truncated string and created ngx_logs somewhere else
+// entirely. Fourteen sites called this function across three incompatible
+// buffer strategies.
+//
+// The query is injected so the growth loop is testable without a 300-character
+// install directory.
+void module_path_grows_past_max_path_test()
+{
+    // Longer than kInitialPathCharacters, so the loop has to grow at least
+    // once; 400 would have fit the first buffer and proved nothing.
+    const std::wstring actual(700, L'x');
+    int calls = 0;
+    const auto queried = platform_paths::ModulePathWith(
+        [&](wchar_t* buffer, uint32_t size) -> uint32_t {
+            ++calls;
+            if (actual.size() >= size) {          // truncated, exactly as Win32 reports it
+                std::copy_n(actual.begin(), size, buffer);
+                return size;
+            }
+            std::copy(actual.begin(), actual.end(), buffer);
+            buffer[actual.size()] = L'\0';
+            return static_cast<uint32_t>(actual.size());
+        });
+
+    CHECK(queried.has_value());
+    if (queried) CHECK_EQ(actual, queried->wstring());
+    // It grew rather than giving up on the first short answer.
+    CHECK(calls > 1);
+}
+
+// The whole bug: a return equal to the buffer size means truncation, never a
+// complete path. Accepting it is what put ngx_logs in the wrong directory.
+void module_path_never_accepts_a_filled_buffer_test()
+{
+    const auto queried = platform_paths::ModulePathWith(
+        [](wchar_t* buffer, uint32_t size) -> uint32_t {
+            std::fill_n(buffer, size, L'y');   // always exactly full: never enough room
+            return size;
+        });
+    CHECK(!queried.has_value());
+}
+
+void module_path_reports_a_failed_query_test()
+{
+    int calls = 0;
+    const auto queried = platform_paths::ModulePathWith(
+        [&](wchar_t*, uint32_t) -> uint32_t { ++calls; return 0; });
+    CHECK(!queried.has_value());
+    // A hard failure is not retried at a larger size.
+    CHECK_EQ(1, calls);
+}
+
+void module_directory_is_the_parent_of_the_module_test()
+{
+    const auto directory = platform_paths::ModuleDirectoryWith(
+        [](wchar_t* buffer, uint32_t size) -> uint32_t {
+            const std::wstring path = LR"(C:\Program Files\Player\DLSSVideoPlayer.exe)";
+            if (path.size() >= size) return size;
+            std::copy(path.begin(), path.end(), buffer);
+            buffer[path.size()] = L'\0';
+            return static_cast<uint32_t>(path.size());
+        });
+    CHECK(directory.has_value());
+    if (directory) CHECK_EQ(std::wstring(LR"(C:\Program Files\Player)"), directory->wstring());
+}
+
+// The real module, which every production caller uses. It has to answer on
+// this machine or the fourteen call sites have no fallback.
+void module_directory_answers_for_this_process_test()
+{
+    const auto directory = platform_paths::ModuleDirectory();
+    CHECK(directory.has_value());
+    if (directory) CHECK(std::filesystem::exists(*directory));
+}
+
+// RecoverUnusableRenderer rebuilt into the SAME HWND. DXGI allows one
+// flip-model swapchain per window, and the renderer being retired may still
+// own one: D3D12Renderer's deleter deliberately retains a renderer whose
+// bounded GPU drain did not complete, because deleting it would free
+// resources its command lists are still reading. So the rebuild met
+// DXGI_ERROR_INVALID_CALL, the media unloaded, and the user was told the GPU
+// was lost - on the one path that exists to survive exactly that.
+//
+// Every other renderer-swap path in the player (EnableUpscaling,
+// CreateRendererCandidate) already creates a fresh child window. Only
+// recovery reused, and it is the path no one exercises by hand.
+//
+// The window work is injected so the ordering is testable without a device,
+// a display or a message loop - the same shape as the fence-teardown cases
+// above.
+void renderer_recovery_rebuilds_into_a_fresh_window_test()
+{
+    HWND retiring = reinterpret_cast<HWND>(0x1001);
+    HWND initializedWith = nullptr;
+    int created = 0;
+
+    const auto result = renderer_recovery::Rebuild(
+        retiring,
+        [&] { ++created; return reinterpret_cast<HWND>(0x2002); },
+        [](HWND) {},
+        [] { return true; },
+        [&](HWND window) { initializedWith = window; return true; });
+
+    CHECK_EQ(1, created);
+    CHECK(result.outcome == renderer_recovery::Outcome::Rebuilt);
+    // The whole bug in one assertion.
+    CHECK(initializedWith != retiring);
+    CHECK_EQ(reinterpret_cast<HWND>(0x2002), initializedWith);
+    CHECK_EQ(reinterpret_cast<HWND>(0x2002), result.window);
+}
+
+// A renderer that could not be drained is kept alive on purpose, and its
+// swapchain with it. Destroying the window underneath it would leave that
+// swapchain pointing at a dead HWND.
+void renderer_recovery_keeps_a_retained_renderers_window_test()
+{
+    HWND retiring = reinterpret_cast<HWND>(0x1001);
+    int destroyed = 0;
+
+    const auto result = renderer_recovery::Rebuild(
+        retiring,
+        [] { return reinterpret_cast<HWND>(0x2002); },
+        [&](HWND) { ++destroyed; },
+        [] { return false; },   // retained: the drain did not complete
+        [](HWND) { return true; });
+
+    CHECK_EQ(0, destroyed);
+    CHECK(!result.oldWindowDestroyed);
+    // The rebuild still happens; it just happens somewhere else.
+    CHECK(result.outcome == renderer_recovery::Outcome::Rebuilt);
+    CHECK_EQ(reinterpret_cast<HWND>(0x2002), result.window);
+}
+
+void renderer_recovery_destroys_the_old_window_once_its_renderer_is_gone_test()
+{
+    HWND retiring = reinterpret_cast<HWND>(0x1001);
+    std::vector<HWND> destroyed;
+
+    const auto result = renderer_recovery::Rebuild(
+        retiring,
+        [] { return reinterpret_cast<HWND>(0x2002); },
+        [&](HWND window) { destroyed.push_back(window); },
+        [] { return true; },
+        [](HWND) { return true; });
+
+    CHECK_EQ(size_t{1}, destroyed.size());
+    if (!destroyed.empty()) CHECK_EQ(retiring, destroyed.front());
+    CHECK(result.oldWindowDestroyed);
+}
+
+// No window means no rebuild: initializing against the old one is the bug.
+void renderer_recovery_without_a_window_does_not_initialize_test()
+{
+    HWND retiring = reinterpret_cast<HWND>(0x1001);
+    int initialized = 0, destroyed = 0, released = 0;
+
+    const auto result = renderer_recovery::Rebuild(
+        retiring,
+        [] { return HWND{nullptr}; },
+        [&](HWND) { ++destroyed; },
+        [&] { ++released; return true; },
+        [&](HWND) { ++initialized; return true; });
+
+    CHECK(result.outcome == renderer_recovery::Outcome::WindowCreationFailed);
+    CHECK_EQ(0, initialized);
+    CHECK_EQ(0, destroyed);
+    // Nothing is retired either: the caller still has a usable old window to
+    // report the failure through.
+    CHECK_EQ(0, released);
+    CHECK_EQ(retiring, result.window);
+}
+
+// A rebuild that fails on the device still reports which window it owns, so
+// the caller tears down the right one.
+void renderer_recovery_reports_the_new_window_after_a_failed_initialize_test()
+{
+    const auto result = renderer_recovery::Rebuild(
+        reinterpret_cast<HWND>(0x1001),
+        [] { return reinterpret_cast<HWND>(0x2002); },
+        [](HWND) {},
+        [] { return true; },
+        [](HWND) { return false; });
+
+    CHECK(result.outcome == renderer_recovery::Outcome::RendererInitFailed);
+    CHECK_EQ(reinterpret_cast<HWND>(0x2002), result.window);
+    CHECK(result.oldWindowDestroyed);
+}
+
+void gpu_teardown_fence_signal_failure_stops_before_event_registration_test()
+{
+    int completionQueries=0,eventRegistrations=0,waits=0;
+    const auto result=d3d12_renderer_detail::WaitForGPUFenceTeardown(
+        uint64_t{41},
+        [&](uint64_t value){CHECK_EQ(uint64_t{41},value);return E_FAIL;},
+        [&]{++completionQueries;return uint64_t{0};},
+        [&](uint64_t){++eventRegistrations;return S_OK;},
+        [&](DWORD){++waits;return DWORD{WAIT_OBJECT_0};});
+
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::SignalFailed,result);
+    CHECK_EQ(0,completionQueries);CHECK_EQ(0,eventRegistrations);CHECK_EQ(0,waits);
+}
+
+void gpu_teardown_fence_signal_failure_maps_to_device_removed_when_device_reason_failed_test()
+{
+    int reasonChecks=0,eventRegistrations=0,waits=0;
+    const auto result=d3d12_renderer_detail::WaitForGPUFenceTeardown(
+        uint64_t{411},
+        [](uint64_t){return E_FAIL;},
+        []{return uint64_t{0};},
+        [&](uint64_t){++eventRegistrations;return S_OK;},
+        [&](DWORD){++waits;return DWORD{WAIT_OBJECT_0};},
+        [&]{++reasonChecks;return DXGI_ERROR_DEVICE_REMOVED;});
+
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::DeviceRemoved,result);
+    CHECK_EQ(1,reasonChecks);CHECK_EQ(0,eventRegistrations);CHECK_EQ(0,waits);
+}
+
+void gpu_teardown_fence_event_registration_failure_stops_before_wait_test()
+{
+    int eventRegistrations=0,waits=0;
+    const auto result=d3d12_renderer_detail::WaitForGPUFenceTeardown(
+        uint64_t{42},
+        [](uint64_t){return S_OK;},
+        []{return uint64_t{0};},
+        [&](uint64_t value){CHECK_EQ(uint64_t{42},value);++eventRegistrations;return E_FAIL;},
+        [&](DWORD){++waits;return DWORD{WAIT_OBJECT_0};});
+
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::EventRegistrationFailed,result);
+    CHECK_EQ(1,eventRegistrations);CHECK_EQ(0,waits);
+}
+
+void gpu_teardown_fence_wait_failure_is_bounded_and_reported_test()
+{
+    DWORD observedTimeout=INFINITE;
+    const auto result=d3d12_renderer_detail::WaitForGPUFenceTeardown(
+        uint64_t{43},
+        [](uint64_t){return S_OK;},
+        []{return uint64_t{0};},
+        [](uint64_t){return S_OK;},
+        [&](DWORD timeout){observedTimeout=timeout;return DWORD{WAIT_FAILED};});
+
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::WaitFailed,result);
+    CHECK(observedTimeout!=INFINITE);CHECK(observedTimeout<=DWORD{2000});
+}
+
+void gpu_teardown_fence_timeout_is_bounded_and_reported_test()
+{
+    DWORD observedTimeout=INFINITE;
+    const auto result=d3d12_renderer_detail::WaitForGPUFenceTeardown(
+        uint64_t{44},
+        [](uint64_t){return S_OK;},
+        []{return uint64_t{0};},
+        [](uint64_t){return S_OK;},
+        [&](DWORD timeout){observedTimeout=timeout;return DWORD{WAIT_TIMEOUT};});
+
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::TimedOut,result);
+    CHECK(observedTimeout!=INFINITE);CHECK(observedTimeout<=DWORD{2000});
+}
+
+// Frame waits during rendering carry their own budget: long enough for the
+// slowest supported GPU to finish three pipelined NR frames, still finite, and
+// distinct from the short teardown budget. Device loss is not subject to it.
+void gpu_render_fence_wait_uses_the_render_budget_and_reports_device_loss_first_test()
+{
+    DWORD observedTimeout=INFINITE;
+    const auto timedOut=d3d12_renderer_detail::WaitForGPUFenceCompletion(
+        uint64_t{48},GetTickCount64(),d3d12_renderer_detail::RenderFenceWaitMilliseconds,
+        []{return uint64_t{0};},
+        [](uint64_t){return S_OK;},
+        [&](DWORD timeout){observedTimeout=timeout;return DWORD{WAIT_TIMEOUT};});
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::TimedOut,timedOut);
+    CHECK(observedTimeout>d3d12_renderer_detail::TeardownFenceWaitMilliseconds);
+    CHECK(observedTimeout<=d3d12_renderer_detail::RenderFenceWaitMilliseconds);
+
+    int waits=0;
+    const auto removed=d3d12_renderer_detail::WaitForGPUFenceDrain(
+        uint64_t{49},d3d12_renderer_detail::RenderFenceWaitMilliseconds,
+        [](uint64_t){return S_OK;},
+        [&]{return waits?UINT64_MAX:uint64_t{0};},
+        [](uint64_t){return S_OK;},
+        [&](DWORD){++waits;return DWORD{WAIT_OBJECT_0};});
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::DeviceRemoved,removed);
+    CHECK_EQ(1,waits);
+}
+
+void gpu_teardown_fence_ignores_old_event_wake_until_new_target_completes_test()
+{
+    int completionQueries=0,waits=0;
+    const auto result=d3d12_renderer_detail::WaitForGPUFenceTeardown(
+        uint64_t{45},
+        [](uint64_t){return S_OK;},
+        [&]{++completionQueries;return completionQueries>=3?uint64_t{45}:uint64_t{12};},
+        [](uint64_t){return S_OK;},
+        [&](DWORD){++waits;return DWORD{WAIT_OBJECT_0};});
+
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::Completed,result);
+    CHECK_EQ(3,completionQueries);
+    CHECK_EQ(2,waits);
+}
+
+void gpu_teardown_fence_consecutive_timeout_does_not_let_old_registration_complete_new_target_test()
+{
+    uint64_t completed=12;
+    std::vector<uint64_t> registrations;
+    const auto first=d3d12_renderer_detail::WaitForGPUFenceTeardown(
+        uint64_t{45},
+        [](uint64_t){return S_OK;},
+        [&]{return completed;},
+        [&](uint64_t value){registrations.push_back(value);return S_OK;},
+        [](DWORD){return DWORD{WAIT_TIMEOUT};});
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::TimedOut,first);
+
+    int secondWaits=0;
+    const auto second=d3d12_renderer_detail::WaitForGPUFenceTeardown(
+        uint64_t{46},
+        [](uint64_t){return S_OK;},
+        [&]{return completed;},
+        [&](uint64_t value){registrations.push_back(value);return S_OK;},
+        [&](DWORD){
+            completed=++secondWaits==1?uint64_t{45}:uint64_t{46};
+            return DWORD{WAIT_OBJECT_0};
+        });
+
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::Completed,second);
+    CHECK_EQ(std::vector<uint64_t>({45,46}),registrations);
+    CHECK_EQ(2,secondWaits);
+}
+
+void gpu_teardown_fence_device_removed_sentinel_is_not_completion_test()
+{
+    int completionQueries=0;
+    int eventRegistrations=0,waits=0;
+    const auto result=d3d12_renderer_detail::WaitForGPUFenceTeardown(
+        uint64_t{46},
+        [](uint64_t){return S_OK;},
+        [&]{return ++completionQueries==1?uint64_t{0}:UINT64_MAX;},
+        [&](uint64_t){++eventRegistrations;return S_OK;},
+        [&](DWORD){++waits;return DWORD{WAIT_OBJECT_0};});
+
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::DeviceRemoved,result);
+    CHECK_EQ(1,eventRegistrations);
+    CHECK_EQ(1,waits);
+}
+
+void gpu_teardown_fence_stale_wakes_share_one_absolute_timeout_budget_test()
+{
+    std::vector<DWORD> timeouts;
+    int waits=0;
+    const auto result=d3d12_renderer_detail::WaitForGPUFenceTeardown(
+        uint64_t{47},
+        [](uint64_t){return S_OK;},
+        []{return uint64_t{8};},
+        [](uint64_t){return S_OK;},
+        [&](DWORD timeout){
+            timeouts.push_back(timeout);
+            if(++waits==1){Sleep(25);return DWORD{WAIT_OBJECT_0};}
+            return DWORD{WAIT_TIMEOUT};
+        });
+
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::TimedOut,result);
+    CHECK_EQ(size_t{2},timeouts.size());
+    if(timeouts.size()==2){CHECK(timeouts[0]<=DWORD{2000});CHECK(timeouts[1]<timeouts[0]);}
+}
+
+// P1.12: a frame-generation submission whose wait timed out is classified
+// before anything is freed. Only a removed device may be torn down at once; a
+// live one gets a longer wait, and one still busy after it is stuck - its
+// resources are leaked, never released under work the GPU may be executing.
+void frame_generation_stalled_submission_frees_only_what_the_gpu_cannot_touch_test()
+{
+    using frame_generation_detail::StalledSubmission;
+    int asked=0,waited=0;
+    CHECK_EQ(StalledSubmission::DeviceRemoved,frame_generation_detail::ResolveStalledSubmission(
+        [&]{++asked;return true;},[&]{++waited;return true;}));
+    CHECK_EQ(1,asked);
+    CHECK_EQ(0,waited);  // a removed device's fence never advances: no second wait
+
+    asked=waited=0;
+    CHECK_EQ(StalledSubmission::Retired,frame_generation_detail::ResolveStalledSubmission(
+        [&]{++asked;return false;},[&]{++waited;return true;}));
+    CHECK_EQ(1,asked);
+    CHECK_EQ(1,waited);
+
+    asked=waited=0;
+    CHECK_EQ(StalledSubmission::Stuck,frame_generation_detail::ResolveStalledSubmission(
+        [&]{++asked;return false;},[&]{++waited;return false;}));
+    CHECK_EQ(2,asked);   // asked again after the wait
+    CHECK_EQ(1,waited);
+
+    // Lost during the longer wait: nothing executes any more, so not stuck.
+    asked=0;
+    CHECK_EQ(StalledSubmission::DeviceRemoved,frame_generation_detail::ResolveStalledSubmission(
+        [&]{return ++asked>1;},[]{return false;}));
+}
+
+void renderer_non_teardown_wait_failure_is_propagated_test()
+{
+    D3D12RendererTestAccess::ResetRetainedRenderers();
+    int waits=0;
+    auto renderer=MakeD3D12Renderer();
+    D3D12RendererTestAccess::ConfigureWait(
+        *renderer,d3d12_renderer_detail::FenceWaitResult::TimedOut,waits);
+
+    CHECK(!D3D12RendererTestAccess::WaitForContinuedUse(*renderer));
+    CHECK_EQ(1,waits);
+    renderer.reset();
+    CHECK_EQ(1,waits);
+}
+
+void renderer_safe_owner_releases_owned_resources_only_after_completed_or_removed_drain_test()
+{
+    for(const auto result:{d3d12_renderer_detail::FenceWaitResult::Completed,
+                           d3d12_renderer_detail::FenceWaitResult::DeviceRemoved}){
+        int waits=0;auto destroyed=std::make_shared<int>(0);
+        auto renderer=MakeD3D12Renderer();
+        D3D12RendererTestAccess::ConfigureWait(*renderer,result,waits);
+        D3D12RendererTestAccess::OwnSentinel(
+            *renderer,std::make_unique<RendererOwnedSentinel>(destroyed));
+
+        renderer.reset();
+
+        CHECK_EQ(1,waits);
+        CHECK_EQ(1,*destroyed);
+    }
+}
+
+void renderer_safe_owner_retains_resources_after_live_device_drain_failure_test()
+{
+    for(const auto result:{d3d12_renderer_detail::FenceWaitResult::SignalFailed,
+                           d3d12_renderer_detail::FenceWaitResult::EventRegistrationFailed,
+                           d3d12_renderer_detail::FenceWaitResult::WaitFailed,
+                           d3d12_renderer_detail::FenceWaitResult::TimedOut}){
+        D3D12RendererTestAccess::ResetRetainedRenderers();
+        int waits=0;auto destroyed=std::make_shared<int>(0);
+        auto renderer=MakeD3D12Renderer();
+        D3D12RendererTestAccess::ConfigureWait(*renderer,result,waits);
+        D3D12RendererTestAccess::OwnSentinel(
+            *renderer,std::make_unique<RendererOwnedSentinel>(destroyed));
+
+        renderer.reset();
+
+        CHECK_EQ(1,waits);
+        CHECK_EQ(0,*destroyed);
+    }
+}
+
+// A drain that fails leaves resources the GPU may still be touching, so the
+// renderer is leaked rather than freed - once. A second such renderer in one
+// process is a loop that would leak the GPU dry, and the deleter ends the
+// process instead; under test the exit is a hook, and the renderer is still
+// kept rather than freed.
+void renderer_second_retained_renderer_ends_the_process_test()
+{
+    D3D12RendererTestAccess::ResetRetainedRenderers();
+    int exits=0;
+    for(int retained=1;retained<=2;++retained){
+        int waits=0;auto destroyed=std::make_shared<int>(0);
+        auto renderer=MakeD3D12Renderer();
+        D3D12RendererTestAccess::ConfigureWait(
+            *renderer,d3d12_renderer_detail::FenceWaitResult::TimedOut,waits);
+        D3D12RendererTestAccess::OnExitProcess(*renderer,[&]{++exits;});
+        D3D12RendererTestAccess::OwnSentinel(
+            *renderer,std::make_unique<RendererOwnedSentinel>(destroyed));
+
+        renderer.reset();
+
+        CHECK_EQ(1,waits);
+        CHECK_EQ(0,*destroyed);
+        CHECK_EQ(retained-1,exits);
+    }
+}
+
+void renderer_frame_signal_failure_is_cached_without_advancing_tracking_test()
+{
+    D3D12RendererTestAccess::ResetRetainedRenderers();
+    int signalCalls=0,reasonChecks=0;
+    auto destroyed=std::make_shared<int>(0);
+    auto renderer=MakeD3D12Renderer();
+    D3D12RendererTestAccess::ConfigureFrameSignal(
+        *renderer,E_FAIL,S_OK,signalCalls,reasonChecks);
+    D3D12RendererTestAccess::SetFrameTracking(*renderer,1,9,1,4);
+    D3D12RendererTestAccess::OwnSentinel(
+        *renderer,std::make_unique<RendererOwnedSentinel>(destroyed));
+
+    CHECK(!D3D12RendererTestAccess::SignalFrameSlot(*renderer,1));
+    CHECK_EQ(1,signalCalls);CHECK_EQ(1,reasonChecks);
+    CHECK_EQ(uint32_t{1},D3D12RendererTestAccess::FrameSlot(*renderer));
+    CHECK_EQ(uint64_t{9},D3D12RendererTestAccess::FenceValue(*renderer));
+    CHECK_EQ(uint64_t{4},D3D12RendererTestAccess::FrameFence(*renderer,1));
+    CHECK(D3D12RendererTestAccess::GPUUnusable(*renderer));
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::SignalFailed,
+             D3D12RendererTestAccess::LastFenceResult(*renderer));
+    CHECK(!D3D12RendererTestAccess::SignalFrameSlot(*renderer,1));
+    CHECK_EQ(1,signalCalls);
+
+    renderer.reset();
+    CHECK_EQ(0,*destroyed);
+}
+
+void renderer_frame_signal_device_removal_is_cached_and_safe_owner_releases_test()
+{
+    int signalCalls=0,reasonChecks=0;
+    auto destroyed=std::make_shared<int>(0);
+    auto renderer=MakeD3D12Renderer();
+    D3D12RendererTestAccess::ConfigureFrameSignal(
+        *renderer,E_FAIL,DXGI_ERROR_DEVICE_REMOVED,signalCalls,reasonChecks);
+    D3D12RendererTestAccess::SetFrameTracking(*renderer,2,12,2,8);
+    D3D12RendererTestAccess::OwnSentinel(
+        *renderer,std::make_unique<RendererOwnedSentinel>(destroyed));
+
+    CHECK(!D3D12RendererTestAccess::SignalFrameSlot(*renderer,2));
+    CHECK_EQ(1,signalCalls);CHECK_EQ(1,reasonChecks);
+    CHECK_EQ(uint32_t{2},D3D12RendererTestAccess::FrameSlot(*renderer));
+    CHECK_EQ(uint64_t{12},D3D12RendererTestAccess::FenceValue(*renderer));
+    CHECK_EQ(uint64_t{8},D3D12RendererTestAccess::FrameFence(*renderer,2));
+    CHECK_EQ(d3d12_renderer_detail::FenceWaitResult::DeviceRemoved,
+             D3D12RendererTestAccess::LastFenceResult(*renderer));
+
+    renderer.reset();
+    CHECK_EQ(1,*destroyed);
+}
+
+// The Signal's own HRESULT can say the device is gone before
+// GetDeviceRemovedReason does: a loss code latches DeviceRemoved, which the
+// safe owner may then release, instead of SignalFailed, which it must retain.
+void renderer_frame_signal_device_loss_code_latches_device_removed_test()
+{
+    using d3d12_renderer_detail::FenceWaitResult;
+    static_assert(d3d12_renderer_detail::IsDeviceLossCode(DXGI_ERROR_DEVICE_REMOVED));
+    static_assert(d3d12_renderer_detail::IsDeviceLossCode(DXGI_ERROR_DEVICE_RESET));
+    static_assert(d3d12_renderer_detail::IsDeviceLossCode(DXGI_ERROR_DEVICE_HUNG));
+    static_assert(!d3d12_renderer_detail::IsDeviceLossCode(E_FAIL));
+    static_assert(!d3d12_renderer_detail::IsDeviceLossCode(S_OK));
+    CHECK_EQ(FenceWaitResult::SignalFailed,
+             d3d12_renderer_detail::ClassifyDeviceCallFailure(E_FAIL,FenceWaitResult::SignalFailed,[]{return S_OK;}));
+    CHECK_EQ(FenceWaitResult::DeviceRemoved,
+             d3d12_renderer_detail::ClassifyDeviceCallFailure(E_FAIL,FenceWaitResult::SignalFailed,[]{return DXGI_ERROR_DEVICE_REMOVED;}));
+    CHECK_EQ(FenceWaitResult::DeviceRemoved,
+             d3d12_renderer_detail::ClassifyDeviceCallFailure(DXGI_ERROR_DEVICE_RESET,FenceWaitResult::WaitFailed,[]{return S_OK;}));
+
+    int signalCalls=0,reasonChecks=0;
+    auto destroyed=std::make_shared<int>(0);
+    auto renderer=MakeD3D12Renderer();
+    D3D12RendererTestAccess::ConfigureFrameSignal(
+        *renderer,DXGI_ERROR_DEVICE_HUNG,S_OK,signalCalls,reasonChecks);
+    D3D12RendererTestAccess::SetFrameTracking(*renderer,2,12,2,8);
+    D3D12RendererTestAccess::OwnSentinel(
+        *renderer,std::make_unique<RendererOwnedSentinel>(destroyed));
+
+    CHECK(!D3D12RendererTestAccess::SignalFrameSlot(*renderer,2));
+    CHECK_EQ(1,signalCalls);CHECK_EQ(1,reasonChecks);
+    CHECK(D3D12RendererTestAccess::GPUUnusable(*renderer));
+    CHECK_EQ(FenceWaitResult::DeviceRemoved,D3D12RendererTestAccess::LastFenceResult(*renderer));
+
+    renderer.reset();
+    CHECK_EQ(1,*destroyed);
+}
+
+void renderer_frame_signal_success_advances_tracking_once_test()
+{
+    int signalCalls=0,reasonChecks=0;
+    auto renderer=MakeD3D12Renderer();
+    D3D12RendererTestAccess::ConfigureFrameSignal(
+        *renderer,S_OK,S_OK,signalCalls,reasonChecks);
+    D3D12RendererTestAccess::SetFrameTracking(*renderer,0,20,0,14);
+
+    CHECK(D3D12RendererTestAccess::SignalFrameSlot(*renderer,0));
+    CHECK_EQ(1,signalCalls);CHECK_EQ(0,reasonChecks);
+    CHECK_EQ(uint32_t{1},D3D12RendererTestAccess::FrameSlot(*renderer));
+    CHECK_EQ(uint64_t{21},D3D12RendererTestAccess::FenceValue(*renderer));
+    CHECK_EQ(uint64_t{21},D3D12RendererTestAccess::FrameFence(*renderer,0));
+    CHECK(!D3D12RendererTestAccess::GPUUnusable(*renderer));
+}
+
+void renderer_cache_capture_requires_a_successful_neural_evaluation_test()
+{
+    auto renderer=MakeD3D12Renderer();int captures=0;
+    D3D12RendererTestAccess::ConfigureCacheCapture(
+        *renderer,2,2,false,[&](std::vector<uint8_t>&){++captures;return true;});
+    CapturedVideoFrame frame;frame.pixels.assign(7,0x55);frame.width=9;frame.height=9;
+    CHECK(!D3D12RendererTestAccess::CaptureEvaluatedFrame(*renderer,frame));
+    CHECK_EQ(0,captures);CHECK(frame.pixels.empty());CHECK_EQ(uint32_t{0},frame.width);
+    CHECK_EQ(uint32_t{0},frame.height);
+}
+
+void renderer_cache_capture_returns_exact_tight_bgra_geometry_test()
+{
+    auto renderer=MakeD3D12Renderer();
+    D3D12RendererTestAccess::ConfigureCacheCapture(
+        *renderer,2,2,true,[](std::vector<uint8_t>& bytes){
+            bytes={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};return true;
+        });
+    CapturedVideoFrame frame;
+    CHECK(D3D12RendererTestAccess::CaptureEvaluatedFrame(*renderer,frame));
+    CHECK_EQ(uint32_t{2},frame.width);CHECK_EQ(uint32_t{2},frame.height);
+    CHECK_EQ(size_t{16},frame.pixels.size());CHECK_EQ(uint8_t{15},frame.pixels.back());
+
+    D3D12RendererTestAccess::ConfigureCacheCapture(
+        *renderer,2,2,true,[](std::vector<uint8_t>& bytes){bytes.assign(17,0);return true;});
+    CHECK(!D3D12RendererTestAccess::CaptureEvaluatedFrame(*renderer,frame));
+    CHECK(frame.pixels.empty());CHECK_EQ(uint32_t{0},frame.width);CHECK_EQ(uint32_t{0},frame.height);
+}
+
+// The capture says which frame it holds from what the renderer recorded, not
+// from what the caller asked for: stamping the request's identity on it before
+// rendering made the job's identity check compare a value with itself.
+void renderer_cache_capture_carries_the_identity_of_the_frame_it_rendered_test()
+{
+    auto renderer=MakeD3D12Renderer();
+    D3D12RendererTestAccess::ConfigureCacheCapture(
+        *renderer,2,2,true,[](std::vector<uint8_t>& bytes){bytes.assign(16,0x11);return true;});
+    const FrameIdentity rendered{7,70,1,2,9,HistoryReset::None};
+    D3D12RendererTestAccess::SetLastRenderedIdentity(*renderer,rendered);
+    CapturedVideoFrame frame;frame.id=FrameIdentity{8,80,1,2,9,HistoryReset::None};
+    CHECK(D3D12RendererTestAccess::CaptureEvaluatedFrame(*renderer,frame));
+    CHECK(frame.id==rendered);
+
+    // A frame the renderer refused leaves no identity a capture could claim.
+    GuideFrame guide;guide.id=FrameIdentity{8,80,1,0,9,HistoryReset::None};
+    const std::vector<uint8_t> pixels(16,0);
+    CHECK(!renderer->RenderFrame(pixels.data(),pixels.size(),FrameIdentity{9,90,1,0,9,HistoryReset::None},
+                                 guide,16.0f));
+    CHECK(D3D12RendererTestAccess::CaptureEvaluatedFrame(*renderer,frame));
+    CHECK(frame.id==FrameIdentity{});
+}
+
+void renderer_cache_capture_wait_failure_never_exposes_partial_bytes_test()
+{
+    auto renderer=MakeD3D12Renderer();
+    D3D12RendererTestAccess::ConfigureCacheCapture(
+        *renderer,2,2,true,[](std::vector<uint8_t>& bytes){bytes.assign(8,0x44);return false;});
+    CapturedVideoFrame frame;frame.pixels.assign(16,0x22);frame.width=2;frame.height=2;
+    CHECK(!D3D12RendererTestAccess::CaptureEvaluatedFrame(*renderer,frame));
+    CHECK(frame.pixels.empty());CHECK_EQ(uint32_t{0},frame.width);CHECK_EQ(uint32_t{0},frame.height);
+}
+
+void renderer_cache_capture_does_not_apply_playback_color_adjustments_test()
+{
+    auto renderer=MakeD3D12Renderer();
+    D3D12Renderer::ColorSettings adjusted{};adjusted.brightness=2.0f;adjusted.contrast=3.0f;
+    adjusted.saturation=0.0f;adjusted.gamma=0.25f;adjusted.temperature=1.0f;adjusted.tint=-1.0f;
+    renderer->SetColorSettings(adjusted);
+    const std::vector<uint8_t> neuralBytes{10,20,30,255};
+    D3D12RendererTestAccess::ConfigureCacheCapture(
+        *renderer,1,1,true,[&](std::vector<uint8_t>& bytes){bytes=neuralBytes;return true;});
+    CapturedVideoFrame frame;
+    CHECK(D3D12RendererTestAccess::CaptureEvaluatedFrame(*renderer,frame));
+    CHECK_EQ(neuralBytes,frame.pixels);
+}
+
+void gpu_classification_table_test()
+{
+    struct Case {
+        uint32_t vendor_id;
+        std::wstring_view description;
+        GpuGeneration expected;
+    };
+
+    constexpr Case cases[] = {
+        {0x10DE, L"NVIDIA GeForce RTX 2080 Ti", GpuGeneration::Rtx20Turing},
+        {0x10DE, L"NVIDIA GeForce RTX 3060 Laptop GPU", GpuGeneration::Rtx30Ampere},
+        {0x10DE, L"NVIDIA GeForce RTX 4090", GpuGeneration::Rtx40Ada},
+        {0x10DE, L"NVIDIA GeForce RTX 4080 SUPER", GpuGeneration::Rtx40Ada},
+        {0x10DE, L"NVIDIA GeForce RTX 4090 Laptop GPU", GpuGeneration::Rtx40Ada},
+        {0x10DE, L"nViDiA gEfOrCe rTx 5090", GpuGeneration::Rtx50Blackwell},
+        {0x10DE, L"NVIDIA RTX A4000", GpuGeneration::OtherRtx},
+        {0x10DE, L"NVIDIA RTX 6000 Ada Generation", GpuGeneration::OtherRtx},
+        {0x10DE, L"NVIDIA GeForce GTX 1660 SUPER", GpuGeneration::OtherNvidia},
+        {0x1002, L"AMD Radeon RX 7900 XTX", GpuGeneration::Unsupported},
+        {0x8086, L"Intel(R) Arc(TM) A770 Graphics", GpuGeneration::Unsupported},
+        {0x10DE, L"", GpuGeneration::OtherNvidia},
+        {0, L"GeForce RTX 5090", GpuGeneration::Unsupported},
+        {0, L"", GpuGeneration::Unsupported},
+    };
+
+    for (const auto& test : cases) {
+        CHECK_EQ(test.expected, ClassifyGpu(test.vendor_id, test.description));
+    }
+}
+
+// The renderer compares the adapter its device was created on against the one
+// DetectHighPerformanceGpu classified, and it has to do that by LUID: a
+// description is a model name, so two identical cards collide, and a hybrid
+// laptop is exactly the machine where the comparison has to hold. Zero is
+// DXGI's "no adapter", which is why it can never agree with anything - two
+// missing adapters are not the same adapter.
+void adapter_luid_identity_compares_parts_not_model_names_test()
+{
+    constexpr uint64_t part = PackAdapterLuid(0, uint32_t{0x0000C0DE});
+    constexpr uint64_t twin = PackAdapterLuid(0, uint32_t{0x0000C0DF});
+    CHECK_EQ(AdapterMatch::Same, CompareAdapterLuids(part, part));
+    CHECK_EQ(AdapterMatch::Different, CompareAdapterLuids(part, twin));
+    CHECK_EQ(AdapterMatch::Unknown, CompareAdapterLuids(part, 0));
+    CHECK_EQ(AdapterMatch::Unknown, CompareAdapterLuids(0, part));
+    CHECK_EQ(AdapterMatch::Unknown, CompareAdapterLuids(0, 0));
+
+    // HighPart is signed and DXGI does issue negative ones; sign-extending it
+    // would fold every such adapter onto the same packed value and make two
+    // different parts compare Same.
+    CHECK_EQ(uint64_t{0xFFFFFFFF0000C0DE}, PackAdapterLuid(-1, uint32_t{0x0000C0DE}));
+    CHECK_EQ(AdapterMatch::Different,
+             CompareAdapterLuids(PackAdapterLuid(-1, 1), PackAdapterLuid(-2, 1)));
+    // The two halves must not be interchangeable either.
+    CHECK_EQ(AdapterMatch::Different,
+             CompareAdapterLuids(PackAdapterLuid(7, 0), PackAdapterLuid(0, 7)));
+}
+
+// Whatever adapter this machine has, the LUID the policy reports must name
+// the adapter the rest of its answer describes - otherwise the renderer's
+// comparison would be against a part nobody classified. Checked by finding
+// that adapter again through DXGI, which needs no NVIDIA hardware.
+void detected_high_performance_gpu_carries_the_luid_of_the_adapter_it_describes_test()
+{
+    const DetectedGpu detected = DetectHighPerformanceGpu();
+    if (detected.adapterLuid == 0) {
+        // No hardware adapter was detected; then nothing else may claim one.
+        CHECK(detected.description.empty());
+        CHECK_EQ(uint32_t{0}, detected.vendorId);
+        CHECK_EQ(GpuGeneration::Unsupported, detected.generation);
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    CHECK(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))));
+    if (!factory) return;
+
+    unsigned matches = 0;
+    for (UINT index = 0;; ++index) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+        DXGI_ADAPTER_DESC1 description{};
+        if (FAILED(adapter->GetDesc1(&description))) continue;
+        if (CompareAdapterLuids(detected.adapterLuid,
+                                PackAdapterLuid(description.AdapterLuid.HighPart,
+                                                description.AdapterLuid.LowPart)) !=
+            AdapterMatch::Same) {
+            continue;
+        }
+        ++matches;
+        CHECK_EQ(detected.description, std::wstring(description.Description));
+        CHECK_EQ(detected.vendorId, description.VendorId);
+        CHECK_EQ(detected.deviceId, description.DeviceId);
+        CHECK_EQ(detected.dedicatedVideoMemoryBytes,
+                 static_cast<uint64_t>(description.DedicatedVideoMemory));
+        CHECK_EQ(detected.generation, ClassifyGpu(description.VendorId, description.Description));
+    }
+    // A LUID is unique per physical adapter, so the detected one resolves to
+    // exactly one entry of the same enumeration.
+    CHECK_EQ(unsigned{1}, matches);
+}
+
+void nvidia_driver_version_is_read_out_of_the_dxgi_quad_test()
+{
+    struct Case {
+        std::wstring_view dxgi;
+        uint32_t major;
+        uint32_t minor;
+    };
+    // The three machines this project has actually run on.
+    constexpr Case accepted[] = {
+        {L"32.0.15.6614", 566, 14},  // RTX 3060 Laptop, feature 18 refused
+        {L"32.0.16.1047", 610, 47},  // RTX 4080 SUPER
+        {L"32.0.16.1664", 616, 64},  // RTX 5090
+    };
+    for (const auto& test : accepted) {
+        const auto parsed = ParseNvidiaDriverVersion(test.dxgi);
+        CHECK(parsed.has_value());
+        if (!parsed) continue;
+        CHECK_EQ(test.major, parsed->major);
+        CHECK_EQ(test.minor, parsed->minor);
+        CHECK_EQ(std::to_wstring(test.major) + L"." + std::to_wstring(test.minor),
+                 FormatNvidiaDriverVersion(*parsed));
+    }
+    // A single-digit minor keeps the two-digit form NVIDIA publishes.
+    CHECK_EQ(std::wstring(L"580.05"), FormatNvidiaDriverVersion(NvidiaDriverVersion{580, 5}));
+
+    constexpr std::wstring_view rejected[] = {
+        L"", L"32.0.16", L"32.0.16.abcd", L"32.0.16.99999", L"32.0.16.1664.2", L"32.0..1664",
+        L"32.0.16.", L"32.0.16.16 64", L"0.0.0.0",
+    };
+    for (const std::wstring_view text : rejected) {
+        CHECK(!ParseNvidiaDriverVersion(text).has_value());
+    }
+}
+
+void neural_driver_floor_separates_the_failing_machine_from_the_working_ones_test()
+{
+    CHECK_EQ(NeuralDriverSupport::BelowFloor, ClassifyNeuralDriver(L"32.0.15.6614"));
+    CHECK_EQ(NeuralDriverSupport::Supported, ClassifyNeuralDriver(L"32.0.16.1047"));
+    CHECK_EQ(NeuralDriverSupport::Supported, ClassifyNeuralDriver(L"32.0.16.1664"));
+    CHECK_EQ(NeuralDriverSupport::Unknown, ClassifyNeuralDriver(L"not-a-driver"));
+    CHECK_EQ(NeuralDriverSupport::Unknown, ClassifyNeuralDriver(L""));
+
+    // The boundary is inclusive: 610.47 is the lowest driver known to work.
+    CHECK_EQ(NeuralDriverSupport::BelowFloor, ClassifyNeuralDriver(L"32.0.16.1046"));
+    constexpr NvidiaDriverVersion justBelowFloor{610, 46};
+    CHECK(justBelowFloor < kNeuralDriverFloor);
+    CHECK(!(kNeuralDriverFloor < kNeuralDriverFloor));
+    CHECK(kNeuralDriverFloor < kNeuralDriverRecommended);
+    CHECK_EQ(std::wstring(L"610.47"), FormatNvidiaDriverVersion(kNeuralDriverFloor));
+    CHECK_EQ(std::wstring(L"616.64"), FormatNvidiaDriverVersion(kNeuralDriverRecommended));
+}
+
+void neural_addon_policy_test()
+{
+    for (const GpuGeneration rtx : {GpuGeneration::Rtx20Turing, GpuGeneration::Rtx30Ampere,
+                                    GpuGeneration::Rtx40Ada, GpuGeneration::Rtx50Blackwell,
+                                    GpuGeneration::OtherRtx}) {
+        CHECK(NeuralAddonDesired(rtx, false));
+        CHECK(!NeuralAddonDesired(rtx, true));
+    }
+    CHECK(!NeuralAddonDesired(GpuGeneration::OtherNvidia, false));
+    CHECK(!NeuralAddonDesired(GpuGeneration::Unsupported, false));
+    CHECK_EQ(std::string_view("rtx20"), GpuGenerationPathName(GpuGeneration::Rtx20Turing));
+    CHECK_EQ(std::string_view("rtx30"), GpuGenerationPathName(GpuGeneration::Rtx30Ampere));
+    CHECK_EQ(std::string_view("rtx40"), GpuGenerationPathName(GpuGeneration::Rtx40Ada));
+    CHECK_EQ(std::string_view("rtx50"), GpuGenerationPathName(GpuGeneration::Rtx50Blackwell));
+    CHECK_EQ(std::string_view("rtx"), GpuGenerationPathName(GpuGeneration::OtherRtx));
+    CHECK_EQ(std::string_view("unsupported"), GpuGenerationPathName(GpuGeneration::OtherNvidia));
+}
+
+// H2's regression gate, written as the machines this project has actually
+// seen: each adapter string paired with the driver DXGI reported on it. The
+// generation only picks cache identity and the pace prior, so the #9 Ampere
+// laptop is wanted exactly as much as the 5090 and the driver floor is the
+// axis that refuses it. The GTX row is the other half of the same rule - the
+// newest driver in the table grants nothing to a part with no tensor cores.
+void neural_addon_is_gated_by_the_driver_floor_not_by_the_generation_test()
+{
+    struct Machine {
+        uint32_t vendorId;
+        std::wstring_view description;
+        std::wstring_view driver;
+        GpuGeneration generation;
+        bool addonDesired;
+        NeuralDriverSupport driverSupport;
+    };
+
+    constexpr Machine machines[] = {
+        // Issue #9, in the shape Windows reports a mobile part.
+        {0x10DE, L"NVIDIA GeForce RTX 3070 Ti Laptop GPU", L"32.0.15.6614",
+         GpuGeneration::Rtx30Ampere, true, NeuralDriverSupport::BelowFloor},
+        // The oldest supported generation on the newest driver: age refuses nothing.
+        {0x10DE, L"NVIDIA GeForce RTX 2080 Ti", L"32.0.16.1664",
+         GpuGeneration::Rtx20Turing, true, NeuralDriverSupport::Supported},
+        {0x10DE, L"NVIDIA GeForce RTX 4080 SUPER", L"32.0.16.1047",
+         GpuGeneration::Rtx40Ada, true, NeuralDriverSupport::Supported},
+        {0x10DE, L"NVIDIA RTX PRO 6000 Blackwell", L"32.0.16.1664",
+         GpuGeneration::OtherRtx, true, NeuralDriverSupport::Supported},
+        {0x10DE, L"NVIDIA GeForce GTX 1660 SUPER", L"32.0.16.1664",
+         GpuGeneration::OtherNvidia, false, NeuralDriverSupport::Supported},
+        {0x8086, L"Intel(R) UHD Graphics 770", L"",
+         GpuGeneration::Unsupported, false, NeuralDriverSupport::Unknown},
+    };
+
+    for (const Machine& machine : machines) {
+        const GpuGeneration generation = ClassifyGpu(machine.vendorId, machine.description);
+        CHECK_EQ(machine.generation, generation);
+        CHECK_EQ(machine.addonDesired, NeuralAddonDesired(generation, false));
+        CHECK_EQ(machine.driverSupport, ClassifyNeuralDriver(machine.driver));
+    }
+}
+
+// A zero prior is a missing measurement, not a verdict that the card cannot
+// render. Downstream the two would be indistinguishable if the forecast ever
+// spoke from a guess: a shrunk start cushion would be a measurement the user
+// never made, and a refusal would turn "nobody has timed this generation" into
+// "unsupported". So the untimed generations must keep the full cushion while
+// the timed ones move it.
+void render_pace_prior_zero_means_unmeasured_not_unsupported_test()
+{
+    // The numbers themselves move as the field matrix fills in; that these
+    // two generations have one at all, and the others do not, is the contract.
+    for (const GpuGeneration timed : {GpuGeneration::Rtx40Ada, GpuGeneration::Rtx50Blackwell})
+        CHECK(RenderPacePrior(timed) > 0.0);
+    for (const GpuGeneration untimed : {GpuGeneration::Rtx20Turing, GpuGeneration::Rtx30Ampere,
+                                        GpuGeneration::OtherRtx, GpuGeneration::OtherNvidia,
+                                        GpuGeneration::Unsupported})
+        CHECK_EQ(0.0, RenderPacePrior(untimed));
+
+    // Same clip, same session, same empty profile: only the prior differs.
+    for (const GpuGeneration untimed : {GpuGeneration::Rtx20Turing, GpuGeneration::Rtx30Ampere,
+                                        GpuGeneration::OtherRtx}) {
+        CHECK(NeuralAddonDesired(untimed, false));
+        const auto forecast =
+            playback_timing::ForecastLiveRender(1920, 1080, 30.0, {}, RenderPacePrior(untimed));
+        CHECK(!forecast.measured);
+        CHECK(forecast.keepsUp);
+        CHECK_EQ(0.0, forecast.realtimeRatio);
+        CHECK_EQ(live_session::kStartLead, live_session::StartLead(forecast.realtimeRatio));
+    }
+    for (const GpuGeneration timed : {GpuGeneration::Rtx40Ada, GpuGeneration::Rtx50Blackwell}) {
+        const auto forecast =
+            playback_timing::ForecastLiveRender(1920, 1080, 30.0, {}, RenderPacePrior(timed));
+        CHECK(forecast.measured);
+        CHECK(forecast.realtimeRatio > 1.5);
+        CHECK(live_session::StartLead(forecast.realtimeRatio) < live_session::kStartLead);
+    }
+}
+
+// A render slower than real time DRAINS the buffer while playback runs, so no
+// fixed cushion prevents a rebuffer - it only sets how often one happens. The
+// case is a frame-generated source: 2560x1440 at 119.88 fps measured 0.814x
+// real time on an RTX 5090, where the two-second resume bought about eleven
+// seconds of playback before the next stall. That is the "plays a few seconds
+// then pauses" report.
+void live_session_sizes_the_cushion_from_the_render_drain_test()
+{
+    using namespace live_session;
+    // At or above real time the buffer refills faster than playback drains it,
+    // so the cushion only ever shrinks - the behaviour these arms always had.
+    CHECK_EQ(kStartLead, StartLead(0.0));
+    CHECK_EQ(kStartLead, StartLead(1.0));
+    CHECK_EQ(kResumeLead, ResumeLead(1.0));
+    CHECK_EQ(kResumeLead, ResumeLead(2.0));
+    CHECK(StartLead(1.6) < kStartLead);
+    CHECK(StartLead(3.5) < StartLead(1.6));
+
+    // Below it, both cushions grow, and the resume one is the one that matters:
+    // the first attach happens once, a rebuffer repeats.
+    const double measured = 0.814;
+    const double lead = SustainedLead(measured);
+    CHECK(lead > kStartLead);
+    CHECK_EQ(lead, StartLead(measured));
+    CHECK_EQ(lead, ResumeLead(measured));
+    // It buys a sustained run rather than a round number: the drain is
+    // (1 - ratio) per second, so this is what covers kSustainSeconds of play.
+    CHECK(std::abs(lead - (1.0 - measured) * kSustainSeconds) < 0.01);
+    // And the fill that buys it stays inside the wait budget.
+    CHECK(lead / measured <= kMaxRefillWaitSeconds + 0.01);
+
+    // A render at half speed cannot have both, so the wait budget wins and the
+    // run is shorter rather than the panel being up for a minute.
+    const double halfSpeed = SustainedLead(0.5);
+    CHECK(std::abs(halfSpeed - kMaxRefillWaitSeconds * 0.5) < 0.01);
+    CHECK(halfSpeed / 0.5 <= kMaxRefillWaitSeconds + 0.01);
+
+    // Barely below real time needs almost nothing, and never less than the
+    // cushion a card that keeps up exactly gets.
+    CHECK_EQ(kStartLead, SustainedLead(0.99));
+    CHECK(SustainedLead(0.2) <= kMaxLead);
+    // Monotone: the slower the render, the bigger the cushion, up to the cap.
+    CHECK(SustainedLead(0.9) <= SustainedLead(0.8));
+    CHECK(SustainedLead(0.8) <= SustainedLead(0.7));
+
+    // The decisions that read them move with it.
+    SessionView view{};
+    view.headSec = 6.0;
+    view.attached = false;
+    CHECK(ShouldAttach(view, StartLead(2.0)));    // fast GPU: 6 s is plenty
+    CHECK(!ShouldAttach(view, StartLead(0.814))); // slow: 6 s is not the cushion
+    view.attached = true;
+    CHECK(ShouldResume(view, ResumeLead(2.0)));
+    CHECK(!ShouldResume(view, ResumeLead(0.814)));
+    // A finished job never grows again, so it resumes on whatever it has.
+    view.finished = true;
+    CHECK(ShouldResume(view, ResumeLead(0.814)));
+}
+
+// Ada's prior is one scalar that has to serve every geometry, and the driven
+// player sessions of docs/VERIFICATION-matrix.md measured what it is actually
+// standing in for on an RTX 4080 SUPER (driver 610.47, eight 1080p sessions and
+// two at 2160p, idle GPU, segment-arrival method):
+//   1920x1080  11.25-11.57 ms/frame  0.897-0.923x the reference model
+//   3840x2160  38.69-41.20 ms/frame  1.377-1.467x
+// So the one scalar is bracketed by measurement, and 1.22 sits inside the
+// bracket. That is the whole reason it was not replaced by the 1080p figure:
+// the two decisions below are the ones the user sees, and each end of the
+// bracket gets one of them wrong.
+//
+// Lowering the prior towards the measured 1080p scale makes the forecast
+// promise 4K30 - it would predict 25.6 ms against a measured 38.7-41.2 - and a
+// session started on that promise renders at 25 fps against a 30 fps playhead.
+// Raising it to the measured 4K scale makes the forecast refuse 1080p60, which
+// this machine runs at 1.45x realtime. This test pins both, so a future
+// "update the prior to the measurement" cannot quietly flip either.
+void ada_render_pace_prior_forecasts_both_ends_of_the_measured_bracket_test()
+{
+    const double ada = RenderPacePrior(GpuGeneration::Rtx40Ada);
+
+    // 4K30 must ask before it starts: the measured cost does not keep up.
+    const auto uhd30 = playback_timing::ForecastLiveRender(3840, 2160, 30.0, {}, ada);
+    CHECK(uhd30.measured);
+    CHECK(!uhd30.keepsUp);
+    // 1080p60 must not ask: the measured cost keeps up with room to spare.
+    const auto fhd60 = playback_timing::ForecastLiveRender(1920, 1080, 60.0, {}, ada);
+    CHECK(fhd60.measured);
+    CHECK(fhd60.keepsUp);
+
+    // The same two verdicts from the measurements themselves, so the prior is
+    // checked against the machine rather than against another constant. The
+    // slowest 1080p and fastest 4K samples are used: they are the samples that
+    // come closest to overturning each verdict.
+    playback_timing::RenderPaceProfile measured1080p;
+    measured1080p.Record({1920, 1080, 11.5734});
+    CHECK(playback_timing::ForecastLiveRender(1920, 1080, 60.0, measured1080p, ada).keepsUp);
+    playback_timing::RenderPaceProfile measured2160p;
+    measured2160p.Record({3840, 2160, 38.6853});
+    CHECK(!playback_timing::ForecastLiveRender(3840, 2160, 30.0, measured2160p, ada).keepsUp);
+
+    // One measured geometry must not be extrapolated optimistically to
+    // another: a profile holding only the 1080p sample still has to predict a
+    // 4K frame at no less than the 1080p cost per pixel, which is what kept a
+    // one-sample profile from starting a 4K session it could not follow.
+    const double uhdFrom1080p = playback_timing::PredictRenderMs(measured1080p, 3840, 2160, ada);
+    CHECK(uhdFrom1080p > 4.0 * 11.5734 * 0.99);
+    CHECK(!playback_timing::ForecastLiveRender(3840, 2160, 30.0, measured1080p, ada).keepsUp);
+}
+
+// The panel is half of every answer here, which is what separates this policy
+// from "double anything under 45 fps". Each row below is a case where a
+// source-only rule and this one disagree, or where a plausible refactor would
+// start generating frames that land worse on the display than the source's own
+// rate does - or would refuse frames that land better, which is the mistake
+// this suite was written around and now records.
+//
+// Every row is planned against frame_rate_policy::kPhaseVerifiedMultiFrameCount
+// rather than a literal cap. That constant is a measurement of where the
+// generated frames actually land - it has already moved once, from one
+// generated frame to five, when the phase probe was changed from a flat white
+// box (no interior detail to localise, so the generated frame measures as a
+// blend near the midpoint) to a textured patch - so the suite has to follow it
+// instead of restating today's value. Where a case is about the RUNTIME
+// bounding the plan, DLSSG.MultiFrameCountMax is passed explicitly, because
+// there the argument is the point.
+void frame_generation_plan_follows_the_panel_not_just_the_source_test()
+{
+    using namespace frame_rate_policy;
+    const auto plan = [](double fps, double refresh,
+                         uint32_t max = kPhaseVerifiedMultiFrameCount,
+                         bool evenOnly = false) {
+        return PlanFrameGeneration(SourceCadence{fps, false, true}, refresh, max, evenOnly);
+    };
+
+    // 24 fps film on a 120 Hz panel: 5x lands exactly on the refresh, every
+    // frame is scanned out once and the 3:2 pulldown disappears. This is the
+    // largest win the policy has and the reason the ceiling matters: while the
+    // phase-verified count was one generated frame, this case planned nothing
+    // at all and the viewer kept the pulldown. 6x, which the runtime would also
+    // admit, overshoots the panel at 144 and is correctly passed over - the cap
+    // is not the target, the refresh is.
+    const auto film120 = plan(24.0, 120.0);
+    CHECK(film120.Generates());
+    CHECK_EQ(5u, film120.multiplier);
+    CHECK_EQ(4u, film120.generatedPerSource);
+    CHECK_EQ(120.0, film120.targetFps);
+    CHECK_EQ(1u, film120.presentsPerFrame);
+    CHECK(film120.cadence.even);
+
+    // The same source on a 60 Hz panel DOUBLES, where it used to be refused
+    // for the claim that generating there "would trade one uneven cadence for
+    // another". These two spreads are the measurement that refutes it: 24 fps
+    // is held 2 or 3 scan-outs (33/50 ms, 3:2 pulldown) and 48 fps is held 1 or
+    // 2 (17/33 ms), so the unevenness is one refresh period in BOTH cases -
+    // that is all it can ever be - while the step between presented frames
+    // halves. Refusing cost the viewer that halving and bought nothing.
+    const auto film60 = plan(24.0, 60.0);
+    CHECK(film60.Generates());
+    CHECK_EQ(2u, film60.multiplier);
+    CHECK_EQ(48.0, film60.targetFps);
+    CHECK(!film60.cadence.even);
+    CHECK_EQ(film60.sourceCadence.spreadMs, film60.cadence.spreadMs);
+    CHECK(film60.cadence.stepMs < film60.sourceCadence.stepMs * 0.51);
+    CHECK_EQ(2u, film60.sourceCadence.shortHold);
+    CHECK_EQ(3u, film60.sourceCadence.longHold);
+    CHECK_EQ(1u, film60.cadence.shortHold);
+    CHECK_EQ(2u, film60.cadence.longHold);
+
+    // The even-cadence-only setting restores the old behaviour for exactly
+    // that case, and names itself: it is the one refusal here a user can lift.
+    CHECK(!plan(24.0, 60.0, kPhaseVerifiedMultiFrameCount, true).Generates());
+    CHECK(plan(24.0, 60.0, kPhaseVerifiedMultiFrameCount, true).refusal ==
+          FrameGenerationRefusal::EvenCadenceRequired);
+    // And it cannot change a case that already lands evenly: 30 -> 60 on 60 Hz
+    // is one scan-out per frame with the setting on or off.
+    CHECK_EQ(2u, plan(30.0, 60.0, kPhaseVerifiedMultiFrameCount, true).multiplier);
+
+    // 30 fps on 120 Hz: 4x reaches the refresh exactly. 5x and 6x overshoot.
+    const auto thirty120 = plan(30.0, 120.0);
+    CHECK_EQ(4u, thirty120.multiplier);
+    CHECK_EQ(3u, thirty120.generatedPerSource);
+    CHECK_EQ(120.0, thirty120.targetFps);
+    CHECK_EQ(1u, thirty120.presentsPerFrame);
+    CHECK(thirty120.sourceCadence.even);
+    CHECK(thirty120.cadence.even);
+
+    // The other side of the admission rule, and the one a "more frames is
+    // always better" refactor breaks: this source ALREADY lands evenly - 4
+    // scan-outs per frame, zero spread - so a multiple that does not divide the
+    // refresh must lose even though it is the higher rate. A runtime admitting
+    // two generated frames could reach 90 fps here (8/17 ms holds, a fresh
+    // unevenness where there was none); it takes 60 instead.
+    const auto thirty120Capped = plan(30.0, 120.0, 2);
+    CHECK_EQ(2u, thirty120Capped.multiplier);
+    CHECK_EQ(60.0, thirty120Capped.targetFps);
+    CHECK(thirty120Capped.cadence.even);
+    CHECK_EQ(0.0, thirty120Capped.cadence.spreadMs);
+
+    // 30 -> 60 on a 60 Hz panel: the doubling case, one scan-out per frame.
+    const auto thirty60 = plan(30.0, 60.0);
+    CHECK_EQ(2u, thirty60.multiplier);
+    CHECK_EQ(1u, thirty60.generatedPerSource);
+    CHECK_EQ(60.0, thirty60.targetFps);
+    CHECK_EQ(1u, thirty60.presentsPerFrame);
+
+    // 60 -> 120 on a 120 Hz panel is the same shape one octave up.
+    const auto sixty120 = plan(60.0, 120.0);
+    CHECK_EQ(2u, sixty120.multiplier);
+    CHECK_EQ(120.0, sixty120.targetFps);
+    CHECK_EQ(1u, sixty120.presentsPerFrame);
+
+    // 60 on a 60 Hz panel names the reason a viewer can act on (get a faster
+    // panel) rather than a cadence argument, which would be true and useless.
+    CHECK(!plan(60.0, 60.0).Generates());
+    CHECK(plan(60.0, 60.0).refusal == FrameGenerationRefusal::SourceMeetsRefresh);
+
+    // The NTSC family against a refresh Windows reports as a whole number:
+    // 24000/1001 x 5 is 119.88 against a mode called 120, which is inside
+    // kRateTolerance (0.005, and 120/119.88 is 1.001 of a scan-out) and must
+    // not be read as uneven. The plan carries the source's own rate times the
+    // multiplier, not a rounded 120 - the conversion is driven at this rate and
+    // a rounded one would drift against the audio.
+    const double ntsc = 24000.0 / 1001.0;
+    const auto ntsc120 = plan(ntsc, 120.0);
+    CHECK_EQ(5u, ntsc120.multiplier);
+    CHECK_EQ(ntsc * 5.0, ntsc120.targetFps);
+    CHECK(ntsc120.targetFps < 120.0);
+    CHECK(120.0 - ntsc120.targetFps < 120.0 * kRateTolerance);
+    CHECK_EQ(1u, ntsc120.presentsPerFrame);
+    CHECK(ntsc120.cadence.even);
+
+    // A runtime that admits fewer frames than the phase measurement verified
+    // bounds the plan: the player takes min(runtime max, phase-verified max).
+    // A machine reporting one generated frame loses the 24 -> 120 case, and
+    // this is the trade the policy still refuses - the source lands evenly at 5
+    // scan-outs and 2x = 48 does not divide 120, so generating would introduce
+    // an unevenness the viewer does not have. It says which one it is.
+    CHECK(!plan(24.0, 120.0, 1).Generates());
+    CHECK(plan(24.0, 120.0, 1).refusal == FrameGenerationRefusal::SourceCadenceEven);
+    // The doubling case survives that same runtime, because it only ever needed
+    // one generated frame.
+    CHECK_EQ(2u, plan(30.0, 60.0, 1).multiplier);
+    // And a runtime that admits nothing is a refusal with a reason, not a
+    // silent 1x that looks like a policy decision.
+    CHECK(plan(30.0, 60.0, 0).refusal == FrameGenerationRefusal::RuntimeRefused);
+
+    // PAL on 60 Hz: no multiple of 25 divides 60, and it doubles anyway. 25 fps
+    // is held 2 or 3 scan-outs, 50 fps is held 1 or 2, and the step goes from
+    // 40 ms to 20 ms for the same one-period spread.
+    const auto pal60 = plan(25.0, 60.0);
+    CHECK_EQ(2u, pal60.multiplier);
+    CHECK_EQ(50.0, pal60.targetFps);
+    CHECK(!pal60.cadence.even);
+    CHECK_EQ(pal60.sourceCadence.spreadMs, pal60.cadence.spreadMs);
+
+    // 144 Hz divides neither 60 nor 30, which is not a reason to leave the
+    // source where it is: 60 -> 120 and 30 -> 120 land in the same grid 60 and
+    // 30 already land in on this panel, two and four times as often.
+    const auto sixty144 = plan(60.0, 144.0);
+    CHECK_EQ(2u, sixty144.multiplier);
+    CHECK_EQ(120.0, sixty144.targetFps);
+    CHECK(!sixty144.cadence.even);
+    CHECK_EQ(sixty144.sourceCadence.spreadMs, sixty144.cadence.spreadMs);
+    CHECK_EQ(4u, plan(30.0, 144.0).multiplier);
+    CHECK_EQ(120.0, plan(30.0, 144.0).targetFps);
+
+    // A panel that cannot even double the source says so. 40 fps needs 80 and
+    // this panel scans out 60, so no multiple exists at all - a different fact
+    // from "no multiple divides the refresh", which is what it used to report.
+    CHECK(!plan(40.0, 60.0).Generates());
+    CHECK(plan(40.0, 60.0).refusal == FrameGenerationRefusal::RefreshBelowDouble);
+
+    // A panel well above the source: the target does not have to reach the
+    // refresh. Whatever multiple the search settles on for 30 fps on 240 Hz,
+    // targetFps is the source rate times that multiple and each generated frame
+    // occupies a whole number of scan-outs, because the source does too.
+    const auto thirty240 = plan(30.0, 240.0);
+    CHECK(thirty240.Generates());
+    CHECK_EQ(30.0 * double(thirty240.multiplier), thirty240.targetFps);
+    CHECK_EQ(240.0, thirty240.targetFps * double(thirty240.presentsPerFrame));
+    CHECK(thirty240.cadence.even);
+
+    // Sources with nothing to interpolate, each naming itself and generating
+    // nothing: the refusal is the answer the status line shows.
+    const auto still = PlanFrameGeneration(SourceCadence{0.0, true, true}, 60.0,
+                                           kPhaseVerifiedMultiFrameCount);
+    CHECK(still.refusal == FrameGenerationRefusal::StillImage);
+    CHECK(!still.Generates());
+    CHECK_EQ(0u, still.generatedPerSource);
+    const auto unknownRate = PlanFrameGeneration(SourceCadence{0.0, false, true}, 60.0,
+                                                 kPhaseVerifiedMultiFrameCount);
+    CHECK(unknownRate.refusal == FrameGenerationRefusal::UnknownSourceRate);
+    CHECK(!unknownRate.Generates());
+    CHECK_EQ(0u, unknownRate.generatedPerSource);
+    const auto variable = PlanFrameGeneration(SourceCadence{30.0, false, false}, 60.0,
+                                              kPhaseVerifiedMultiFrameCount);
+    CHECK(variable.refusal == FrameGenerationRefusal::VariableFrameRate);
+    CHECK(!variable.Generates());
+    CHECK_EQ(0u, variable.generatedPerSource);
+    const auto unknownRefresh = plan(30.0, 0.0);
+    CHECK(unknownRefresh.refusal == FrameGenerationRefusal::UnknownRefresh);
+    CHECK(!unknownRefresh.Generates());
+    CHECK_EQ(0u, unknownRefresh.generatedPerSource);
+
+    CHECK(FrameGenerationRefusalName(FrameGenerationRefusal::RefreshBelowDouble) ==
+          "refresh-below-double");
+    CHECK(FrameGenerationRefusalName(FrameGenerationRefusal::SourceCadenceEven) ==
+          "source-cadence-even");
+    CHECK(FrameGenerationRefusalName(FrameGenerationRefusal::EvenCadenceRequired) ==
+          "even-cadence-required");
+}
+
+// The two terms the policy trades, measured on their own. The equality below is
+// the whole reason 24 fps doubles on a 60 Hz panel: a presentation grid is
+// uneven by one refresh period or not at all, because a frame can only be held
+// for floor or ceil of refresh/rate scan-outs. A higher rate therefore cannot
+// be "more uneven" than a lower one on the same display, only finer-stepped.
+void display_cadence_spread_is_one_refresh_period_or_nothing_test()
+{
+    using namespace frame_rate_policy;
+    const auto film = CadenceOf(24.0, 60.0);
+    CHECK(!film.even);
+    CHECK_EQ(2u, film.shortHold);
+    CHECK_EQ(3u, film.longHold);
+    CHECK(std::abs(film.spreadMs - 1000.0 / 60.0) < 1e-9);
+    CHECK(std::abs(film.stepMs - 1000.0 / 24.0) < 1e-9);
+
+    const auto doubled = CadenceOf(48.0, 60.0);
+    CHECK(!doubled.even);
+    CHECK_EQ(1u, doubled.shortHold);
+    CHECK_EQ(2u, doubled.longHold);
+    CHECK_EQ(film.spreadMs, doubled.spreadMs);
+    CHECK(doubled.stepMs < film.stepMs);
+
+    // Even is even at any hold length, and carries no spread at all.
+    const auto even = CadenceOf(30.0, 120.0);
+    CHECK(even.even);
+    CHECK_EQ(4u, even.shortHold);
+    CHECK_EQ(4u, even.longHold);
+    CHECK_EQ(0.0, even.spreadMs);
+
+    // NTSC against a mode Windows calls 120: inside kRateTolerance, so this is
+    // one scan-out per frame rather than a 1.001-wide unevenness.
+    const auto ntsc = CadenceOf(24000.0 / 1001.0 * 5.0, 120.0);
+    CHECK(ntsc.even);
+    CHECK_EQ(1u, ntsc.shortHold);
+    CHECK_EQ(0.0, ntsc.spreadMs);
+
+    // Nothing to measure is not an even cadence.
+    CHECK(!CadenceOf(0.0, 120.0).even);
+    CHECK(!CadenceOf(24.0, 0.0).even);
+}
+
+// The display-side answer. Every refusal above is about a grid the player does
+// not own - but the monitor usually offers another one, and switching to it is
+// the only move that removes an unevenness instead of reducing it.
+void refresh_switch_offer_names_the_mode_that_removes_the_pulldown_test()
+{
+    using namespace frame_rate_policy;
+    const SourceCadence film{24.0, false, true};
+    const double modes[] = {60.0, 120.0, 144.0};
+
+    // On 60 Hz the film doubles to 48 and keeps its pulldown; the same
+    // monitor's 120 Hz mode takes it to 120 exactly at 5x. 144 Hz is in the
+    // list and loses: it only reaches 72 evenly.
+    const auto from60 = BetterRefreshForSource(film, modes, 60.0, kPhaseVerifiedMultiFrameCount);
+    CHECK(from60.Offered());
+    CHECK_EQ(120.0, from60.refreshHz);
+    CHECK_EQ(5u, from60.multiplier);
+    CHECK_EQ(120.0, from60.targetFps);
+
+    // Already on the best mode: nothing to offer, and the player must not nag.
+    CHECK(!BetterRefreshForSource(film, modes, 120.0, kPhaseVerifiedMultiFrameCount).Offered());
+
+    // The offer survives the even-cadence-only setting, because switching the
+    // display is precisely how that setting gets what it asks for.
+    CHECK(BetterRefreshForSource(film, modes, 60.0, kPhaseVerifiedMultiFrameCount, true).Offered());
+
+    // The other case a mode change fixes: a source that meets its panel
+    // generates nothing at all on 60 Hz, and doubles on 120.
+    const SourceCadence sixty{60.0, false, true};
+    const auto faster = BetterRefreshForSource(sixty, modes, 60.0, kPhaseVerifiedMultiFrameCount);
+    CHECK(faster.Offered());
+    CHECK_EQ(120.0, faster.refreshHz);
+    CHECK_EQ(2u, faster.multiplier);
+    CHECK_EQ(120.0, faster.targetFps);
+
+    // A tie in presented rate goes to the lower refresh: 30 fps reaches 120
+    // evenly on a 120 Hz mode and on a 240 Hz one, and 120 asks less of the
+    // panel for the same result.
+    const SourceCadence thirty{30.0, false, true};
+    const double highModes[] = {60.0, 120.0, 240.0};
+    const auto tie = BetterRefreshForSource(thirty, highModes, 60.0, kPhaseVerifiedMultiFrameCount);
+    CHECK_EQ(120.0, tie.refreshHz);
+    CHECK_EQ(120.0, tie.targetFps);
+
+    // No alternative mode is not an offer, and neither is a list holding only
+    // the mode the display is already in.
+    CHECK(!BetterRefreshForSource(film, {}, 60.0, kPhaseVerifiedMultiFrameCount).Offered());
+    const double only60[] = {60.0};
+    CHECK(!BetterRefreshForSource(film, only60, 60.0, kPhaseVerifiedMultiFrameCount).Offered());
+
+    // A runtime that admits nothing has no offer to make either: the mode
+    // change would not buy a conversion.
+    CHECK(!BetterRefreshForSource(film, modes, 60.0, 0).Offered());
+}
+
+// The ceiling above is a measurement, and measurements move: it was one
+// generated frame while the phase probe was a featureless box and is five now
+// that a textured probe localised the generated frames inside the source
+// interval. So one case pins the RELATIONSHIP instead of the number. A source
+// running at refresh/m is exactly the case m-times generation exists for - it
+// lands on the refresh with one scan-out per frame - so every multiplier the
+// constant admits has to be reachable, and nothing beyond it may be.
+// Issue #14's follow-up: an RTX 3060 whose runtime admits 3 generated frames
+// offered 5x in the menu and quietly converted at 4x. Once the runtime has been
+// measured, the menu greys what it will not admit and the confirmation says
+// when the setting was lowered; before that, nothing is greyed on a guess.
+void frame_generation_menu_follows_the_measured_runtime_cap_test()
+{
+    using frame_rate_policy::GeneratedFramesAdmitted;
+    using frame_rate_policy::RuntimeLoweredPreference;
+    for (uint32_t generated = 1; generated <= 4; ++generated)
+        CHECK(GeneratedFramesAdmitted(generated, std::nullopt));
+    CHECK(GeneratedFramesAdmitted(1, 3u));
+    CHECK(GeneratedFramesAdmitted(3, 3u));
+    CHECK(!GeneratedFramesAdmitted(4, 3u));
+    CHECK(GeneratedFramesAdmitted(1, 1u));
+    CHECK(!GeneratedFramesAdmitted(2, 1u));
+
+    CHECK(!RuntimeLoweredPreference(4, std::nullopt));
+    CHECK(!RuntimeLoweredPreference(3, 3u));
+    CHECK(!RuntimeLoweredPreference(0, 3u));   // "as many as the display allows" asks for no number
+    REQUIRE(RuntimeLoweredPreference(4, 3u).has_value());
+    CHECK_EQ(3u, *RuntimeLoweredPreference(4, 3u));
+    const Localizer localizer;
+    for (const wchar_t* key : {L"menu.framegen_beyond_gpu", L"framegen.confirm.lowered", L"framegen.confirm.lowered.addon"}) {
+        const std::wstring text = localizer.Get(key);
+        CHECK(!text.empty() && text != key);
+    }
+}
+
+void frame_generation_reaches_every_multiplier_the_verified_ceiling_admits_test()
+{
+    using namespace frame_rate_policy;
+    // 120 Hz is used because it is a real mode that every multiplier from 2
+    // upwards divides into a plausible source rate (60, 40, 30, 24, 20).
+    constexpr double kRefresh = 120.0;
+    for (uint32_t multiplier = 2; multiplier <= kPhaseVerifiedMultiFrameCount + 1; ++multiplier) {
+        const double fps = kRefresh / double(multiplier);
+        const auto planned = PlanFrameGeneration(SourceCadence{fps, false, true}, kRefresh,
+                                                 kPhaseVerifiedMultiFrameCount);
+        CHECK(planned.refusal == FrameGenerationRefusal::None);
+        CHECK_EQ(multiplier, planned.multiplier);
+        CHECK_EQ(multiplier - 1u, planned.generatedPerSource);
+        CHECK_EQ(1u, planned.presentsPerFrame);
+        CHECK(std::abs(planned.targetFps - kRefresh) <= kRefresh * kRateTolerance);
+    }
+
+    // And the ceiling is a ceiling. The source that would need one multiple
+    // more than the constant admits must not get it: either the search finds a
+    // smaller admissible multiple that still divides the refresh, or it
+    // refuses, but the multiplier never exceeds the verified count plus the
+    // source frame itself, and the target never overshoots the panel.
+    const double beyond = kRefresh / double(kPhaseVerifiedMultiFrameCount + 2);
+    const auto bounded = PlanFrameGeneration(SourceCadence{beyond, false, true}, kRefresh,
+                                             kPhaseVerifiedMultiFrameCount);
+    CHECK(bounded.multiplier <= kPhaseVerifiedMultiFrameCount + 1);
+    CHECK(bounded.targetFps <= kRefresh * (1.0 + kRateTolerance));
+}
+
+void neural_prerender_defaults_prefer_1080p_and_preserve_explicit_output_test()
+{
+    const auto experimental = ResolveNeuralRenderDefaults(true, false, 3840, 2160);
+    CHECK_EQ(uint32_t{1920}, experimental.width);
+    CHECK_EQ(uint32_t{1080}, experimental.height);
+
+    const auto explicitOutput = ResolveNeuralRenderDefaults(true, true, 2560, 1440);
+    CHECK_EQ(uint32_t{2560}, explicitOutput.width);
+    CHECK_EQ(uint32_t{1440}, explicitOutput.height);
+
+    const auto nativeOnly = ResolveNeuralRenderDefaults(false, false, 3840, 2160);
+    CHECK_EQ(uint32_t{3840}, nativeOnly.width);
+    CHECK_EQ(uint32_t{2160}, nativeOnly.height);
+}
+
+void neural_playback_lifecycle_accepts_its_generation_and_reaches_ready_test()
+{
+    NeuralPlaybackLifecycle lifecycle;const uint64_t generation=lifecycle.Begin();
+    CHECK(lifecycle.Accept(generation));CHECK(lifecycle.Transition(NeuralPlaybackState::Ready));
+}
+
+void neural_playback_lifecycle_runs_render_validate_then_ready_test()
+{
+    NeuralPlaybackLifecycle lifecycle;lifecycle.Begin();
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Rendering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Validating));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Ready));
+}
+
+void neural_completion_publishes_only_after_probe_and_manifest_validation_test()
+{
+    CHECK(CanPublishNeuralCompletion(true,true,true));
+    CHECK(!CanPublishNeuralCompletion(false,true,true));
+    CHECK(!CanPublishNeuralCompletion(true,false,true));
+    CHECK(!CanPublishNeuralCompletion(true,true,false));
+}
+
+void neural_publish_tolerance_admits_one_muxer_rounding_per_joined_segment_test()
+{
+    // The refused session: 2607 frames of 30 fps video published as 44
+    // separately muxed segments and then joined, so the joined file may sit
+    // one 1 ms Matroska rounding per part away from the rendered duration.
+    const int64_t rounding=10000;
+    const int64_t expected=869000000;
+    const int64_t drift=44*rounding;
+    const int64_t joined=JoinedMediaDurationTolerance100ns(30.0,44);
+    const int64_t single=JoinedMediaDurationTolerance100ns(30.0,1);
+    const bool durationsMatch=NeuralPublishDurationsMatch(expected+drift,expected,expected,joined);
+    CHECK(durationsMatch);
+    CHECK(!NeuralPublishDurationsMatch(expected+drift,expected,expected,single));
+    CHECK_EQ(joined-single,43*rounding);
+    // Drift beyond the roundings and the one allowed frame is still a defect,
+    // on whichever side it shows up.
+    CHECK(!NeuralPublishDurationsMatch(expected+joined+1,expected,expected,joined));
+    CHECK(!NeuralPublishDurationsMatch(expected,expected+joined+1,expected,joined));
+    // A lost frame is never publishable, however well the durations agree.
+    const uint64_t probeFrames=2606,resultFrames=2607;
+    CHECK(!CanPublishNeuralCompletion(true,durationsMatch&&probeFrames==resultFrames,true));
+    // An unreadable frame rate must not collapse the tolerance to nothing.
+    CHECK(JoinedMediaDurationTolerance100ns(0.0,44)>=drift);
+    CHECK(JoinedMediaDurationTolerance100ns(std::numeric_limits<double>::infinity(),0)>=rounding);
+}
+
+void render_range_residual_below_one_frame_is_coverage_not_work_test()
+{
+    // The re-toggled session: a head accumulated from integer per-frame
+    // segment ends against a range end taken from the probed source duration.
+    const double fps=30.0;
+    const int64_t head=947333000;
+    // The head sits 333 ticks below the frame that follows it, which is the
+    // whole shape of this case: everything short of that boundary is residual.
+    const int64_t next=FramePts(2842,fps);
+    CHECK_EQ(int64_t{947333333},next);
+    CHECK(RenderRangeIsCovered(head,head,fps));
+    CHECK(RenderRangeIsCovered(head,head+1,fps));
+    CHECK(RenderRangeIsCovered(head,next,fps));
+    // One tick further and the frame is inside the range. That is work however
+    // narrow the range is, and measuring a WIDTH instead is what refused it:
+    // this range is 334 ticks wide against a frame duration of 333333.
+    CHECK(!RenderRangeIsCovered(head,next+1,fps));
+    CHECK(!RenderRangeIsCovered(head,head+30*333334,fps));
+    // Without a frame rate a residual of unknown length stays work.
+    CHECK(!RenderRangeIsCovered(head,head+1,0.0));
+    CHECK(RenderRangeIsCovered(head+1,head,0.0));
+}
+
+// The hole a live session refused to render and never let go of.
+//
+// Two predicates decide whether a span of timeline is work, and until this case
+// existed nothing compared them. UncoveredSpans drops holes narrower than the
+// frame duration its caller supplies, while RenderRangeIsCovered measured the
+// same question against ceil(1e7/fps) - so a hole holding exactly one real
+// frame was a hole to the first and "shorter than one frame" to the second.
+// StartLiveRenderTarget refuses such a target, returns success and changes
+// nothing, so the very same hole is selected again on the next tick: the
+// session never renders it, never counts a failure and never reaches finished,
+// which is the flag that ends a rebuffer. A 59.94 fps source logged that
+// refusal 40850 times in six minutes with playback paused behind it and every
+// frame of the video already rendered.
+//
+// No width constant can settle it, which is why this sweeps the grid rather
+// than picking one. FramePts truncates a floating-point division, so steps run
+// floor(1e7/fps) wide wherever the truncation does not carry - and one tick
+// narrower still where the division loses a unit in the last place, which 25
+// fps does at frame 41. ceil is wrong at 59.94, floor is wrong at 25.
+// The export plan: which passes run, at what size, in what order.
+//
+// The order is not a choice the plan makes - it is NVIDIA's, and the dialog
+// offers no way to reorder it - so what is tested here is the refusals and the
+// geometry, which are the two things a user can get wrong from the dialog.
+// The DLSS menu's shape, measured against the guidance it was restructured to.
+//
+// Microsoft's menu guidelines: separators between logical groups, no more than
+// six of them, two to seven items per group. NN/g's is the reason it matters -
+// "groups of unrelated options reduce clarity, decrease findability, hinder
+// spatial memorability, and increase cognitive load". The menu this replaced
+// opened with seven items spanning three different features, and put Neural
+// Rendering's toggle six rows above its own presets and settings.
+//
+// Pinned because a menu drifts one convenient append at a time, and the append
+// that breaks it always looks harmless on its own.
+// The three feature pills must not look alike, and a pill must be able to say
+// it is busy.
+//
+// The toolbar drops to icon-only at its two narrow widths - the comment beside
+// UiIcon::FrameGeneration says so, and says why it matters: "three identical
+// sparkles hid which one starts a minutes-long conversion". That note was
+// written, acted on for frame generation, and then left Neural Rendering and
+// DLSS Upscaling both on sparkles, so two of the three stayed identical at
+// exactly the width the note was about. Asserting distinctness is cheaper than
+// noticing it twice.
+void feature_pills_are_visually_distinguishable_test()
+{
+    const wchar_t neural = GlyphForIcon(UiIcon::Sparkles);
+    const wchar_t upscaling = GlyphForIcon(UiIcon::Upscaling);
+    const wchar_t framegen = GlyphForIcon(UiIcon::FrameGeneration);
+    CHECK(neural != upscaling);
+    CHECK(neural != framegen);
+    CHECK(upscaling != framegen);
+    // And none of them may collide with another control in the same bar.
+    for (const UiIcon other : {UiIcon::Open, UiIcon::Play, UiIcon::Pause, UiIcon::Stop,
+                               UiIcon::Volume, UiIcon::VolumeOff, UiIcon::Crop,
+                               UiIcon::Adjustments, UiIcon::Debug, UiIcon::Maximize}) {
+        CHECK(GlyphForIcon(other) != neural);
+        CHECK(GlyphForIcon(other) != upscaling);
+        CHECK(GlyphForIcon(other) != framegen);
+    }
+
+    // Four states, four fills. With only enabled/active, "running a conversion"
+    // and "switched on" painted the same - and at icon-only widths the label
+    // that distinguished them is not drawn at all.
+    const ButtonVisual off = ResolveButtonVisual(ButtonState{true, false, false, false, false, false});
+    const ButtonVisual on = ResolveButtonVisual(ButtonState{true, true, false, false, false, false});
+    const ButtonVisual working = ResolveButtonVisual(ButtonState{true, false, true, false, false, false});
+    const ButtonVisual unavailable = ResolveButtonVisual(ButtonState{false, false, false, false, false, false});
+    CHECK(off.fill != on.fill);
+    CHECK(on.fill != working.fill);
+    CHECK(off.fill != working.fill);
+    CHECK(unavailable.fill != on.fill);
+    CHECK(unavailable.fill != working.fill);
+    // Working outranks on: a conversion that is running is the more urgent
+    // thing to report, and a pill can be both.
+    CHECK_EQ(working.fill, ResolveButtonVisual(ButtonState{true, true, true, false, false, false}).fill);
+    // Unavailable outranks everything, because a control you cannot press must
+    // never look like one that is doing something.
+    CHECK_EQ(unavailable.fill, ResolveButtonVisual(ButtonState{false, true, true, false, false, false}).fill);
+}
+
+void menus_group_two_to_seven_related_items_per_block_test()
+{
+    Localizer localizer;
+    const HMENU menu = app_menu::CreateMenuBar(localizer, true);
+    CHECK(menu != nullptr);
+    if (!menu) return;
+    // Every top-level menu is held to the same rule, not just the one that
+    // prompted the work. `Exit` alone behind a separator is the documented
+    // exception: it is the convention every Windows File menu follows, and a
+    // guideline that argues with a convention that strong loses.
+    for (const wchar_t* name : {L"File", L"Playback", L"Video", L"DLSS", L"Advanced"}) {
+        HMENU top = find_top_level_submenu(menu, name);
+        CHECK(top != nullptr);
+        if (!top) continue;
+        std::vector<UINT> sizes{0};
+        std::vector<UINT> lastOfGroup;
+        const int items = GetMenuItemCount(top);
+        UINT previous = 0;
+        for (int index = 0; index < items; ++index) {
+            MENUITEMINFOW entry{};
+            entry.cbSize = sizeof(entry);
+            entry.fMask = MIIM_FTYPE | MIIM_ID;
+            if (!GetMenuItemInfoW(top, UINT(index), TRUE, &entry)) continue;
+            if (entry.fType & MFT_SEPARATOR) { lastOfGroup.push_back(previous); sizes.push_back(0); continue; }
+            ++sizes.back();
+            previous = entry.wID;
+        }
+        lastOfGroup.push_back(previous);
+        CHECK(sizes.size() <= 7);   // no more than six separators
+        for (size_t group = 0; group < sizes.size(); ++group) {
+            const bool exitAlone = sizes[group] == 1 && group < lastOfGroup.size() &&
+                                   lastOfGroup[group] == app_menu::IDM_EXIT;
+            CHECK(sizes[group] >= 2 || exitAlone);
+            CHECK(sizes[group] <= 7);
+        }
+    }
+
+    HMENU dlss = find_top_level_submenu(menu, L"DLSS");
+    CHECK(dlss != nullptr);
+    if (!dlss) { DestroyMenu(menu); return; }
+
+    // Walk the DLSS top level only: what a viewer sees when the menu opens.
+    std::vector<UINT> groupSizes;
+    std::vector<std::vector<UINT>> groups;
+    groupSizes.push_back(0);
+    groups.emplace_back();
+    const int count = GetMenuItemCount(dlss);
+    for (int index = 0; index < count; ++index) {
+        MENUITEMINFOW item{};
+        item.cbSize = sizeof(item);
+        item.fMask = MIIM_FTYPE | MIIM_ID | MIIM_SUBMENU;
+        if (!GetMenuItemInfoW(dlss, UINT(index), TRUE, &item)) continue;
+        if (item.fType & MFT_SEPARATOR) { groupSizes.push_back(0); groups.emplace_back(); continue; }
+        ++groupSizes.back();
+        groups.back().push_back(item.wID);
+    }
+
+    // No more than six separators, and every group between two and seven.
+    CHECK(groupSizes.size() >= 2);
+    CHECK(groupSizes.size() <= 7);          // <= 6 separators
+    for (const UINT size : groupSizes) {
+        CHECK(size >= 2);
+        CHECK(size <= 7);
+    }
+
+    // Each feature's toggle sits in the same block as its own controls, which
+    // is the whole point of the restructure.
+    const auto blockOf = [&](UINT command) -> int {
+        for (size_t block = 0; block < groups.size(); ++block)
+            for (const UINT id : groups[block])
+                if (id == command) return int(block);
+        return -1;
+    };
+    const int neuralBlock = blockOf(app_menu::IDM_NEURAL_SETTINGS);
+    CHECK(neuralBlock >= 0);
+    CHECK_EQ(neuralBlock, blockOf(app_menu::IDM_NEURAL_RENDERING));
+    const int upscaleBlock = blockOf(app_menu::IDM_DLSS_UPSCALING);
+    CHECK(upscaleBlock >= 0);
+    CHECK(upscaleBlock != neuralBlock);
+    // Frame generation is its own block, not wedged between the other two.
+    const int framegenBlock = blockOf(app_menu::IDM_FRAME_GENERATION);
+    CHECK(framegenBlock >= 0);
+    CHECK(framegenBlock != neuralBlock);
+    CHECK(framegenBlock != upscaleBlock);
+    // Neural first, then upscaling, then generation: the order the stages run
+    // in, so the menu reads the same way the pipeline does.
+    CHECK(neuralBlock < upscaleBlock);
+    CHECK(upscaleBlock < framegenBlock);
+
+    DestroyMenu(menu);
+}
+
+void export_plan_runs_super_resolution_and_neural_as_one_pass_test()
+{
+    const auto plan = [](bool upscale, bool neural, bool framegen, uint32_t rung = 1440,
+                         uint32_t multiplier = 2, uint32_t maxMultiplier = 2,
+                         bool still = false, SuperResolutionEngine engine = SuperResolutionEngine::Dlss) {
+        ExportSelection selection;
+        selection.upscale = upscale; selection.neural = neural;
+        selection.frameGeneration = framegen;
+        selection.targetHeight = rung; selection.multiplier = multiplier;
+        selection.engine = engine;
+        return PlanExport(selection, 1280, 720, 30.0, maxMultiplier, still);
+    };
+
+    // Neural alone: one worker pass, source geometry, verdicts on.
+    const ExportPlan n = plan(false, true, false);
+    CHECK(n.valid); CHECK(n.workerStage); CHECK(n.requireNeural); CHECK(!n.frameGenStage);
+    CHECK_EQ(uint32_t{1280}, n.outputWidth); CHECK_EQ(uint32_t{720}, n.outputHeight);
+    CHECK_EQ(uint32_t{1}, ExportStageCount(n));
+
+    // DLSS Super Resolution alone: one worker pass at the target size with the
+    // neural verdicts OFF, which is what makes the helper start with the
+    // add-on disabled. It was refused while the helper enabled the add-on for
+    // every job - an upscale-only and an upscale-plus-neural export of one clip
+    // came back byte-identical at 9,548,373 bytes - and ExportMatrixSmoke now
+    // asserts the two differ.
+    const ExportPlan u = plan(true, false, false);
+    CHECK(u.valid); CHECK(u.refusal == ExportRefusal::None);
+    CHECK(u.workerStage); CHECK(!u.requireNeural); CHECK(!u.frameGenStage);
+    CHECK_EQ(uint32_t{2560}, u.outputWidth); CHECK_EQ(uint32_t{1440}, u.outputHeight);
+    CHECK_EQ(uint32_t{1}, ExportStageCount(u));
+    // And it composes with frame generation like any other first pass.
+    const ExportPlan uf = plan(true, false, true);
+    CHECK(uf.valid); CHECK(!uf.requireNeural); CHECK_EQ(uint32_t{2}, ExportStageCount(uf));
+    CHECK_EQ(60.0, uf.outputFps);
+
+    // Both: still one pass. Two would run the model at source size and upscale
+    // after, which is the Neural Upstream order rather than the reference one.
+    const ExportPlan un = plan(true, true, false);
+    CHECK(un.valid); CHECK_EQ(uint32_t{1}, ExportStageCount(un));
+    CHECK(un.requireNeural);
+    CHECK_EQ(uint32_t{2560}, un.outputWidth);
+
+    // Frame generation alone: no worker pass at all.
+    const ExportPlan f = plan(false, false, true);
+    CHECK(f.valid); CHECK(!f.workerStage); CHECK(f.frameGenStage);
+    CHECK_EQ(uint32_t{1280}, f.outputWidth);
+    CHECK_EQ(60.0, f.outputFps);
+
+    // All three: two passes, grown and doubled.
+    const ExportPlan unf = plan(true, true, true);
+    CHECK(unf.valid); CHECK_EQ(uint32_t{2}, ExportStageCount(unf));
+    CHECK_EQ(uint32_t{2560}, unf.outputWidth); CHECK_EQ(uint32_t{1440}, unf.outputHeight);
+    CHECK_EQ(60.0, unf.outputFps);
+
+    // Refusals, each naming its own cause so the dialog can say which control
+    // to change rather than "export failed".
+    CHECK(!plan(false, false, false).valid);
+    CHECK(plan(false, false, false).refusal == ExportRefusal::NothingSelected);
+    // 1080p rung on a 1440p source is not an upscale.
+    CHECK(PlanExport({true, false, false, 1080, 2}, 2560, 1440, 30.0, 2, false).refusal ==
+          ExportRefusal::AlreadyAtTarget);
+    // An Ada card admits 2x only; 3x must refuse rather than quietly write 2x.
+    CHECK(plan(false, false, true, 1440, 3, 2).refusal == ExportRefusal::MultiplierUnsupported);
+    CHECK(plan(false, false, true, 1440, 2, 0).refusal == ExportRefusal::MultiplierUnsupported);
+    CHECK(plan(false, false, true, 1440, 2, 2, /*still=*/true).refusal == ExportRefusal::StillImage);
+    CHECK(PlanExport({false, true, false}, 0, 0, 30.0, 2, false).refusal ==
+          ExportRefusal::SourceGeometryUnknown);
+    // A still image may still be upscaled and neural rendered; only generation
+    // needs a successor frame.
+    CHECK(PlanExport({true, true, false, 1440, 2}, 1280, 720, 30.0, 2, /*still=*/true).valid);
+
+    // RTX VSR is the recommended engine and the selection's default, and it is its
+    // own pass, in the player rather than the helper; DLSS stays the worker's.
+    CHECK(ExportSelection{}.engine == SuperResolutionEngine::RtxVsr);
+    const ExportPlan v = plan(true, false, false, 1440, 2, 2, false, SuperResolutionEngine::RtxVsr);
+    CHECK(v.valid); CHECK(v.vsrStage); CHECK(!v.workerStage); CHECK(!v.requireNeural);
+    CHECK_EQ(uint32_t{2560}, v.outputWidth); CHECK_EQ(uint32_t{1440}, v.outputHeight);
+    CHECK_EQ(uint32_t{1}, ExportStageCount(v));
+    CHECK(!u.vsrStage);
+    const ExportPlan vf = plan(true, false, true, 1440, 2, 2, false, SuperResolutionEngine::RtxVsr);
+    CHECK(vf.valid); CHECK(vf.vsrStage); CHECK(vf.frameGenStage); CHECK_EQ(uint32_t{2}, ExportStageCount(vf));
+    // With the model the upscale is its carrier's, DLSS's, whatever the engine says.
+    const ExportPlan vn = plan(true, true, false, 1440, 2, 2, false, SuperResolutionEngine::RtxVsr);
+    CHECK(vn.valid); CHECK(vn.workerStage); CHECK(!vn.vsrStage); CHECK_EQ(uint32_t{1}, ExportStageCount(vn));
+    // Where RTX VSR cannot run the plan says so rather than failing at the pass;
+    // a neural export does not need it.
+    {
+        ExportSelection selection; selection.upscale = true;
+        CHECK(PlanExport(selection, 1280, 720, 30.0, 2, false, /*vsrReady=*/false).refusal == ExportRefusal::VsrUnavailable);
+        selection.neural = true;
+        CHECK(PlanExport(selection, 1280, 720, 30.0, 2, false, /*vsrReady=*/false).valid);
+        selection.neural = false; selection.engine = SuperResolutionEngine::Dlss;
+        CHECK(PlanExport(selection, 1280, 720, 30.0, 2, false, /*vsrReady=*/false).valid);
+    }
+    CHECK(SuperResolutionEngineName(SuperResolutionEngine::RtxVsr) == "vsr");
+    CHECK(SuperResolutionEngineName(SuperResolutionEngine::Dlss) == "dlss");
+    CHECK(ParseSuperResolutionEngine("vsr") == std::optional<SuperResolutionEngine>(SuperResolutionEngine::RtxVsr));
+    CHECK(ParseSuperResolutionEngine("dlss") == std::optional<SuperResolutionEngine>(SuperResolutionEngine::Dlss));
+    CHECK(!ParseSuperResolutionEngine("bicubic"));
+
+    // Blackwell's higher multiples are admitted when the runtime says so.
+    const ExportPlan quad = plan(false, false, true, 1440, 4, 4);
+    CHECK(quad.valid); CHECK_EQ(uint32_t{4}, quad.multiplier); CHECK_EQ(120.0, quad.outputFps);
+}
+
+// The live keep-up forecast ignored the processing-scale rung: the first 50%
+// session was forecast at the 100% pace. A rung with no pace of its own now
+// starts from the 100% forecast scaled by what the smaller model saves, and
+// its own measurements replace that as soon as it has any.
+void live_forecast_scales_by_the_processing_rung_test()
+{
+    using namespace live_session;
+    CHECK_EQ(1.0, ProcessingScaleCostFactor(100));
+    CHECK_EQ(1.0, ProcessingScaleCostFactor(60));   // not a rung
+    // cost = 1 - share * (1 - pixelRatio), share a quarter.
+    CHECK(std::abs(ProcessingScaleCostFactor(75) - (1.0 - 0.25 * (1.0 - 0.5625))) < 1e-12);
+    CHECK(std::abs(ProcessingScaleCostFactor(50) - 0.8125) < 1e-12);
+    CHECK(ProcessingScaleCostFactor(50) < ProcessingScaleCostFactor(75));
+    // Never cheaper than the measurements in LiveSessionPolicy.h by more than
+    // 3% (1080p: 0.915 at 75%, 0.820 at 50%), and never above the 100% cost.
+    CHECK(ProcessingScaleCostFactor(75) > 0.915 * 0.97 && ProcessingScaleCostFactor(75) < 1.0);
+    CHECK(ProcessingScaleCostFactor(50) > 0.820 * 0.97 && ProcessingScaleCostFactor(50) < 1.0);
+
+    playback_timing::RenderPaceProfile source, half;
+    source.Record({1920, 1080, 36.0});   // 27.8 fps against a 30 fps source
+    // 100% is the forecast it always was.
+    const auto full = ForecastAtProcessingScale(1920, 1080, 30.0, 100, half, source, 1.0);
+    CHECK(full.measured); CHECK_EQ(36.0, full.msPerFrame); CHECK(!full.keepsUp);
+    // 50% with nothing measured at 50%: scaled, and here that is the difference
+    // between a warning and none.
+    const auto first = ForecastAtProcessingScale(1920, 1080, 30.0, 50, half, source, 1.0);
+    CHECK(first.measured);
+    CHECK(std::abs(first.msPerFrame - 36.0 * 0.8125) < 1e-9);
+    CHECK(std::abs(first.renderFps - 1000.0 / (36.0 * 0.8125)) < 1e-9);
+    CHECK(std::abs(first.realtimeRatio - first.renderFps / 30.0) < 1e-12);
+    CHECK(first.keepsUp);
+    // Its own measurement wins, at its geometry or extrapolated to another.
+    half.Record({1920, 1080, 40.0});
+    CHECK_EQ(40.0, ForecastAtProcessingScale(1920, 1080, 30.0, 50, half, source, 1.0).msPerFrame);
+    CHECK(ForecastAtProcessingScale(2560, 1440, 30.0, 50, half, source, 1.0).msPerFrame > 40.0);
+    // Unmeasured everywhere stays unmeasured: an unknown pace never blocks.
+    const auto unknown = ForecastAtProcessingScale(1920, 1080, 30.0, 50, {}, {}, 0.0);
+    CHECK(!unknown.measured); CHECK(unknown.keepsUp);
+    // The generation's prior describes 100% and reaches a rung only through it.
+    const auto prior = ForecastAtProcessingScale(1920, 1080, 30.0, 75, {}, {}, 1.0);
+    CHECK(prior.measured);
+    CHECK(std::abs(prior.msPerFrame - playback_timing::RenderPaceModel{}.MsPerFrame(1920, 1080) *
+                                      ProcessingScaleCostFactor(75)) < 1e-9);
+}
+
+// The stage export used to rename its Matroska carrier onto whatever name the
+// Save dialog returned, so "clip.mp4" was Matroska. The container now follows
+// the extension, and only the containers the output can be are offered.
+void export_container_follows_the_chosen_extension_test()
+{
+    CHECK(ExportContainerFor(L".mkv") == ExportContainer::Matroska);
+    CHECK(ExportContainerFor(L"MP4") == ExportContainer::Mp4);
+    CHECK(ExportContainerFor(L".Gif") == ExportContainer::Gif);
+    CHECK(ExportContainerFor(L".png") == ExportContainer::Png);
+    CHECK(ExportContainerFor(L".jpg") == ExportContainer::Jpeg);
+    CHECK(ExportContainerFor(L".JPEG") == ExportContainer::Jpeg);
+    CHECK(!ExportContainerFor(L".avi")); CHECK(!ExportContainerFor(L"")); CHECK(!ExportContainerFor(L".mkv2"));
+
+    // Video: MKV first (the default), MP4; no pictures, no GIF.
+    const auto video = ExportContainerChoices(false, false);
+    CHECK_EQ(size_t{2}, video.size());
+    CHECK(video.front() == ExportContainer::Matroska);
+    CHECK(ExportContainerOffered(ExportContainer::Mp4, false, false));
+    for (const auto refused : {ExportContainer::Gif, ExportContainer::Png, ExportContainer::Jpeg})
+        CHECK(!ExportContainerOffered(refused, false, false));
+    // Animation: GIF first, and the two video containers.
+    CHECK(ExportContainerChoices(false, true).front() == ExportContainer::Gif);
+    CHECK(ExportContainerOffered(ExportContainer::Matroska, false, true));
+    CHECK(!ExportContainerOffered(ExportContainer::Png, false, true));
+    // Photo: one frame, so pictures only.
+    CHECK(ExportContainerChoices(true, false).front() == ExportContainer::Png);
+    CHECK(ExportContainerOffered(ExportContainer::Jpeg, true, false));
+    CHECK(!ExportContainerOffered(ExportContainer::Matroska, true, false));
+    // Every offered container's extension names that container again.
+    for (const bool still : {false, true})
+        for (const bool animation : {false, true})
+            for (const ExportContainer container : ExportContainerChoices(still, animation))
+                CHECK(ExportContainerFor(ExportContainerExtension(container)) == container);
+
+    // The name written is always one whose extension says what it is.
+    CHECK(ExportFileName(L"C:/out/clip.mp4", 0, false, false) == L"C:/out/clip.mp4");
+    CHECK(ExportFileName(L"C:/out/clip.MKV", 1, false, false) == L"C:/out/clip.MKV");
+    CHECK(ExportFileName(L"C:/out/clip", 1, false, false) == L"C:/out/clip.mp4");
+    CHECK(ExportFileName(L"C:/out/clip.avi", 0, false, false) == L"C:/out/clip.avi.mkv");
+    // A container this source is not offered is not honoured either.
+    CHECK(ExportFileName(L"C:/out/clip.png", 0, false, false) == L"C:/out/clip.png.mkv");
+    CHECK(ExportFileName(L"C:/out/photo.jpeg", 0, true, false) == L"C:/out/photo.jpeg");
+    // A dot in a folder name is not an extension; a filter out of range is the default.
+    CHECK(ExportFileName(L"C:/out.v2/clip", 7, false, true) == L"C:/out.v2/clip.gif");
+
+    // What travels beside the video. MKV copies nearly everything, converting
+    // only the MP4 timed text it cannot hold.
+    using A = ExportStreamAction;
+    CHECK(ExportStreamActionFor(ExportContainer::Matroska, "audio", "pcm_s16le") == A::Copy);
+    CHECK(ExportStreamActionFor(ExportContainer::Matroska, "audio", "vorbis") == A::Copy);
+    CHECK(ExportStreamActionFor(ExportContainer::Matroska, "subtitle", "subrip") == A::Copy);
+    CHECK(ExportStreamActionFor(ExportContainer::Matroska, "subtitle", "hdmv_pgs_subtitle") == A::Copy);
+    CHECK(ExportStreamActionFor(ExportContainer::Matroska, "subtitle", "mov_text") == A::ToSubrip);
+    CHECK(ExportStreamActionFor(ExportContainer::Matroska, "subtitle", "eia_608") == A::Drop);
+    CHECK(ExportStreamActionFor(ExportContainer::Matroska, "attachment", "ttf") == A::Copy);
+    CHECK(ExportStreamActionFor(ExportContainer::Matroska, "data", "bin_data") == A::Drop);
+    CHECK(ExportStreamActionFor(ExportContainer::Matroska, "video", "mjpeg") == A::Drop);
+    // MP4 encodes the audio it cannot hold rather than dropping it, and has
+    // no place for picture subtitles or fonts.
+    CHECK(ExportStreamActionFor(ExportContainer::Mp4, "audio", "aac") == A::Copy);
+    CHECK(ExportStreamActionFor(ExportContainer::Mp4, "audio", "opus") == A::Copy);
+    CHECK(ExportStreamActionFor(ExportContainer::Mp4, "audio", "pcm_s16le") == A::EncodeAac);
+    CHECK(ExportStreamActionFor(ExportContainer::Mp4, "audio", "vorbis") == A::EncodeAac);
+    CHECK(ExportStreamActionFor(ExportContainer::Mp4, "audio", "") == A::Drop);
+    CHECK(ExportStreamActionFor(ExportContainer::Mp4, "subtitle", "subrip") == A::ToMovText);
+    CHECK(ExportStreamActionFor(ExportContainer::Mp4, "subtitle", "ass") == A::ToMovText);
+    CHECK(ExportStreamActionFor(ExportContainer::Mp4, "subtitle", "mov_text") == A::Copy);
+    CHECK(ExportStreamActionFor(ExportContainer::Mp4, "subtitle", "hdmv_pgs_subtitle") == A::Drop);
+    CHECK(ExportStreamActionFor(ExportContainer::Mp4, "attachment", "ttf") == A::Drop);
+    // Pictures carry nothing.
+    CHECK(ExportStreamActionFor(ExportContainer::Gif, "audio", "aac") == A::Drop);
+    CHECK(ExportStreamActionFor(ExportContainer::Png, "subtitle", "subrip") == A::Drop);
+
+    // HEVC in MP4 is tagged hvc1, which Apple's players require.
+    CHECK(std::wstring(ExportVideoTag(ExportContainer::Mp4, "hevc")) == L"hvc1");
+    CHECK(std::wstring(ExportVideoTag(ExportContainer::Mp4, "h264")).empty());
+    CHECK(std::wstring(ExportVideoTag(ExportContainer::Matroska, "hevc")).empty());
+}
+
+// The dialog and --render say what an export will do through StageExport's
+// formatters, and why it will not through ExportRefusalKey: one wording for
+// both, pinned here, and a key for every refusal that the English table holds.
+void stage_export_summaries_are_the_dialogs_and_the_command_lines_test()
+{
+    const Localizer localizer;
+    std::vector<std::wstring> keys;
+    for (const ExportRefusal refusal : {ExportRefusal::NothingSelected, ExportRefusal::SourceGeometryUnknown,
+                                        ExportRefusal::AlreadyAtTarget, ExportRefusal::MultiplierUnsupported,
+                                        ExportRefusal::VsrUnavailable, ExportRefusal::StillImage}) {
+        const std::wstring key = ExportRefusalKey(refusal);
+        CHECK(key.starts_with(L"export.stages.refusal."));
+        CHECK(localizer.Get(key.c_str()) != key);
+        CHECK(std::find(keys.begin(), keys.end(), key) == keys.end());
+        keys.push_back(key);
+    }
+    CHECK(std::wstring(ExportRefusalKey(ExportRefusal::None)) == L"export.stages.refusal.nothing");
+
+    ExportPlan plan;
+    plan.valid = true;
+    plan.workerStage = true;
+    plan.requireNeural = true;
+    plan.outputWidth = 1920;
+    plan.outputHeight = 1080;
+    plan.outputFps = 29.97;
+    CHECK(StageExportResultSummary(plan) == L"1920 \u00d7 1080 at 29.97 fps \u00b7 1 pass");
+    CHECK(StageExportPlanSummary(plan, 1920, 1080, 29.97) == L"1920 x 1080 at 29.97 fps -> 1920 x 1080 at 29.97 fps, 1 pass");
+    // The model at the source size: the rung alone, whatever the history says.
+    CHECK(StageExportEncodeSummary(plan, 1920, EncoderQuality::Lossless, UpscalingHistory::PerFrame) == L"encode: lossless");
+    plan.frameGenStage = true;
+    plan.multiplier = 2;
+    plan.outputFps = 59.94;
+    CHECK(StageExportResultSummary(plan) == L"1920 \u00d7 1080 at 59.94 fps \u00b7 2 passes");
+    CHECK(StageExportPlanSummary(plan, 1280, 720, 29.97) == L"1280 x 720 at 29.97 fps -> 1920 x 1080 at 59.94 fps, 2 passes");
+    // The model on an upscaled carrier keeps its own history; nothing names one.
+    CHECK(StageExportEncodeSummary(plan, 1280, EncoderQuality::High, UpscalingHistory::PerFrame) == L"encode: high");
+    // Super Resolution alone: DLSS in the helper says its history, RTX VSR has none.
+    plan.requireNeural = false;
+    CHECK(StageExportEncodeSummary(plan, 1280, EncoderQuality::Standard, UpscalingHistory::PerFrame) ==
+          L"encode: standard, upscaler DLSS, history per-frame");
+    plan.workerStage = false;
+    plan.vsrStage = true;
+    CHECK(StageExportEncodeSummary(plan, 1280, EncoderQuality::High, UpscalingHistory::Temporal) ==
+          L"encode: high, upscaler RTX VSR");
+    CHECK(StageExportResultSummary(plan) == L"1920 \u00d7 1080 at 59.94 fps \u00b7 2 passes");
+}
+
+// `--render` is parsed before anything else runs, so the one thing it must
+// never do is claim a launch that was meant for the player - a bare file path
+// (dragged onto the exe), --output, --safe-mode - and the one thing it must
+// always do is refuse a render it cannot describe rather than guess.
+void render_command_line_parses_the_stages_and_refuses_what_it_cannot_describe_test()
+{
+    using namespace render_command;
+    const auto parse = [](std::initializer_list<const wchar_t*> arguments) {
+        std::vector<std::wstring> values(arguments.begin(), arguments.end());
+        return Parse(values);
+    };
+    // The player's own launches are left alone.
+    CHECK(parse({}).mode == Mode::Player);
+    CHECK(parse({L"C:/films/clip.mp4"}).mode == Mode::Player);
+    CHECK(parse({L"--safe-mode", L"--output", L"1920x1080", L"clip.mp4"}).mode == Mode::Player);
+    // Help wins wherever it appears, with or without --render.
+    CHECK(parse({L"--help"}).mode == Mode::Help);
+    CHECK(parse({L"/?"}).mode == Mode::Help);
+    CHECK(parse({L"--render", L"clip.mp4", L"-h"}).mode == Mode::Help);
+
+    // --probe, what dlss5-convert probe runs: one input, two flags, and never
+    // together with --render.
+    const Parsed probe = parse({L"--probe", L"clip.mp4", L"--json", L"--capabilities"});
+    CHECK(probe.mode == Mode::Probe);
+    CHECK(probe.command.input == L"clip.mp4");
+    CHECK(probe.command.json && probe.command.capabilities);
+    CHECK(!parse({L"--probe", L"clip.mp4"}).command.json);
+    CHECK(parse({L"--probe", L"clip.mp4", L"--render", L"clip.mp4"}).mode == Mode::BadArguments);
+    CHECK(parse({L"--probe"}).mode == Mode::BadArguments);
+    CHECK(parse({L"--probe", L"a.mp4", L"--probe", L"b.mp4"}).mode == Mode::BadArguments);
+    CHECK(parse({L"--probe", L"a.mp4", L"--stages", L"sr"}).mode == Mode::BadArguments);
+
+    // The default is the dialog's: the neural pass alone, at the saved settings.
+    const Parsed plain = parse({L"--render", L"clip.mp4"});
+    CHECK(plain.mode == Mode::Render);
+    CHECK(plain.command.input == L"clip.mp4");
+    CHECK(plain.command.selection.neural);
+
+    // Neural settings' knobs, the encoder ladder and SR history, each only
+    // where the stage it belongs to runs, and only within the dialog's range.
+    const Parsed tuned = parse({L"--render", L"clip.mp4", L"--passes", L"3", L"--intensity", L"1.5",
+        L"--local-tone", L"0.5", L"--local-structure", L"2", L"--color-strength", L"0.8", L"--encode", L"lossless"});
+    CHECK(tuned.mode == Mode::Render);
+    CHECK(tuned.command.passes == std::optional<int>(3));
+    CHECK(tuned.command.intensity == std::optional<float>(1.5f));
+    CHECK(tuned.command.localTone == std::optional<float>(0.5f));
+    CHECK(tuned.command.localStructure == std::optional<float>(2.0f));
+    CHECK(tuned.command.colorStrength && std::abs(*tuned.command.colorStrength - 0.8f) < 1e-6f);
+    CHECK(tuned.command.quality == "lossless");
+        for (const auto& refused : std::vector<std::vector<std::wstring>>{
+             {L"--render", L"c.mp4", L"--passes", L"5"}, {L"--render", L"c.mp4", L"--passes", L"0"},
+             {L"--render", L"c.mp4", L"--intensity", L"2.5"}, {L"--render", L"c.mp4", L"--intensity", L"-1"},
+             {L"--render", L"c.mp4", L"--intensity", L"1e0"}, {L"--render", L"c.mp4", L"--color-strength", L"1.2"},
+             {L"--render", L"c.mp4", L"--encode", L"best"}, {L"--render", L"c.mp4", L"--passes", L"2", L"--passes", L"3"},
+             {L"--render", L"c.mp4", L"--stages", L"sr", L"--passes", L"2"},
+             {L"--render", L"c.mp4", L"--stages", L"fg", L"--encode", L"high"},
+             {L"--render", L"c.mp4", L"--history", L"temporal"},
+             {L"--render", L"c.mp4", L"--stages", L"sr,nr", L"--history", L"per-frame"},
+             {L"--render", L"c.mp4", L"--stages", L"sr", L"--history", L"sometimes"}})
+        CHECK(render_command::Parse(refused).mode == Mode::BadArguments);
+    // The retired --quality points at --encode instead of being unknown.
+    const Parsed retired = parse({L"--render", L"c.mp4", L"--quality", L"high"});
+    CHECK(retired.mode == Mode::BadArguments);
+    CHECK(retired.error.find(L"--encode") != std::wstring::npos);
+    const Parsed history = parse({L"--render", L"c.mp4", L"--stages", L"sr", L"--history", L"per-frame", L"--encode", L"high"});
+    CHECK(history.mode == Mode::Render);
+    CHECK(history.command.history == std::optional<UpscalingHistory>(UpscalingHistory::PerFrame));
+    // --history is DLSS Super Resolution's, so a script that names it keeps DLSS.
+    CHECK(history.command.engine == std::optional<SuperResolutionEngine>(SuperResolutionEngine::Dlss));
+    // --sr-engine picks the upscaler for sr without nr; empty uses the saved choice.
+    CHECK(!parse({L"--render", L"c.mp4", L"--stages", L"sr"}).command.engine);
+    const Parsed vsrEngine = parse({L"--render", L"c.mp4", L"--stages", L"sr", L"--sr-engine", L"vsr"});
+    CHECK(vsrEngine.mode == Mode::Render);
+    CHECK(vsrEngine.command.engine == std::optional<SuperResolutionEngine>(SuperResolutionEngine::RtxVsr));
+    CHECK(parse({L"--render", L"c.mp4", L"--stages", L"sr", L"--sr-engine", L"DLSS"}).command.engine ==
+          std::optional<SuperResolutionEngine>(SuperResolutionEngine::Dlss));
+    for (const auto& refusedEngine : std::initializer_list<std::vector<std::wstring>>{
+             {L"--render", L"c.mp4", L"--stages", L"sr", L"--sr-engine", L"bicubic"},
+             {L"--render", L"c.mp4", L"--stages", L"sr,nr", L"--sr-engine", L"vsr"},
+             {L"--render", L"c.mp4", L"--stages", L"nr", L"--sr-engine", L"dlss"},
+             {L"--render", L"c.mp4", L"--stages", L"sr", L"--sr-engine", L"vsr", L"--history", L"temporal"},
+             {L"--render", L"c.mp4", L"--stages", L"sr", L"--sr-engine", L"vsr", L"--sr-engine", L"dlss"}})
+        CHECK(render_command::Parse(refusedEngine).mode == Mode::BadArguments);
+
+    CHECK(!plain.command.passes && !plain.command.intensity && plain.command.quality.empty() && !plain.command.history);
+
+    CHECK(!plain.command.selection.upscale); CHECK(!plain.command.selection.frameGeneration);
+    CHECK(!plain.command.preset); CHECK(plain.command.output.empty()); CHECK(!plain.command.hasRange);
+    CHECK_EQ(uint32_t{1440}, plain.command.selection.targetHeight);
+    CHECK_EQ(uint32_t{2}, plain.command.selection.multiplier);
+
+    // Every option, in any order, and stages in any order - the pipeline runs
+    // them in NVIDIA's order whatever the list says.
+    const Parsed full = parse({L"--quiet", L"--stages", L"FG,nr,sr", L"--height", L"2160",
+                               L"--multiplier", L"3", L"--preset", L"Gentle", L"--range", L"0:10-0:25.5",
+                               L"--out", L"D:/out/film.MKV", L"--render", L"in put.mp4", L"--safe-mode"});
+    CHECK(full.mode == Mode::Render);
+    CHECK(full.command.quiet); CHECK(full.command.safeMode);
+    CHECK(full.command.selection.upscale && full.command.selection.neural &&
+          full.command.selection.frameGeneration);
+    CHECK_EQ(uint32_t{2160}, full.command.selection.targetHeight);
+    CHECK_EQ(uint32_t{3}, full.command.selection.multiplier);
+    CHECK(full.command.preset && neural_presets::kPresets[*full.command.preset].key == "gentle");
+    // The default preset is "standard" since it stopped sharing a name with Style
+    // Natural; "natural", the key it is saved under, still selects it.
+    // --style takes NVIDIA's three names, in any case, as Style's index.
+    const std::pair<const wchar_t*, int> styles[]{{L"default", 0}, {L"Natural", 1}, {L"CINEMATIC", 2}};
+    for (const auto& [name, index] : styles) {
+        const Parsed styled = parse({L"--render", L"a.mp4", L"--style", name});
+        CHECK(styled.command.style && *styled.command.style == index);
+    }
+    CHECK(!plain.command.style);
+    for (const wchar_t* spelling : {L"standard", L"Standard", L"natural"}) {
+        const Parsed named = parse({L"--render", L"a.mp4", L"--preset", spelling});
+        CHECK(named.command.preset && *named.command.preset == neural_presets::kDefaultPresetIndex);
+    }
+    CHECK(full.command.hasRange);
+    CHECK(full.command.rangeStart == L"0:10"); CHECK(full.command.rangeEnd == L"0:25.5");
+    CHECK(full.command.output == L"D:/out/film.MKV");
+    // Every container the export writes is accepted here; which of them the
+    // source may be written as is decided once it is read.
+    for (const wchar_t* name : {L"film.mp4", L"film.gif", L"photo.png", L"photo.JPG", L"photo.jpeg"})
+        CHECK(parse({L"--render", L"a.mp4", L"--out", name}).command.output == name);
+    CHECK(full.command.input == L"in put.mp4");
+    // What it asks for goes through the dialog's own planner unchanged.
+    const ExportPlan plan = PlanExport(full.command.selection, 1280, 720, 30.0, 4, false);
+    CHECK(plan.valid); CHECK_EQ(uint32_t{3840}, plan.outputWidth); CHECK_EQ(90.0, plan.outputFps);
+    // Super Resolution alone is a render like any other now.
+    const Parsed upscaleOnly = parse({L"--render", L"clip.mp4", L"--stages", L"sr"});
+    CHECK(upscaleOnly.mode == Mode::Render);
+    CHECK(!PlanExport(upscaleOnly.command.selection, 1280, 720, 30.0, 2, false).requireNeural);
+
+    // Refused, each with a reason, rather than guessed at.
+    const std::vector<std::vector<std::wstring>> refusedCases{
+             {L"--render"},                                              // no input
+             {L"--render", L""},                                         // empty input
+             {L"--render", L"a.mp4", L"--render", L"b.mp4"},             // twice
+             {L"--render", L"a.mp4", L"--output", L"1920x1080"},         // the player's flag
+             {L"--render", L"a.mp4", L"--stages", L""},                  // no stage
+             {L"--render", L"a.mp4", L"--stages", L"sr,"},               // empty stage
+             {L"--render", L"a.mp4", L"--stages", L"sr,sr"},             // repeated stage
+             {L"--render", L"a.mp4", L"--stages", L"upscale"},           // unknown stage
+             {L"--render", L"a.mp4", L"--stages", L"sr", L"--height", L"720"},   // not a rung
+             {L"--render", L"a.mp4", L"--stages", L"sr", L"--height", L"+1440"},
+             {L"--render", L"a.mp4", L"--height", L"1440"},              // no sr stage
+             {L"--render", L"a.mp4", L"--stages", L"fg", L"--multiplier", L"6"},
+             {L"--render", L"a.mp4", L"--stages", L"fg", L"--multiplier", L"1"},
+             {L"--render", L"a.mp4", L"--multiplier", L"2"},             // no fg stage
+             {L"--render", L"a.mp4", L"--preset", L"vivid"},             // unknown preset
+             {L"--render", L"a.mp4", L"--style", L"vivid"},              // unknown style
+             {L"--render", L"a.mp4", L"--style", L"natural", L"--style", L"default"},
+             {L"--render", L"a.mp4", L"--stages", L"sr", L"--style", L"natural"},  // no nr
+             {L"--render", L"a.mp4", L"--stages", L"sr", L"--preset", L"natural"},  // no nr
+             {L"--render", L"a.mp4", L"--range", L"10"},                 // no end
+             {L"--render", L"a.mp4", L"--range", L"-10"},
+             {L"--render", L"a.mp4", L"--range", L"1-2-3"},
+             {L"--render", L"a.mp4", L"--stages", L"fg", L"--range", L"0:01-0:02"},  // fg alone
+             {L"--render", L"a.mp4", L"--out", L"a.avi"},                // no container it writes
+             {L"--render", L"a.mp4", L"--out", L"a"},
+             {L"--render", L"a.mp4", L"--out"},                          // no value
+             {L"--render", L"a.mp4", L"--quiet", L"--quiet"},
+    };
+    for (const auto& arguments : refusedCases) {
+        const Parsed refused = Parse(arguments);
+        CHECK(refused.mode == Mode::BadArguments);
+        CHECK(!refused.error.empty());
+    }
+
+    CHECK(DefaultOutput(L"C:/films/clip.final.mp4") == std::filesystem::path(L"C:/films/clip.final-dlss.mkv"));
+    CHECK(ProgressLine(1, 2, L"Neural rendering", 0, 0) == L"1/2 Neural rendering: 0 frames");
+    CHECK(ProgressLine(2, 2, L"Frame generation", 30, 120) == L"2/2 Frame generation: 30/120 frames (25%)");
+    // A pass that reports past its estimate says 100%, not 104%.
+    CHECK(ProgressLine(1, 1, L"Super Resolution", 125, 120) == L"1/1 Super Resolution: 125/120 frames (100%)");
+    CHECK(Usage().find(L"--render <input>") != std::wstring::npos);
+    CHECK_EQ(3, kExitRefused); CHECK_EQ(5, kExitCancelled);
+}
+
+// The processing-scale ladder. The default is the top rung and changes
+// nothing - not the model's input, not the cache key, not the add-on's ini -
+// and each reduced rung is even-sized, restored to the source, and its own
+// cache entry.
+// The zero-motion test on the neural carrier (w5-mv): shipped on, and keyed. A
+// benchmark arm may force either side; nothing else can, and the key follows the
+// value a render was actually made with, so a render made without the test is never
+// served for one made with it - or the other way round.
+void neural_zero_motion_test_ships_on_and_is_a_cache_key_term_test()
+{
+    CHECK(kNeuralZeroMotionTest);
+    CHECK(NeuralZeroMotionTest(std::nullopt) == kNeuralZeroMotionTest);
+    CHECK(NeuralZeroMotionTest(false) == false);
+    CHECK(NeuralZeroMotionTest(true) == true);
+    CHECK(NeuralMotionIdentityTerm(false).empty());
+    CHECK(NeuralMotionIdentityTerm(true) == "|mv-zero-test-v1");
+    // The shipped key carries the term: a cache from a build without the test is a
+    // different picture on every held or near-still frame.
+    CHECK(!NeuralMotionIdentityTerm(NeuralZeroMotionTest(std::nullopt)).empty());
+}
+
+// Super Resolution's history (w5-mv): Temporal on a fresh install, stored by name,
+// reset on every frame only in a Super Resolution session that asked for Per-frame,
+// and never on a carrier the neural model runs on - so no cached render, and no
+// cache key, depends on the choice. The menu block is contiguous in the enum's order.
+void upscaling_history_defaults_to_temporal_and_never_reaches_the_model_test()
+{
+    CHECK(kDefaultUpscalingHistory == UpscalingHistory::Temporal);
+    // The viewer starts at Per-frame; a job that names none still means Temporal.
+    CHECK(kRecommendedUpscalingHistory == UpscalingHistory::PerFrame);
+    for (const UpscalingHistory history : {UpscalingHistory::Temporal, UpscalingHistory::PerFrame})
+        CHECK(ParseUpscalingHistory(UpscalingHistoryName(history)) == std::optional<UpscalingHistory>(history));
+    CHECK(UpscalingHistoryName(UpscalingHistory::PerFrame) == "per-frame");
+    CHECK(UpscalingHistoryName(UpscalingHistory::Temporal) == "temporal");
+    for (const std::string_view bad : {"", "Temporal", "perframe", "per_frame", "1"})
+        CHECK(!ParseUpscalingHistory(bad).has_value());
+
+    // Only a Super Resolution session has a history to discard every frame.
+    CHECK(UpscalingResetsEveryFrame(UpscalingHistory::PerFrame, true));
+    CHECK(!UpscalingResetsEveryFrame(UpscalingHistory::PerFrame, false));
+    CHECK(!UpscalingResetsEveryFrame(UpscalingHistory::Temporal, true));
+    CHECK(!UpscalingResetsEveryFrame(UpscalingHistory::Temporal, false));
+
+    // A carrier the model runs on keeps Temporal whatever the viewer chose.
+    CHECK(CarrierUpscalingHistory(UpscalingHistory::PerFrame, true) == UpscalingHistory::Temporal);
+    CHECK(CarrierUpscalingHistory(UpscalingHistory::PerFrame, false) == UpscalingHistory::PerFrame);
+    CHECK(CarrierUpscalingHistory(UpscalingHistory::Temporal, false) == UpscalingHistory::Temporal);
+
+    CHECK_EQ(app_menu::IDM_UPSCALE_HISTORY_TEMPORAL + 1, app_menu::IDM_UPSCALE_HISTORY_PER_FRAME);
+}
+
+void processing_scale_ladder_defaults_to_the_source_and_keys_every_rung_test()
+{
+    CHECK_EQ(uint32_t{100}, kDefaultProcessingScale);
+    CHECK_EQ(uint32_t{100}, kProcessingScaleRungs[0]);
+    for (const uint32_t rung : {100u, 75u, 50u}) CHECK(IsProcessingScaleRung(rung));
+    for (const uint32_t other : {0u, 25u, 60u, 99u, 101u, 150u}) CHECK(!IsProcessingScaleRung(other));
+
+    const ProcessingInput source = ProcessingSize(3840, 2160, 100);
+    CHECK(!source.reduced); CHECK_EQ(uint32_t{3840}, source.width); CHECK_EQ(uint32_t{2160}, source.height);
+    const ProcessingInput three = ProcessingSize(3840, 2160, 75);
+    CHECK(three.reduced); CHECK_EQ(uint32_t{2880}, three.width); CHECK_EQ(uint32_t{1620}, three.height);
+    const ProcessingInput half = ProcessingSize(1920, 1080, 50);
+    CHECK(half.reduced); CHECK_EQ(uint32_t{960}, half.width); CHECK_EQ(uint32_t{540}, half.height);
+    // Odd results round down to even; an odd source at 100 stays as it is.
+    const ProcessingInput odd = ProcessingSize(1279, 719, 75);
+    CHECK(odd.reduced); CHECK_EQ(0u, odd.width % 2); CHECK_EQ(0u, odd.height % 2);
+    CHECK_EQ(uint32_t{1279}, ProcessingSize(1279, 719, 100).width);
+    // Not a rung, or too small to reduce, is the source.
+    CHECK(!ProcessingSize(1920, 1080, 60).reduced);
+    CHECK(!ProcessingSize(2, 2, 50).reduced);
+
+    // The carrier is Super Resolution from the model's frame whenever the
+    // output is larger than it: a reduced rung restoring the source, and an
+    // export's Super Resolution stage reaching its rung - which ran as DLAA at
+    // the rung over a resampled source until this was asked of it. At the
+    // source size it stays DLAA, as every cached render always was.
+    CHECK(SuperResolutionCarrier(half.width, half.height, 1920, 1080));
+    CHECK(SuperResolutionCarrier(1280, 720, 2560, 1440));
+    CHECK(SuperResolutionCarrier(960, 540, 1920, 1080));
+    CHECK(!SuperResolutionCarrier(1920, 1080, 1920, 1080));
+    CHECK(!SuperResolutionCarrier(1279, 719, 1279, 719));
+    CHECK(!SuperResolutionCarrier(0, 0, 1920, 1080));
+
+    CHECK(ProcessingScaleIdentityTerm(100).empty());
+    CHECK(ProcessingScaleIdentityTerm(75) == "|processing-scale-75-v2");
+    CHECK(ProcessingScaleIdentityTerm(50) != ProcessingScaleIdentityTerm(75));
+
+    // The add-on order: the model ahead of the upscale below 100; at 100 the
+    // ini is left alone unless a reduced render left its 1 behind.
+    CHECK(PreUpscaleOverride(75, "") == std::optional<std::string_view>("1"));
+    CHECK(PreUpscaleOverride(50, "0") == std::optional<std::string_view>("1"));
+    CHECK(!PreUpscaleOverride(100, "").has_value());
+    CHECK(!PreUpscaleOverride(100, "0").has_value());
+    CHECK(PreUpscaleOverride(100, "1") == std::optional<std::string_view>("0"));
+
+    // The menu's rungs, in the ladder's order.
+    CHECK_EQ(app_menu::IDM_PROCESSING_SCALE_FIRST, app_menu::CommandForProcessingScale(100));
+    CHECK_EQ(app_menu::IDM_PROCESSING_SCALE_LAST, app_menu::CommandForProcessingScale(50));
+    CHECK(app_menu::ProcessingScaleForCommand(app_menu::IDM_PROCESSING_SCALE_FIRST + 1) == std::optional<uint32_t>(75));
+    CHECK(!app_menu::ProcessingScaleForCommand(app_menu::IDM_PROCESSING_SCALE_LAST + 1).has_value());
+    CHECK_EQ(app_menu::IDM_PROCESSING_SCALE_FIRST, app_menu::CommandForProcessingScale(60));
+
+    // `--render --processing-scale` takes a rung, and only for the model at
+    // the source size.
+    const auto parse = [](std::vector<std::wstring> arguments) { return render_command::Parse(arguments); };
+    const auto scaled = parse({L"--render", L"a.mp4", L"--processing-scale", L"75"});
+    CHECK(scaled.mode == render_command::Mode::Render);
+    CHECK(scaled.command.processingScale == std::optional<uint32_t>(75));
+    CHECK(!parse({L"--render", L"a.mp4"}).command.processingScale.has_value());
+    CHECK(parse({L"--render", L"a.mp4", L"--processing-scale", L"60"}).mode == render_command::Mode::BadArguments);
+    CHECK(parse({L"--render", L"a.mp4", L"--stages", L"sr,nr", L"--processing-scale", L"50"}).mode ==
+          render_command::Mode::BadArguments);
+    CHECK(parse({L"--render", L"a.mp4", L"--stages", L"fg", L"--processing-scale", L"50"}).mode ==
+          render_command::Mode::BadArguments);
+}
+
+// The reduction the model sees below 100%: the exact coverage-weighted mean,
+// which at 50% is the 2x2 box, the same bytes whatever the thread count, and
+// refused for anything that is not a reduction of a whole frame.
+void area_downscale_is_the_exact_coverage_mean_and_deterministic_test()
+{
+    // 4x2 -> 2x1: each output pixel is the mean of a 2x2 block.
+    std::vector<uint8_t> source{
+        0, 10, 20, 255,   40, 50, 60, 255,   100, 100, 100, 255,   200, 200, 200, 255,
+        80, 90, 100, 255, 120, 130, 140, 255, 100, 100, 100, 255,   0, 0, 0, 255};
+    std::vector<uint8_t> half;
+    CHECK(frame_resample::DownscaleBgraArea(source, 4, 2, 2, 1, half));
+    CHECK(half == std::vector<uint8_t>({60, 70, 80, 255, 100, 100, 100, 255}));
+
+    // 3 -> 2 along one axis: weights 2/3 + 1/3 and 1/3 + 2/3.
+    std::vector<uint8_t> row{0, 0, 0, 255, 90, 90, 90, 255, 180, 180, 180, 255};
+    std::vector<uint8_t> two;
+    CHECK(frame_resample::DownscaleBgraArea(row, 3, 1, 2, 1, two));
+    CHECK(two == std::vector<uint8_t>({30, 30, 30, 255, 150, 150, 150, 255}));
+    for (const uint32_t size : {3u, 4u, 7u, 1920u}) {
+        const auto axis = frame_resample::BuildAxis(size, size * 3 / 4 ? size * 3 / 4 : 1);
+        for (const auto& span : axis.spans) {
+            float sum = 0.0f;
+            for (uint32_t tap = 0; tap < span.count; ++tap) sum += axis.weights[span.offset + tap];
+            CHECK(std::fabs(sum - 1.0f) < 1e-5f);
+        }
+    }
+
+    // A large frame, twice: the row split across the pool changes nothing.
+    std::vector<uint8_t> large(size_t(1920) * 1080 * 4);
+    for (size_t index = 0; index < large.size(); ++index) large[index] = uint8_t((index * 2654435761u) >> 24);
+    std::vector<uint8_t> first, second;
+    CHECK(frame_resample::DownscaleBgraArea(large, 1920, 1080, 1440, 810, first));
+    CHECK(frame_resample::DownscaleBgraArea(large, 1920, 1080, 1440, 810, second));
+    CHECK_EQ(size_t(1440) * 810 * 4, first.size());
+    CHECK(first == second);
+
+    std::vector<uint8_t> untouched{1, 2, 3};
+    CHECK(!frame_resample::DownscaleBgraArea(row, 3, 1, 4, 1, untouched));   // an enlargement
+    CHECK(!frame_resample::DownscaleBgraArea(row, 4, 1, 2, 1, untouched));   // not a whole frame
+    CHECK(untouched == std::vector<uint8_t>({1, 2, 3}));
+}
+
+// The matrix an undeclared video is decoded with: BT.709 from HD up, BT.601
+// below it (ffmpeg's own default, so nothing moves there), never for a stream
+// that declared one, and never for a photo or a GIF.
+void untagged_hd_video_decodes_as_bt709_and_only_it_test()
+{
+    const SourceColorDescription none{};
+    SourceColorDescription declared601{};
+    declared601.matrix = ColorMatrix::Bt601; declared601.range = ColorRange::Limited;
+    SourceColorDescription declared709{};
+    declared709.matrix = ColorMatrix::Bt709;
+    SourceColorDescription rangeOnly{};
+    rangeOnly.range = ColorRange::Limited;
+    CHECK(UntaggedSourceDecodesAsBt709(none, 1280, 720, false));
+    CHECK(UntaggedSourceDecodesAsBt709(none, 1920, 1080, false));
+    CHECK(UntaggedSourceDecodesAsBt709(none, 3840, 2160, false));
+    CHECK(UntaggedSourceDecodesAsBt709(none, 1280, 544, false));    // scope 720p
+    CHECK(UntaggedSourceDecodesAsBt709(none, 960, 720, false));     // 4:3 720p
+    CHECK(UntaggedSourceDecodesAsBt709(rangeOnly, 1920, 1080, false));
+    CHECK(!UntaggedSourceDecodesAsBt709(none, 720, 576, false));    // PAL SD
+    CHECK(!UntaggedSourceDecodesAsBt709(none, 720, 480, false));    // NTSC SD
+    CHECK(!UntaggedSourceDecodesAsBt709(none, 640, 360, false));
+    CHECK(!UntaggedSourceDecodesAsBt709(declared601, 1920, 1080, false));
+    CHECK(!UntaggedSourceDecodesAsBt709(declared709, 1920, 1080, false));   // declared, not inferred
+    CHECK(!UntaggedSourceDecodesAsBt709(none, 1920, 1080, true));   // photo or GIF
+    CHECK(std::string_view(UntaggedColorIdentityTerm(false)).empty());
+    CHECK(std::string_view(UntaggedColorIdentityTerm(true)) == "|untagged-hd-bt709-v1");
+    // With GPU source conversion on, such a render now converts on the GPU
+    // where it used to be refused to the CPU pipe, so its key moves; with it
+    // off, nothing about the render changed and neither does the key.
+    CHECK(std::string_view(UntaggedColorIdentityTerm(true, false)) == "|untagged-hd-bt709-v1");
+    CHECK(std::string_view(UntaggedColorIdentityTerm(true, true)) == "|untagged-hd-bt709-gpu-v1");
+    CHECK(std::string_view(UntaggedColorIdentityTerm(false, true)).empty());
+}
+
+// The description an untagged HD video is DECODED under is BT.709 limited, the
+// same reading the CPU path pins in its scale filter, so the GPU NV12
+// conversion implements it. Refusing it sent every untagged HD file through a
+// BGRA pipe: measured on an RTX 5090, an untagged 3840x2160 30 fps clip
+// presented 3.5 fps during a live session and dropped 413 of 646 frames, and
+// the same bytes tagged BT.709 played 30 fps with none dropped.
+void untagged_hd_video_is_decoded_under_a_description_the_gpu_converts_test()
+{
+    const SourceColorDescription none{};
+    const SourceColorDescription decoded = DecodedColorDescription(none, true);
+    CHECK(decoded.matrix == ColorMatrix::Bt709);
+    CHECK(decoded.range == ColorRange::Limited);
+    CHECK(SourceNv12ConversionFor(decoded) == SourceNv12Conversion::Bt709Limited);
+    CHECK(SourceNv12ConversionFor(none) == SourceNv12Conversion::Unsupported);
+
+    // A declared range is kept; only the matrix was missing.
+    SourceColorDescription fullOnly{};
+    fullOnly.range = ColorRange::Full;
+    CHECK(SourceNv12ConversionFor(DecodedColorDescription(fullOnly, true)) == SourceNv12Conversion::Bt709Full);
+
+    // Primaries and transfer are not the matrix and are not invented.
+    CHECK(decoded.primaries == none.primaries);
+    CHECK(decoded.transfer == none.transfer);
+
+    // Everything the untagged rule does not cover is decoded as declared: SD,
+    // a photo, and any stream that states its matrix.
+    const SourceColorDescription sd = DecodedColorDescription(none, false);
+    CHECK(sd.matrix == ColorMatrix::Unspecified && sd.range == ColorRange::Unspecified);
+    SourceColorDescription declared601{};
+    declared601.matrix = ColorMatrix::Bt601; declared601.range = ColorRange::Limited;
+    const SourceColorDescription kept = DecodedColorDescription(declared601, false);
+    CHECK(kept.matrix == ColorMatrix::Bt601 && kept.range == ColorRange::Limited);
+}
+
+// A stream's display matrix, read the way ffmpeg's autorotation reads it. The
+// matrices are the ones the bundled ffprobe printed for a clip stream-copied
+// with -display_rotation 90, -90, 180 and 90 plus -display_hflip; the filters
+// are the ones ffmpeg inserted for them (its verbose log names them), and a
+// clip decoded through each matched ffmpeg's autorotated output byte for byte.
+void display_matrix_stands_the_picture_up_as_ffmpeg_does_test()
+{
+    using namespace display_orientation;
+    const std::string_view probe =
+        "codec_name=h264\r\nwidth=320\r\nheight=176\r\nduration=1.000000\r\n"
+        "displaymatrix=\r\n"
+        "00000000:            0      -65536           0\r\n"
+        "00000001:        65536           0           0\r\n"
+        "00000002:            0           0  1073741824\r\n"
+        "\r\nformat_name=mov,mp4,m4a,3gp,3g2,mj2\r\n";
+    const auto quarter = ParseDisplayMatrix(probe);
+    CHECK(quarter.has_value());
+    if (quarter) {
+        CHECK((*quarter == Matrix{0, -65536, 0, 65536, 0, 0, 0, 0, 1073741824}));
+        CHECK(FromDisplayMatrix(*quarter) == Orientation::CounterClockwise);
+    }
+    // No matrix, a cut-off one and a mangled one decode as stored.
+    CHECK(!ParseDisplayMatrix("width=320\nheight=176\n").has_value());
+    CHECK(!ParseDisplayMatrix("displaymatrix=\n00000000: 0 -65536 0\n00000001: 65536 0 0\n").has_value());
+    CHECK(!ParseDisplayMatrix("displaymatrix=\n00000000: 0 -65536 0\n00000001: 65536 x 0\n00000002: 0 0 1073741824\n").has_value());
+    CHECK(!ParseDisplayMatrix("displaymatrix=\nrotation=90\n").has_value());
+
+    const int32_t one = 65536, w = 1073741824;
+    CHECK(FromDisplayMatrix({0, one, 0, -one, 0, 0, 0, 0, w}) == Orientation::Clockwise);        // -90 and 270
+    CHECK(FromDisplayMatrix({-one, 0, 0, 0, -one, 0, 0, 0, w}) == Orientation::HalfTurn);        // 180
+    CHECK(FromDisplayMatrix({0, -one, 0, -one, 0, 0, 0, 0, w}) == Orientation::ClockwiseFlip);   // 90 + hflip
+    CHECK(FromDisplayMatrix({0, one, 0, one, 0, 0, 0, 0, w}) == Orientation::CounterClockwiseFlip);
+    CHECK(FromDisplayMatrix({one, 0, 0, 0, one, 0, 0, 0, w}) == Orientation::Upright);
+    CHECK(FromDisplayMatrix({-one, 0, 0, 0, one, 0, 0, 0, w}) == Orientation::MirrorHorizontal);
+    CHECK(FromDisplayMatrix({one, 0, 0, 0, -one, 0, 0, 0, w}) == Orientation::MirrorVertical);
+    // A matrix with a scale in it still turns by its angle alone.
+    CHECK(FromDisplayMatrix({0, -2 * one, 0, 2 * one, 0, 0, 0, 0, w}) == Orientation::CounterClockwise);
+    // 45 degrees is not a turn a frame can be stood up by, and a zero matrix is no turn at all.
+    CHECK(!FromDisplayMatrix({46341, -46341, 0, 46341, 46341, 0, 0, 0, w}).has_value());
+    CHECK(!FromDisplayMatrix({0, 0, 0, 0, 0, 0, 0, 0, 0}).has_value());
+
+    CHECK(SwapsAxes(Orientation::Clockwise) && SwapsAxes(Orientation::CounterClockwise) &&
+          SwapsAxes(Orientation::ClockwiseFlip) && SwapsAxes(Orientation::CounterClockwiseFlip));
+    CHECK(!SwapsAxes(Orientation::Upright) && !SwapsAxes(Orientation::HalfTurn) &&
+          !SwapsAxes(Orientation::MirrorHorizontal) && !SwapsAxes(Orientation::MirrorVertical));
+    CHECK(SoftwareFilter(Orientation::Upright).empty() && CudaFilter(Orientation::Upright).empty());
+    CHECK(SoftwareFilter(Orientation::CounterClockwise) == L"transpose=cclock");
+    CHECK(SoftwareFilter(Orientation::ClockwiseFlip) == L"transpose=clock_flip");
+    CHECK(SoftwareFilter(Orientation::HalfTurn) == L"hflip,vflip");
+    CHECK(SoftwareFilter(Orientation::MirrorVertical) == L"vflip");
+    CHECK(CudaFilter(Orientation::Clockwise) == L"transpose_cuda=dir=clock");
+    CHECK(CudaFilter(Orientation::HalfTurn) == L"transpose_cuda=dir=reversal");
+    CHECK(CudaFilter(Orientation::MirrorHorizontal) == L"transpose_cuda=dir=hflip");
+    // Every turned source carries a key term, a half turn included, whose width
+    // and height alone would not move its key; an upright one carries none.
+    CHECK(IdentityTerm(Orientation::Upright).empty());
+    CHECK_EQ(std::string("|display-cclock-v1"), IdentityTerm(Orientation::CounterClockwise));
+    CHECK_EQ(std::string("|display-reversal-v1"), IdentityTerm(Orientation::HalfTurn));
+}
+
+// The Media Foundation copy reads only bytes the locked buffer holds. The
+// resolution-drop case is the one that used to walk 1080 rows of 7680 bytes
+// through a buffer holding a 1280x720 frame.
+void media_foundation_copy_never_reads_past_the_sample_test()
+{
+    using namespace mf_sample;
+    // Exact fit, top-down.
+    {
+        const CopyPlan plan = PlanCopy(4, 3, 16, 48);
+        CHECK(plan.copy);
+        CHECK_EQ(int32_t{16}, plan.stride);
+        CHECK_EQ(size_t{0}, plan.firstRow);
+        CHECK_EQ(size_t{16}, plan.rowBytes);
+        CHECK(!PlanCopy(4, 3, 16, 47).copy);
+    }
+    // Padded rows: the last row needs only its pixels, not its padding.
+    {
+        const CopyPlan plan = PlanCopy(4, 3, 20, 20 * 2 + 16);
+        CHECK(plan.copy);
+        CHECK_EQ(int32_t{20}, plan.stride);
+        CHECK_EQ(size_t{16}, plan.rowBytes);
+    }
+    // Bottom-up: the walk starts at the last row in the buffer and reads back
+    // to the first, so it reads exactly as far as a top-down walk.
+    {
+        const CopyPlan plan = PlanCopy(4, 3, -16, 48);
+        CHECK(plan.copy);
+        CHECK_EQ(int32_t{-16}, plan.stride);
+        CHECK_EQ(size_t{32}, plan.firstRow);
+        CHECK_EQ(size_t{16}, plan.rowBytes);
+        CHECK(!PlanCopy(4, 3, -16, 47).copy);
+    }
+    // A declared stride the buffer cannot hold falls back to packed rows, as it
+    // always did - and only when the packed rows fit.
+    {
+        const CopyPlan plan = PlanCopy(4, 3, 32, 48);
+        CHECK(plan.copy);
+        CHECK_EQ(int32_t{16}, plan.stride);
+        CHECK_EQ(size_t{0}, plan.firstRow);
+        // P1.33: a bottom-up frame stays bottom-up; walked top-down it was
+        // shown upside down.
+        const CopyPlan bottomUp = PlanCopy(4, 3, -32, 48);
+        CHECK(bottomUp.copy);
+        CHECK_EQ(int32_t{-16}, bottomUp.stride);
+        CHECK_EQ(size_t{32}, bottomUp.firstRow);
+        CHECK(!PlanCopy(4, 3, 32, 47).copy);
+        CHECK(!PlanCopy(4, 3, -32, 47).copy);
+    }
+    // A stride narrower than a row copies what the row holds; the caller
+    // clears the rest of the row.
+    {
+        const CopyPlan plan = PlanCopy(4, 3, 8, 24);
+        CHECK(plan.copy);
+        CHECK_EQ(size_t{8}, plan.rowBytes);
+    }
+    // No stride stated reads packed rows.
+    CHECK(PlanCopy(4, 3, 0, 48).copy);
+    CHECK(!PlanCopy(4, 3, 0, 47).copy);
+    // The resolution drop: opened at 1920x1080, handed a 1280x720 frame.
+    CHECK(!PlanCopy(1920, 1080, 7680, size_t{1280} * 720 * 4).copy);
+    CHECK(!PlanCopy(1920, 1080, -7680, size_t{1280} * 720 * 4).copy);
+    CHECK(!PlanCopy(1920, 1080, 5120, size_t{1280} * 720 * 4).copy);
+    CHECK(PlanCopy(1920, 1080, 7680, size_t{1920} * 1080 * 4).copy);
+    // Nothing to copy, and a stride with no positive twin.
+    CHECK(!PlanCopy(0, 1080, 7680, size_t{1} << 30).copy);
+    CHECK(!PlanCopy(1920, 0, 7680, size_t{1} << 30).copy);
+    CHECK(PlanCopy(4, 3, INT32_MIN, 48).copy);
+    CHECK_EQ(int32_t{-16}, PlanCopy(4, 3, INT32_MIN, 48).stride);
+    CHECK_EQ(size_t{32}, PlanCopy(4, 3, INT32_MIN, 48).firstRow);
+    // A type change is followed at the same size and ends the decode at another.
+    CHECK(FollowsTypeChange(1920, 1080, 1920, 1080));
+    CHECK(!FollowsTypeChange(1920, 1080, 1280, 720));
+    CHECK(!FollowsTypeChange(1920, 1080, 1080, 1920));
+}
+
+// An HDR source is tone mapped to SDR for a peak fixed per source from its static
+// metadata, never measured per frame, and that peak is part of the render's key.
+void hdr_sources_tone_map_for_a_static_peak_test()
+{
+    using namespace hdr_policy;
+    SourceColorDescription color{};
+    CHECK(SignalOf(color)==HdrSignal::Sdr);
+    color.transfer=ColorTransfer::Bt709;CHECK(SignalOf(color)==HdrSignal::Sdr);
+    color.transfer=ColorTransfer::Other;CHECK(SignalOf(color)==HdrSignal::Sdr);
+    color.transfer=ColorTransfer::Pq;CHECK(SignalOf(color)==HdrSignal::Pq);
+    color.transfer=ColorTransfer::Hlg;CHECK(SignalOf(color)==HdrSignal::Hlg);
+    // MaxCLL is the content's own peak and wins; the mastering peak only bounds it.
+    CHECK_EQ(1000.0,ToneMapPeakNits(HdrSignal::Pq,1000.0,4000.0));
+    CHECK_EQ(4000.0,ToneMapPeakNits(HdrSignal::Pq,0.0,4000.0));
+    // Nothing usable: 1000 nits, not ffmpeg's 10000 that plays a typical grade dark.
+    CHECK_EQ(1000.0,ToneMapPeakNits(HdrSignal::Pq,0.0,0.0));
+    CHECK_EQ(1000.0,ToneMapPeakNits(HdrSignal::Pq,50.0,20000.0));
+    CHECK_EQ(1000.0,ToneMapPeakNits(HdrSignal::Pq,std::nan(""),std::numeric_limits<double>::infinity()));
+    // Whole nits, so a key cannot move on a float's last digit.
+    CHECK_EQ(1234.0,ToneMapPeakNits(HdrSignal::Pq,1233.6,0.0));
+    // HLG is relative and ignores whatever it carries.
+    CHECK_EQ(1000.0,ToneMapPeakNits(HdrSignal::Hlg,4000.0,4000.0));
+    const std::wstring pq=SdrToneMapFilter(HdrSignal::Pq,4000.0,true);
+    CHECK(pq.find(L"zscale=tin=smpte2084:pin=bt2020:t=linear:npl=100")==0);
+    CHECK(pq.find(L"tonemap=tonemap=hable:desat=0:peak=40.000000")!=std::wstring::npos);
+    CHECK(pq.find(L"zscale=p=bt709")!=std::wstring::npos);
+    CHECK(pq.find(L"zscale=t=bt709")!=std::wstring::npos);
+    CHECK(pq.find(L"min=")==std::wstring::npos);
+    // An undeclared matrix is named, because zimg cannot convert YUV without one.
+    CHECK(SdrToneMapFilter(HdrSignal::Pq,1000.0,false).find(L":min=bt2020nc")!=std::wstring::npos);
+    CHECK(SdrToneMapFilter(HdrSignal::Hlg,1000.0,true).find(L"tin=arib-std-b67")==7);
+    CHECK(ToneMapIdentityTerm(HdrSignal::Sdr,1000.0).empty());
+    CHECK_EQ(std::string("|hdr-sdr-hable-v1-pq-peak4000"),ToneMapIdentityTerm(HdrSignal::Pq,4000.0));
+    CHECK_EQ(std::string("|hdr-sdr-hable-v1-hlg-peak1000"),ToneMapIdentityTerm(HdrSignal::Hlg,1000.0));
+    CHECK(ToneMapIdentityTerm(HdrSignal::Pq,1000.0)!=ToneMapIdentityTerm(HdrSignal::Pq,4000.0));
+}
+
+// The decoder's own tone map (HdrToneMap.h): which sources take it, that its
+// integer path stays inside int32 (cs_5_0 has nothing wider) and follows the
+// curve it tabulates, and the key term that names it.
+void hdr_tone_map_integer_path_follows_the_curve_test()
+{
+    using namespace hdr_tonemap;
+    using hdr_policy::HdrSignal;
+    SourceColorDescription pq{ColorMatrix::Bt2020Ncl, ColorRange::Limited, ColorPrimaries::Bt2020, ColorTransfer::Pq};
+    CHECK(Supported(pq, 3840, 2160));
+    CHECK(!Supported(pq, 3841, 2160));   // P010 needs even geometry
+    CHECK(!Supported(pq, 3840, 2161));
+    SourceColorDescription undeclared = pq;
+    undeclared.matrix = ColorMatrix::Unspecified;
+    CHECK(Supported(undeclared, 4, 2));  // ffmpeg's chain assumes BT.2020 NCL too
+    for (const ColorMatrix other : {ColorMatrix::Bt709, ColorMatrix::Bt601, ColorMatrix::Other}) {
+        SourceColorDescription declared = pq;
+        declared.matrix = other;
+        CHECK(!Supported(declared, 4, 2)); // kept on ffmpeg's float chain (v1)
+    }
+    SourceColorDescription sdr = pq;
+    sdr.transfer = ColorTransfer::Bt709;
+    CHECK(!Supported(sdr, 4, 2));
+    CHECK_EQ(std::string("|hdr-sdr-hable-v2-lut65-pq-peak1000"), hdr_policy::ToneMapIdentityTerm(HdrSignal::Pq, 1000.0, true));
+    CHECK_EQ(std::string("|hdr-sdr-hable-v2-lut65-hlg-peak1000"), hdr_policy::ToneMapIdentityTerm(HdrSignal::Hlg, 1000.0, true));
+    CHECK(hdr_policy::ToneMapIdentityTerm(HdrSignal::Pq, 1000.0, true) != hdr_policy::ToneMapIdentityTerm(HdrSignal::Pq, 1000.0));
+    CHECK(hdr_policy::ToneMapIdentityTerm(HdrSignal::Sdr, 1000.0, true).empty());
+
+    // Every product of the fixed-point matrix, at the extremes of ten bits, fits
+    // in int32 with room for the sums.
+    for (const bool full : {false, true}) {
+        const Matrix m = MatrixFor(full);
+        const int64_t yTerm = int64_t(1023 * 8 - m.yOffset) * m.y;
+        const int64_t chroma = 4096;   // |8*C - 4096| at most
+        CHECK(yTerm + chroma * m.crR < INT32_MAX);
+        CHECK(yTerm + chroma * m.cbB < INT32_MAX);
+        CHECK(yTerm + chroma * (m.cbG + m.crG) < INT32_MAX);
+        CHECK(int64_t(m.yOffset) * m.y + chroma * (m.cbG + m.crG) < INT32_MAX);
+    }
+
+    // A flat P010 frame of one Y'CbCr sample, through the integer path, against
+    // the curve evaluated in double at that sample; and a grey ramp stays grey and
+    // never goes backwards.
+    const auto table = BuildLut(HdrSignal::Pq, 1000.0);
+    const Matrix m = MatrixFor(false);
+    const auto flat = [&](uint32_t y10, uint32_t cb10, uint32_t cr10) {
+        std::vector<uint16_t> p010(4 * 2 + 4, 0);
+        for (int i = 0; i < 8; ++i) p010[i] = uint16_t(y10 << 6);
+        for (int i = 0; i < 2; ++i) { p010[8 + 2 * i] = uint16_t(cb10 << 6); p010[9 + 2 * i] = uint16_t(cr10 << 6); }
+        std::vector<uint8_t> bgra(4 * 2 * 4);
+        ToneMapP010Rows(reinterpret_cast<const uint8_t*>(p010.data()), 4, 2, m, table.data(), bgra.data(), 0, 2);
+        for (size_t i = 4; i < bgra.size(); ++i) CHECK_EQ(bgra[i % 4], bgra[i]); // a flat frame stays flat
+        return std::array<int, 3>{bgra[2], bgra[1], bgra[0]};
+    };
+    const auto reference = [&](uint32_t y10, uint32_t cb10, uint32_t cr10) {
+        const double y = (double(y10) - 64.0) / 876.0, cb = (double(cb10) - 512.0) / 896.0, cr = (double(cr10) - 512.0) / 896.0;
+        const double r = y + 1.4746 * cr, b = y + 1.8814 * cb, g = (y - 0.2627 * r - 0.0593 * b) / 0.6780;
+        const double in[3] = {std::clamp(r, 0.0, 1.0), std::clamp(g, 0.0, 1.0), std::clamp(b, 0.0, 1.0)};
+        double out[3];
+        Curve(HdrSignal::Pq, 1000.0, in, out);
+        return std::array<int, 3>{Encode(out[0]), Encode(out[1]), Encode(out[2])};
+    };
+    int worst = 0, previous = -1, total = 0, compared = 0;
+    for (uint32_t y10 = 64; y10 <= 940; y10 += 4) {
+        const auto grey = flat(y10, 512, 512);
+        CHECK(grey[0] == grey[1] && grey[1] == grey[2]);
+        CHECK(grey[0] >= previous);
+        previous = grey[0];
+        for (const auto [cb, cr] : {std::pair<uint32_t, uint32_t>{512, 512}, {480, 540}, {540, 500}, {500, 470}}) {
+            const auto got = flat(y10, cb, cr);
+            const auto want = reference(y10, cb, cr);
+            for (int c = 0; c < 3; ++c) {
+                worst = std::max(worst, std::abs(got[c] - want[c]));
+                total += std::abs(got[c] - want[c]);
+                ++compared;
+            }
+        }
+    }
+    // Where the table's cells are furthest from linear - a weak channel of a
+    // saturated colour near zero, where the encode is steepest, and the brightest
+    // channel at the clip - a sample lands a few codes off; everywhere else within
+    // one (measured: worst 5 in this sweep).
+    CHECK(worst <= 6);
+    CHECK(double(total) / compared < 0.35);
+    CHECK_EQ(0, flat(64, 512, 512)[0]);    // PQ black is black
+    // BT.2408 reference white (203 nits, PQ 0.58) sits below the clip, with room
+    // above it for the curve to roll highlights off.
+    const auto white = flat(64 + uint32_t(std::lround(0.5807 * 876)), 512, 512);
+    CHECK(white[0] > 180 && white[0] < 235);
+}
+
+void one_step_of_the_frame_grid_is_always_work_test()
+{
+    for (const double fps : {60000.0 / 1001.0, 59.9401, 30000.0 / 1001.0, 29.97,
+                             24000.0 / 1001.0, 23.976, 15.0, 25.0, 30.0, 50.0, 60.0}) {
+        // The first grid step the predicate gets wrong, so a failure names the
+        // frame rather than printing one line per frame of a 100 s video.
+        int64_t refused = -1;
+        for (uint64_t index = 0; index < 6000 && refused < 0; ++index)
+            if (RenderRangeIsCovered(FramePts(index, fps), FramePts(index + 1, fps), fps))
+                refused = static_cast<int64_t>(index);
+        CHECK_EQ(int64_t{-1}, refused);
+    }
+}
+
+// The invariant the session actually runs on: every hole it keeps is a hole a
+// job can be started on.
+//
+// LiveHoles() hands NextRenderTarget a set of spans and StartLiveRenderTarget
+// snaps the chosen one to where a render may begin before asking whether it
+// holds anything. If those two can disagree the session has no exit - it will
+// not render the hole and it will not stop selecting it - so they are swept
+// against each other here across the grid, at hole widths from a sliver to
+// several frames, starting a tick to a frame below each boundary the way a
+// retained region's last segment ends.
+void every_hole_the_session_keeps_is_a_hole_a_job_can_start_on_test()
+{
+    for (const double fps : {60000.0 / 1001.0, 59.9401, 30000.0 / 1001.0, 25.0, 30.0, 60.0}) {
+        const int64_t frame = static_cast<int64_t>(std::llround(10000000.0 / fps));
+        int64_t strandedIndex = -1, strandedBack = -1, strandedWidth = -1;
+        for (uint64_t index = 1; index < 2200 && strandedIndex < 0; ++index)
+            for (const int64_t back : {int64_t{0}, int64_t{1}, int64_t{59}, frame / 2, frame - 1})
+                for (const int64_t width : {int64_t{1}, frame / 3, frame - 1, frame, frame + 1,
+                                            3 * frame, 3 * frame + 7}) {
+                    const int64_t start = FramePts(index, fps) - back;
+                    const CoverageSpan hole{start, start + width};
+                    // Not a hole the session would keep: nothing to reconcile.
+                    if (UncoveredSpans({}, hole, frame).empty()) continue;
+                    if (!RenderRangeIsCovered(
+                            FramePts(FrameIndexAtOrBefore(hole.start100ns, fps), fps),
+                            hole.end100ns, fps))
+                        continue;
+                    strandedIndex = static_cast<int64_t>(index);
+                    strandedBack = back;
+                    strandedWidth = width;
+                    break;
+                }
+        CHECK_EQ(int64_t{-1}, strandedIndex);
+        CHECK_EQ(int64_t{-1}, strandedBack);
+        CHECK_EQ(int64_t{-1}, strandedWidth);
+    }
+}
+
+// Why the unfillable hole was there to be refused.
+//
+// A retained region ends where its last segment's container timestamps ran out,
+// which sits a few ticks below the grid boundary of the frame that follows it.
+// StartLiveRenderTarget snapped that hole start to the NEAREST frame, and
+// nearest rounds forward - past the one frame the hole contains. The worker
+// seeks to a timestamp after that frame, its first output is the frame after
+// it, and the job started to fill the hole leaves the hole exactly as it found
+// it. Snapping to the frame the timestamp falls inside cannot step over it, and
+// the resulting overlap is what merges the two regions back into one.
+void render_start_snaps_into_the_frame_it_lands_in_not_past_it_test()
+{
+    const double fps = 60000.0 / 1001.0;
+    const int64_t boundary = FramePts(2016, fps);
+    const int64_t holeStart = boundary - 59;
+    CHECK(FramePts(FrameIndexNearest(holeStart, fps), fps) > holeStart);
+    CHECK(FramePts(FrameIndexAtOrBefore(holeStart, fps), fps) <= holeStart);
+    // And the snapped target still holds a frame to render, which is the whole
+    // point: the predicate above must call it work.
+    CHECK(!RenderRangeIsCovered(FramePts(FrameIndexAtOrBefore(holeStart, fps), fps),
+                                FramePts(2017, fps), fps));
+    // A start already on a boundary is left where it is - no frame is rendered
+    // twice for the sake of the snap.
+    CHECK_EQ(boundary, FramePts(FrameIndexAtOrBefore(boundary, fps), fps));
+}
+
+// 100ns source timestamps: the units the segment index, the renderer and the
+// playback clock all speak. One second, and one frame of the 30 fps clip the
+// backward-seek bug was reported against.
+constexpr int64_t kSecond100ns = 10000000;
+constexpr int64_t kFrame100ns = 333333;
+
+// CoverageSpan has no equality operator - nothing in the player compares two
+// spans - so the tests name the endpoints they mean.
+void check_span(const CoverageSpan& span, int64_t start100ns, int64_t end100ns)
+{
+    CHECK_EQ(start100ns, span.start100ns);
+    CHECK_EQ(end100ns, span.end100ns);
+}
+
+void coverage_merge_sorts_drops_degenerate_and_joins_touching_spans_test()
+{
+    // A run publishes out of order relative to earlier runs, retries overlap
+    // what they redo, and a cancelled job can leave an empty span behind.
+    const std::vector<CoverageSpan> merged = MergeSpans({
+        {40 * kSecond100ns, 50 * kSecond100ns},
+        {10 * kSecond100ns, 20 * kSecond100ns},
+        {20 * kSecond100ns, 30 * kSecond100ns},
+        {5 * kSecond100ns, 5 * kSecond100ns},
+        {9 * kSecond100ns, 3 * kSecond100ns},
+        {25 * kSecond100ns, 35 * kSecond100ns},
+    });
+    CHECK_EQ(size_t{2}, merged.size());
+    if (merged.size() == 2) {
+        check_span(merged[0], 10 * kSecond100ns, 35 * kSecond100ns);
+        check_span(merged[1], 40 * kSecond100ns, 50 * kSecond100ns);
+    }
+
+    // Two runs that meet exactly are one rendered region: the first job's last
+    // frame and the second job's first are consecutive frames of the video, so
+    // a render boundary must never be reported as a hole.
+    const std::vector<CoverageSpan> touching =
+        MergeSpans({{0, 10 * kSecond100ns}, {10 * kSecond100ns, 20 * kSecond100ns}});
+    CHECK_EQ(size_t{1}, touching.size());
+    if (touching.size() == 1) check_span(touching[0], 0, 20 * kSecond100ns);
+
+    // One tick short of touching is a real gap and must survive as two spans,
+    // otherwise an unrendered frame would be claimed as playable.
+    const std::vector<CoverageSpan> gapped =
+        MergeSpans({{0, 10 * kSecond100ns}, {10 * kSecond100ns + 1, 20 * kSecond100ns}});
+    CHECK_EQ(size_t{2}, gapped.size());
+    if (gapped.size() == 2) {
+        check_span(gapped[0], 0, 10 * kSecond100ns);
+        check_span(gapped[1], 10 * kSecond100ns + 1, 20 * kSecond100ns);
+    }
+}
+
+void uncovered_spans_of_nothing_is_everything_and_of_everything_is_nothing_test()
+{
+    const CoverageSpan range{0, 104 * kSecond100ns};
+
+    const std::vector<CoverageSpan> fresh = UncoveredSpans({}, range, kFrame100ns);
+    CHECK_EQ(size_t{1}, fresh.size());
+    if (fresh.size() == 1) check_span(fresh[0], range.start100ns, range.end100ns);
+
+    CHECK(UncoveredSpans({{0, 104 * kSecond100ns}}, range, kFrame100ns).empty());
+
+    // Two runs that meet leave nothing to render between them.
+    CHECK(UncoveredSpans({{0, 52 * kSecond100ns}, {52 * kSecond100ns, 104 * kSecond100ns}}, range,
+                         kFrame100ns)
+              .empty());
+}
+
+void uncovered_spans_find_the_hole_between_regions_and_the_lead_in_before_the_first_test()
+{
+    // The reported session: the user let it render from 20s, seeked back, and
+    // the opening twenty seconds were never rendered at all. Both the lead-in
+    // and the tail are work, and the lead-in is the one that used to be lost.
+    const CoverageSpan range{0, 104 * kSecond100ns};
+    const std::vector<CoverageSpan> holes =
+        UncoveredSpans({{20 * kSecond100ns, 60 * kSecond100ns}}, range, kFrame100ns);
+    CHECK_EQ(size_t{2}, holes.size());
+    if (holes.size() == 2) {
+        check_span(holes[0], 0, 20 * kSecond100ns);
+        check_span(holes[1], 60 * kSecond100ns, 104 * kSecond100ns);
+    }
+
+    // The mirror image: the opening and the tail rendered, the middle not.
+    const std::vector<CoverageSpan> between = UncoveredSpans(
+        {{60 * kSecond100ns, 104 * kSecond100ns}, {0, 20 * kSecond100ns}}, range, kFrame100ns);
+    CHECK_EQ(size_t{1}, between.size());
+    if (between.size() == 1) check_span(between[0], 20 * kSecond100ns, 60 * kSecond100ns);
+}
+
+void uncovered_spans_clip_coverage_to_the_range_and_ignore_coverage_outside_it_test()
+{
+    // A range narrower than the coverage: a trimmed export, or a session
+    // measuring what is left of the clip from a point the user seeked to.
+    const CoverageSpan range{30 * kSecond100ns, 90 * kSecond100ns};
+
+    const std::vector<CoverageSpan> leading =
+        UncoveredSpans({{10 * kSecond100ns, 40 * kSecond100ns}}, range, kFrame100ns);
+    CHECK_EQ(size_t{1}, leading.size());
+    if (leading.size() == 1) check_span(leading[0], 40 * kSecond100ns, 90 * kSecond100ns);
+
+    const std::vector<CoverageSpan> trailing =
+        UncoveredSpans({{80 * kSecond100ns, 120 * kSecond100ns}}, range, kFrame100ns);
+    CHECK_EQ(size_t{1}, trailing.size());
+    if (trailing.size() == 1) check_span(trailing[0], 30 * kSecond100ns, 80 * kSecond100ns);
+
+    const std::vector<CoverageSpan> both = UncoveredSpans(
+        {{10 * kSecond100ns, 40 * kSecond100ns}, {80 * kSecond100ns, 120 * kSecond100ns}}, range,
+        kFrame100ns);
+    CHECK_EQ(size_t{1}, both.size());
+    if (both.size() == 1) check_span(both[0], 40 * kSecond100ns, 80 * kSecond100ns);
+
+    // Coverage that never meets the range buys nothing inside it.
+    const std::vector<CoverageSpan> outside = UncoveredSpans(
+        {{0, 5 * kSecond100ns}, {100 * kSecond100ns, 110 * kSecond100ns}}, range, kFrame100ns);
+    CHECK_EQ(size_t{1}, outside.size());
+    if (outside.size() == 1) check_span(outside[0], 30 * kSecond100ns, 90 * kSecond100ns);
+}
+
+void uncovered_spans_drop_sub_frame_holes_but_keep_a_hole_one_frame_wide_test()
+{
+    // Integer per-frame segment ends against a fractional frame rate leave a
+    // few ticks of residual that no job can render: asking for less than a
+    // frame earns a range refusal from the worker. A hole exactly one frame
+    // wide is a frame the user would watch unrendered, so it is work.
+    const CoverageSpan range{0, 10 * kSecond100ns};
+    const std::vector<CoverageSpan> covered{
+        {0, 3 * kSecond100ns},
+        {3 * kSecond100ns + kFrame100ns - 1, 6 * kSecond100ns},
+        {6 * kSecond100ns + kFrame100ns, 10 * kSecond100ns},
+    };
+
+    const std::vector<CoverageSpan> holes = UncoveredSpans(covered, range, kFrame100ns);
+    CHECK_EQ(size_t{1}, holes.size());
+    if (holes.size() == 1)
+        check_span(holes[0], 6 * kSecond100ns, 6 * kSecond100ns + kFrame100ns);
+
+    // The sliver is only dropped by the width filter, not by the arithmetic.
+    CHECK_EQ(size_t{2}, UncoveredSpans(covered, range, 0).size());
+
+    // The same residual at the end of the range, which is where the re-toggled
+    // session found it.
+    CHECK(UncoveredSpans({{0, 10 * kSecond100ns - (kFrame100ns - 1)}}, range, kFrame100ns).empty());
+    const std::vector<CoverageSpan> tail =
+        UncoveredSpans({{0, 10 * kSecond100ns - kFrame100ns}}, range, kFrame100ns);
+    CHECK_EQ(size_t{1}, tail.size());
+    if (tail.size() == 1)
+        check_span(tail[0], 10 * kSecond100ns - kFrame100ns, 10 * kSecond100ns);
+}
+
+void next_render_target_clips_the_hole_under_the_playhead_to_the_playhead_test()
+{
+    // The user is waiting on this frame. Rendering the seconds they already
+    // passed first would make them wait for all of it before anything appears.
+    const std::vector<CoverageSpan> holes{{0, 20 * kSecond100ns},
+                                          {60 * kSecond100ns, 104 * kSecond100ns}};
+
+    const std::optional<CoverageSpan> inside = NextRenderTarget(holes, 8 * kSecond100ns);
+    CHECK(inside.has_value());
+    if (inside) check_span(*inside, 8 * kSecond100ns, 20 * kSecond100ns);
+
+    // At the first tick of a hole the whole hole is the target.
+    const std::optional<CoverageSpan> atStart = NextRenderTarget(holes, 60 * kSecond100ns);
+    CHECK(atStart.has_value());
+    if (atStart) check_span(*atStart, 60 * kSecond100ns, 104 * kSecond100ns);
+
+    // A hole is half-open: its end timestamp is rendered, so the playhead
+    // sitting exactly there is not inside it and the target is the next hole.
+    const std::optional<CoverageSpan> atEnd = NextRenderTarget(holes, 20 * kSecond100ns);
+    CHECK(atEnd.has_value());
+    if (atEnd) check_span(*atEnd, 60 * kSecond100ns, 104 * kSecond100ns);
+}
+
+void next_render_target_prefers_the_nearest_hole_ahead_then_the_earliest_behind_test()
+{
+    const std::vector<CoverageSpan> holes{{0, 20 * kSecond100ns},
+                                          {40 * kSecond100ns, 50 * kSecond100ns},
+                                          {80 * kSecond100ns, 104 * kSecond100ns}};
+
+    // Playhead on rendered video: playback is about to arrive at the nearest
+    // hole ahead, so that one is rendered before either of the others.
+    const std::optional<CoverageSpan> ahead = NextRenderTarget(holes, 30 * kSecond100ns);
+    CHECK(ahead.has_value());
+    if (ahead) check_span(*ahead, 40 * kSecond100ns, 50 * kSecond100ns);
+
+    const std::optional<CoverageSpan> next = NextRenderTarget(holes, 60 * kSecond100ns);
+    CHECK(next.has_value());
+    if (next) check_span(*next, 80 * kSecond100ns, 104 * kSecond100ns);
+
+    // Nothing left ahead: the earliest hole behind is taken, not the latest.
+    // This is how a session started mid-video eventually renders its opening.
+    const std::optional<CoverageSpan> behind = NextRenderTarget(holes, 104 * kSecond100ns);
+    CHECK(behind.has_value());
+    if (behind) check_span(*behind, 0, 20 * kSecond100ns);
+
+    const std::optional<CoverageSpan> onlyBehind =
+        NextRenderTarget({{0, 20 * kSecond100ns}, {40 * kSecond100ns, 50 * kSecond100ns}},
+                         55 * kSecond100ns);
+    CHECK(onlyBehind.has_value());
+    if (onlyBehind) check_span(*onlyBehind, 0, 20 * kSecond100ns);
+}
+
+void next_render_target_without_a_hole_has_nothing_to_render_test()
+{
+    CHECK(!NextRenderTarget({}, 12 * kSecond100ns).has_value());
+
+    // Degenerate holes are not work either: a job asked to render an empty
+    // range is refused, and a session that kept asking would never idle.
+    CHECK(!NextRenderTarget({{5 * kSecond100ns, 5 * kSecond100ns},
+                             {9 * kSecond100ns, 3 * kSecond100ns}},
+                            12 * kSecond100ns)
+               .has_value());
+}
+
+void span_containing_returns_the_playable_region_not_a_later_disjoint_one_test()
+{
+    // Two rendered regions with a hole between them, the first one built from
+    // two runs that met exactly.
+    const std::vector<CoverageSpan> covered{{20 * kSecond100ns, 40 * kSecond100ns},
+                                            {40 * kSecond100ns, 60 * kSecond100ns},
+                                            {80 * kSecond100ns, 104 * kSecond100ns}};
+
+    const std::optional<CoverageSpan> playing = SpanContaining(covered, 30 * kSecond100ns);
+    CHECK(playing.has_value());
+    if (playing) check_span(*playing, 20 * kSecond100ns, 60 * kSecond100ns);
+
+    const std::optional<CoverageSpan> later = SpanContaining(covered, 90 * kSecond100ns);
+    CHECK(later.has_value());
+    if (later) check_span(*later, 80 * kSecond100ns, 104 * kSecond100ns);
+
+    // Inside the hole there is no playable buffer. The later region is not
+    // lead: playback cannot reach it without crossing unrendered video, and a
+    // session measuring its buffer against the newest rendered timestamp would
+    // attach with nothing to show.
+    CHECK(!SpanContaining(covered, 70 * kSecond100ns).has_value());
+    // Before the first region, and at the exclusive end of a region.
+    CHECK(!SpanContaining(covered, 10 * kSecond100ns).has_value());
+    CHECK(!SpanContaining(covered, 60 * kSecond100ns).has_value());
+    CHECK(!SpanContaining(covered, 104 * kSecond100ns).has_value());
+    // The first and last rendered ticks are inside.
+    CHECK(SpanContaining(covered, 20 * kSecond100ns).has_value());
+    CHECK(SpanContaining(covered, 104 * kSecond100ns - 1).has_value());
+}
+
+void covered_duration_counts_only_rendered_video_inside_the_range_test()
+{
+    // The render pace is measured against this, so counting a hole as work
+    // done would report a session as faster than real time when it is not.
+    const CoverageSpan range{0, 104 * kSecond100ns};
+    const std::vector<CoverageSpan> covered{{20 * kSecond100ns, 60 * kSecond100ns},
+                                            {30 * kSecond100ns, 50 * kSecond100ns},
+                                            {80 * kSecond100ns, 104 * kSecond100ns},
+                                            {110 * kSecond100ns, 120 * kSecond100ns}};
+    CHECK_EQ(64 * kSecond100ns, CoveredDuration100ns(covered, range));
+    CHECK(std::abs(CoveredFraction(covered, range) - 64.0 / 104.0) < 1e-12);
+
+    // Coverage wider than the range contributes only the overlap, and a range
+    // entirely inside one rendered region is finished.
+    CHECK_EQ(10 * kSecond100ns, CoveredDuration100ns({{0, 100 * kSecond100ns}},
+                                                     {10 * kSecond100ns, 20 * kSecond100ns}));
+    CHECK_EQ(1.0, CoveredFraction({{0, 100 * kSecond100ns}},
+                                  {10 * kSecond100ns, 20 * kSecond100ns}));
+    // Two runs that meet cover the range exactly once, not twice.
+    CHECK_EQ(1.0, CoveredFraction({{0, 52 * kSecond100ns}, {52 * kSecond100ns, 104 * kSecond100ns}},
+                                  range));
+
+    // Nothing rendered, and a range with nothing in it.
+    CHECK_EQ(int64_t{0}, CoveredDuration100ns({}, range));
+    CHECK_EQ(0.0, CoveredFraction({}, range));
+    CHECK_EQ(int64_t{0}, CoveredDuration100ns(covered, {50 * kSecond100ns, 50 * kSecond100ns}));
+    CHECK_EQ(0.0, CoveredFraction(covered, {50 * kSecond100ns, 50 * kSecond100ns}));
+    CHECK_EQ(0.0, CoveredFraction(covered, {60 * kSecond100ns, 40 * kSecond100ns}));
+}
+
+void neural_cancel_and_failure_offer_original_only_without_partial_cache_test()
+{
+    NeuralPlaybackLifecycle lifecycle;const uint64_t generation=lifecycle.Begin();
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Rendering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Cancelling));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::OriginalOnly));
+    lifecycle.Invalidate();CHECK(!lifecycle.Accept(generation));
+    lifecycle.Begin();CHECK(lifecycle.Transition(NeuralPlaybackState::Failed));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::OriginalOnly));
+}
+
+void neural_pause_suspends_rendering_and_resumes_without_advancing_test()
+{
+    NeuralPlaybackLifecycle lifecycle;lifecycle.Begin();
+    CHECK(!lifecycle.Transition(NeuralPlaybackState::Paused));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Rendering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Paused));
+    CHECK(!lifecycle.Transition(NeuralPlaybackState::Validating));
+    CHECK(!lifecycle.Transition(NeuralPlaybackState::Ready));
+    CHECK_EQ(NeuralPlaybackState::Paused,lifecycle.state);
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Rendering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Paused));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Cancelling));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::OriginalOnly));
+}
+
+void neural_recovery_resolves_to_rendering_failed_or_retry_exhausted_test()
+{
+    NeuralPlaybackLifecycle lifecycle;lifecycle.Begin();
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Recovering));
+    CHECK(!lifecycle.Transition(NeuralPlaybackState::Ready));
+    CHECK(!lifecycle.Transition(NeuralPlaybackState::Paused));
+    CHECK(!lifecycle.Transition(NeuralPlaybackState::Validating));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Rendering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Recovering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::RetryExhausted));
+    CHECK(!lifecycle.Transition(NeuralPlaybackState::Rendering));
+    CHECK(!lifecycle.Transition(NeuralPlaybackState::Recovering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::OriginalOnly));
+    lifecycle.Begin();
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Rendering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Recovering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Failed));
+    lifecycle.Begin();
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Rendering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Recovering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Cancelling));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Idle));
+    CHECK(!lifecycle.Transition(NeuralPlaybackState::RetryExhausted));
+    CHECK(!lifecycle.Transition(NeuralPlaybackState::Recovering));
+}
+
+void neural_failure_kind_selects_the_lifecycle_state_test()
+{
+    CHECK_EQ(NeuralPlaybackState::RetryExhausted,StateForFailure(NeuralRenderFailure::RetryExhausted));
+    CHECK_EQ(NeuralPlaybackState::OriginalOnly,StateForFailure(NeuralRenderFailure::Cancelled));
+    CHECK_EQ(NeuralPlaybackState::Failed,StateForFailure(NeuralRenderFailure::DeviceRemoved));
+    CHECK_EQ(NeuralPlaybackState::Failed,StateForFailure(NeuralRenderFailure::Preflight));
+    CHECK_EQ(NeuralPlaybackState::Failed,StateForFailure(NeuralRenderFailure::WorkerCrashed));
+    NeuralPlaybackLifecycle lifecycle;lifecycle.Begin();
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Rendering));
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Recovering));
+    CHECK(lifecycle.Transition(StateForFailure(NeuralRenderFailure::RetryExhausted)));
+}
+
+void neural_progress_phase_drives_the_lifecycle_through_pause_and_recovery_test()
+{
+    // Phases without a state of their own never move the job.
+    CHECK_EQ(NeuralPlaybackState::Acquiring,StateForProgressPhase(NeuralRenderPhase::CheckingCache,NeuralPlaybackState::Acquiring));
+    CHECK_EQ(NeuralPlaybackState::Validating,StateForProgressPhase(NeuralRenderPhase::Ready,NeuralPlaybackState::Validating));
+    CHECK_EQ(NeuralPlaybackState::Acquiring,StateForProgressPhase(NeuralRenderPhase::Preflight,NeuralPlaybackState::Acquiring));
+    CHECK_EQ(NeuralPlaybackState::Validating,StateForProgressPhase(NeuralRenderPhase::Validating,NeuralPlaybackState::Rendering));
+    // A worker walking through preflight, decode, pause, resume, a frame retry and
+    // encode lands in exactly the states the UI presents.
+    NeuralPlaybackLifecycle lifecycle;lifecycle.Begin();
+    const auto advance=[&](NeuralRenderPhase phase){return lifecycle.Transition(StateForProgressPhase(phase,lifecycle.state));};
+    CHECK(!advance(NeuralRenderPhase::Preflight));
+    CHECK_EQ(NeuralPlaybackState::Acquiring,lifecycle.state);
+    CHECK(advance(NeuralRenderPhase::Decoding));
+    CHECK_EQ(NeuralPlaybackState::Rendering,lifecycle.state);
+    CHECK(advance(NeuralRenderPhase::Paused));
+    CHECK_EQ(NeuralPlaybackState::Paused,lifecycle.state);
+    CHECK(advance(NeuralRenderPhase::NeuralRendering));
+    CHECK_EQ(NeuralPlaybackState::Rendering,lifecycle.state);
+    CHECK(advance(NeuralRenderPhase::Recovering));
+    CHECK_EQ(NeuralPlaybackState::Recovering,lifecycle.state);
+    // A relaunched helper re-acquires while the job is still recovering.
+    CHECK(!advance(NeuralRenderPhase::Acquiring));
+    CHECK_EQ(NeuralPlaybackState::Recovering,lifecycle.state);
+    CHECK(advance(NeuralRenderPhase::Encoding));
+    CHECK_EQ(NeuralPlaybackState::Rendering,lifecycle.state);
+    CHECK(advance(NeuralRenderPhase::Validating));
+    CHECK(!advance(NeuralRenderPhase::Ready));
+    CHECK_EQ(NeuralPlaybackState::Validating,lifecycle.state);
+    CHECK(lifecycle.Transition(NeuralPlaybackState::Ready));
+}
+
+void dlss_toggle_in_cached_playback_changes_comparison_view_not_renderer_feature_test()
+{
+    CHECK_EQ(ComparisonView::Neural,ToggleComparisonView(ComparisonView::Original));
+    CHECK_EQ(ComparisonView::Original,ToggleComparisonView(ComparisonView::Neural));
+}
+
+void neural_runtime_layout_is_absent_complete_or_fail_closed_test()
+{
+    CHECK_EQ(NeuralRuntimeLayout::Absent,
+             ClassifyNeuralRuntimeLayout(false, false, false, false));
+    CHECK_EQ(NeuralRuntimeLayout::Complete,
+             ClassifyNeuralRuntimeLayout(true, true, true, true));
+
+    for (unsigned presentMask = 1; presentMask < 15; ++presentMask) {
+        CHECK_EQ(NeuralRuntimeLayout::Incomplete,
+                 ClassifyNeuralRuntimeLayout(
+                     (presentMask & 1U) != 0,
+                     (presentMask & 2U) != 0,
+                     (presentMask & 4U) != 0,
+                     (presentMask & 8U) != 0));
+    }
+}
+
+void default_neural_carrier_uses_native_resolution_dlaa_test()
+{
+    CHECK_EQ(NVSDK_NGX_PerfQuality_Value_DLAA,
+             DefaultNeuralCarrierQuality());
+}
+
+void windows_command_line_quoting_round_trip_test()
+{
+    constexpr std::wstring_view executable = L"C:\\Program Files\\DLSS Player\\DLSSVideoPlayer.exe";
+    const std::vector<std::wstring> arguments = {
+        L"movie.mp4",
+        L"C:\\Videos\\clip with spaces.mp4",
+        L"",
+        L"--future-option=\"quoted value\"",
+        L"C:\\trailing slash\\",
+        L"plain\\slashes",
+        L"embedded\"quote",
+    };
+    constexpr std::wstring_view expected =
+        L"\"C:\\Program Files\\DLSS Player\\DLSSVideoPlayer.exe\" "
+        L"\"movie.mp4\" "
+        L"\"C:\\Videos\\clip with spaces.mp4\" "
+        L"\"\" "
+        L"\"--future-option=\\\"quoted value\\\"\" "
+        L"\"C:\\trailing slash\\\\\" "
+        L"\"plain\\slashes\" "
+        L"\"embedded\\\"quote\"";
+
+    const std::wstring commandLine = BuildWindowsCommandLine(executable, arguments);
+    CHECK_EQ(std::wstring(expected), commandLine);
+
+    int parsedCount = 0;
+    LPWSTR* parsed = CommandLineToArgvW(commandLine.c_str(), &parsedCount);
+    CHECK(parsed != nullptr);
+    if (parsed) {
+        CHECK_EQ(static_cast<int>(arguments.size() + 1), parsedCount);
+        if (parsedCount == static_cast<int>(arguments.size() + 1)) {
+            CHECK_EQ(std::wstring(executable), std::wstring(parsed[0]));
+            for (size_t index = 0; index < arguments.size(); ++index) {
+                CHECK_EQ(arguments[index], std::wstring(parsed[index + 1]));
+            }
+        }
+        LocalFree(parsed);
+    }
+}
+
+void runtime_argument_parsing_preserves_user_arguments_and_strips_markers_test()
+{
+    const wchar_t* argv[] = {
+        L"C:\\Program Files\\DLSS Player\\DLSSVideoPlayer.exe",
+        L"--future-flag",
+        L"",
+        L"C:\\Videos\\clip with spaces.mp4",
+        L"quoted\"value",
+        L"--safe-mode",
+        L"--addon-bootstrap-restarted",
+        L"--safe-mode",
+        L"--addon-bootstrap-restarted",
+    };
+    const std::vector<std::wstring> expected = {
+        L"--future-flag",
+        L"",
+        L"C:\\Videos\\clip with spaces.mp4",
+        L"quoted\"value",
+        L"--safe-mode",
+    };
+
+    const RuntimeArguments parsed = ParseRuntimeArguments(static_cast<int>(std::size(argv)), argv);
+    CHECK(parsed.ok);
+    CHECK(parsed.safeMode);
+    CHECK(parsed.error.empty());
+    CHECK_EQ(expected.size(), parsed.userArguments.size());
+    if (parsed.userArguments.size() == expected.size()) {
+        for (size_t index = 0; index < expected.size(); ++index) {
+            CHECK_EQ(expected[index], parsed.userArguments[index]);
+        }
+    }
+
+    const RuntimeArguments failed = ParseRuntimeArguments(0, nullptr);
+    CHECK(!failed.ok);
+    CHECK(!failed.safeMode);
+    CHECK(failed.userArguments.empty());
+    CHECK(!failed.error.empty());
+}
+
+void restart_argument_lifecycle_and_create_process_command_line_test()
+{
+    const std::vector<std::wstring> contaminated = {
+        L"--future-flag",
+        L"",
+        L"--addon-bootstrap-restarted",
+        L"C:\\Videos\\clip with spaces.mp4",
+        L"--safe-mode",
+        L"--safe-mode",
+        L"--addon-bootstrap-restarted",
+    };
+
+    const std::vector<std::wstring> safeMode = BuildSafeModeRestartArguments(contaminated);
+    const std::vector<std::wstring> expectedSafeMode = {
+        L"--future-flag",
+        L"",
+        L"C:\\Videos\\clip with spaces.mp4",
+        L"--safe-mode",
+    };
+    CHECK_EQ(expectedSafeMode.size(), safeMode.size());
+    if (safeMode.size() == expectedSafeMode.size()) {
+        for (size_t index = 0; index < safeMode.size(); ++index) {
+            CHECK_EQ(expectedSafeMode[index], safeMode[index]);
+        }
+    }
+
+    constexpr std::wstring_view executable = L"C:\\Program Files\\DLSS Player\\DLSSVideoPlayer.exe";
+    constexpr std::wstring_view expectedCommandLine =
+        L"\"C:\\Program Files\\DLSS Player\\DLSSVideoPlayer.exe\" "
+        L"\"--future-flag\" \"\" "
+        L"\"C:\\Videos\\clip with spaces.mp4\" "
+        L"\"--safe-mode\"";
+    CHECK_EQ(std::wstring(expectedCommandLine), BuildWindowsCommandLine(executable, safeMode));
+}
+
+void advanced_safe_mode_normal_invocation_adds_safe_mode_test()
+{
+    const std::vector<std::wstring> normalArguments = {
+        L"--future-flag",
+        L"",
+        L"C:\\Videos\\clip with spaces.mp4",
+    };
+    const std::vector<std::wstring> expected = {
+        L"--future-flag",
+        L"",
+        L"C:\\Videos\\clip with spaces.mp4",
+        L"--safe-mode",
+    };
+    int launchCalls = 0;
+    std::vector<std::wstring> launchedArguments;
+
+    const SafeModeRestartOutcome outcome = ExecuteAdvancedSafeModeRestart(
+        true,
+        normalArguments,
+        [&](const std::vector<std::wstring>& arguments) {
+            ++launchCalls;
+            launchedArguments = arguments;
+            return true;
+        });
+
+    CHECK_EQ(SafeModeRestartOutcome::CloseCurrent, outcome);
+    CHECK_EQ(1, launchCalls);
+    CHECK_EQ(expected.size(), launchedArguments.size());
+    if (launchedArguments.size() == expected.size()) {
+        for (size_t index = 0; index < expected.size(); ++index) {
+            CHECK_EQ(expected[index], launchedArguments[index]);
+        }
+    }
+}
+
+void advanced_safe_mode_cancel_keeps_current_open_without_launch_test()
+{
+    int launchCalls = 0;
+    const SafeModeRestartOutcome outcome = ExecuteAdvancedSafeModeRestart(
+        false,
+        {L"--future-flag"},
+        [&](const std::vector<std::wstring>&) {
+            ++launchCalls;
+            return true;
+        });
+
+    CHECK_EQ(SafeModeRestartOutcome::Cancelled, outcome);
+    CHECK_EQ(0, launchCalls);
+}
+
+void advanced_safe_mode_launch_failure_keeps_current_open_test()
+{
+    int launchCalls = 0;
+    const SafeModeRestartOutcome outcome = ExecuteAdvancedSafeModeRestart(
+        true,
+        {L"--future-flag"},
+        [&](const std::vector<std::wstring>& arguments) {
+            ++launchCalls;
+            CHECK_EQ(2u, arguments.size());
+            if (arguments.size() == 2) {
+                CHECK_EQ(std::wstring(L"--future-flag"), arguments[0]);
+                CHECK_EQ(std::wstring(L"--safe-mode"), arguments[1]);
+            }
+            return false;
+        });
+
+    CHECK_EQ(SafeModeRestartOutcome::LaunchFailed, outcome);
+    CHECK_EQ(1, launchCalls);
+}
+
+void advanced_safe_mode_launch_success_closes_with_sanitized_arguments_test()
+{
+    const std::vector<std::wstring> contaminated = {
+        L"--addon-bootstrap-restarted",
+        L"--safe-mode",
+        L"--future-flag",
+        L"--safe-mode",
+    };
+    const std::vector<std::wstring> expected = {
+        L"--safe-mode",
+        L"--future-flag",
+    };
+    int launchCalls = 0;
+    std::vector<std::wstring> launchedArguments;
+
+    const SafeModeRestartOutcome outcome = ExecuteAdvancedSafeModeRestart(
+        true,
+        contaminated,
+        [&](const std::vector<std::wstring>& arguments) {
+            ++launchCalls;
+            launchedArguments = arguments;
+            return true;
+        });
+
+    CHECK_EQ(SafeModeRestartOutcome::CloseCurrent, outcome);
+    CHECK_EQ(1, launchCalls);
+    CHECK_EQ(expected.size(), launchedArguments.size());
+    if (launchedArguments.size() == expected.size()) {
+        for (size_t index = 0; index < expected.size(); ++index) {
+            CHECK_EQ(expected[index], launchedArguments[index]);
+        }
+    }
+}
+
+void disabled_addons_creates_missing_addon_section_test()
+{
+    constexpr std::string_view input =
+        "[GENERAL]\r\n"
+        "PresetPath=C:\\Games\\Player\r\n";
+    constexpr std::string_view expected =
+        "[GENERAL]\r\n"
+        "PresetPath=C:\\Games\\Player\r\n"
+        "[ADDON]\r\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\r\n";
+
+    CHECK_EQ(std::string(expected), UpdateDisabledAddonsIni(input, kNeuralAddon, true));
+}
+
+void disabled_addons_updates_empty_and_populated_lists_test()
+{
+    constexpr std::string_view emptyInput =
+        "[ADDON]\n"
+        "DisabledAddons=\n"
+        "[INPUT]\n"
+        "KeyMenu=36\n";
+    constexpr std::string_view emptyExpected =
+        "[ADDON]\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\n"
+        "[INPUT]\n"
+        "KeyMenu=36\n";
+    constexpr std::string_view populatedInput =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,third-party.addon64\n";
+    constexpr std::string_view populatedExpected =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,third-party.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64\n";
+
+    CHECK_EQ(std::string(emptyExpected), UpdateDisabledAddonsIni(emptyInput, kNeuralAddon, true));
+    CHECK_EQ(std::string(populatedExpected), UpdateDisabledAddonsIni(populatedInput, kNeuralAddon, true));
+}
+
+void disabled_addons_preserves_mixed_line_endings_and_unrelated_sections_test()
+{
+    constexpr std::string_view input =
+        "[GENERAL]\r\n"
+        "NoReloadOnInit=1\n"
+        "[ADDON]\r"
+        "DisabledAddons=legacy.addon64\r"
+        "[OVERLAY]\n"
+        "TutorialProgress=3\r\n";
+    constexpr std::string_view expected =
+        "[GENERAL]\r\n"
+        "NoReloadOnInit=1\n"
+        "[ADDON]\r"
+        "DisabledAddons=legacy.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64\r"
+        "[OVERLAY]\n"
+        "TutorialProgress=3\r\n";
+
+    CHECK_EQ(std::string(expected), UpdateDisabledAddonsIni(input, kNeuralAddon, true));
+}
+
+void disabled_addons_removes_only_exact_target_entries_test()
+{
+    constexpr std::string_view input =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64,renodx-dlss5.addon64.bak,DLSS 5 Neural Rendering@renodx-dlss5.addon64,other.addon64\n";
+    constexpr std::string_view expected =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,renodx-dlss5.addon64.bak,other.addon64\n";
+
+    CHECK_EQ(std::string(expected), UpdateDisabledAddonsIni(input, kNeuralAddon, false));
+}
+
+void disabled_addons_collapses_only_exact_target_duplicates_test()
+{
+    constexpr std::string_view input =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64,renodx-dlss5.addon64.bak\n";
+    constexpr std::string_view expected =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64,renodx-dlss5.addon64.bak\n";
+
+    CHECK_EQ(std::string(expected), UpdateDisabledAddonsIni(input, kNeuralAddon, true));
+}
+
+void disabled_addons_matches_trimmed_tokens_without_changing_retained_whitespace_test()
+{
+    constexpr std::string_view input =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64, DLSS 5 Neural Rendering@renodx-dlss5.addon64,  other.addon64\n";
+    constexpr std::string_view enabledExpected =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,  other.addon64\n";
+
+    CHECK_EQ(std::string(enabledExpected), UpdateDisabledAddonsIni(input, kNeuralAddon, false));
+    CHECK_EQ(std::string(input), UpdateDisabledAddonsIni(input, kNeuralAddon, true));
+    CHECK_EQ(std::string(input), UpdateDisabledAddonsIni(
+        UpdateDisabledAddonsIni(input, kNeuralAddon, true), kNeuralAddon, true));
+}
+
+void reshade_68_disabled_addon_token_conformance_test()
+{
+    const std::string canonical = "[ADDON]\nDisabledAddons=" + std::string(kNeuralAddon) + "\n";
+    const std::string registeredName = "[ADDON]\nDisabledAddons=" + std::string(kNeuralAddonName) + "\n";
+    const std::string atFilename = "[ADDON]\nDisabledAddons=@" + std::string(kNeuralAddonFilename) + "\n";
+    const std::string legacyBareFilename = "[ADDON]\nDisabledAddons=" + std::string(kNeuralAddonFilename) + "\n";
+    const std::string wrongCaseCanonical =
+        "[ADDON]\nDisabledAddons=dlss 5 neural rendering@RENODX-DLSS5.ADDON64\n";
+
+    const ConfigUpdate canonicalState = EvaluateNeuralAddonConfigUpdate(canonical, canonical, false, false);
+    CHECK(canonicalState.ok);
+    CHECK(!canonicalState.addonEnabled);
+    const ConfigUpdate nameState = EvaluateNeuralAddonConfigUpdate(registeredName, registeredName, false, false);
+    CHECK(nameState.ok);
+    CHECK(!nameState.addonEnabled);
+    const ConfigUpdate filenameState = EvaluateNeuralAddonConfigUpdate(atFilename, atFilename, false, false);
+    CHECK(filenameState.ok);
+    CHECK(!filenameState.addonEnabled);
+    const ConfigUpdate legacyState = EvaluateNeuralAddonConfigUpdate(
+        legacyBareFilename, legacyBareFilename, false, true);
+    CHECK(legacyState.ok);
+    CHECK(legacyState.addonEnabled);
+    const ConfigUpdate wrongCaseState = EvaluateNeuralAddonConfigUpdate(
+        wrongCaseCanonical, wrongCaseCanonical, false, true);
+    CHECK(wrongCaseState.ok);
+    CHECK(wrongCaseState.addonEnabled);
+}
+
+void reshade_68_aliases_migrate_to_one_canonical_token_test()
+{
+    constexpr std::string_view input =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,DLSS 5 Neural Rendering,@renodx-dlss5.addon64,renodx-dlss5.addon64,dlss 5 neural rendering@RENODX-DLSS5.ADDON64,other.addon64\n";
+    constexpr std::string_view disabledExpected =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64,other.addon64\n";
+    constexpr std::string_view enabledExpected =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,other.addon64\n";
+
+    const std::string disabled = UpdateDisabledAddonsIni(input, kNeuralAddon, true);
+    CHECK_EQ(std::string(disabledExpected), disabled);
+    CHECK_EQ(disabled, UpdateDisabledAddonsIni(disabled, kNeuralAddon, true));
+    CHECK_EQ(std::string(enabledExpected), UpdateDisabledAddonsIni(input, kNeuralAddon, false));
+}
+
+void reshade_68_section_and_key_lookup_are_case_sensitive_test()
+{
+    constexpr std::string_view wrongCaseSection =
+        "[addon]\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\n";
+    constexpr std::string_view wrongCaseSectionExpected =
+        "[addon]\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\n"
+        "[ADDON]\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\n";
+    constexpr std::string_view wrongCaseKey =
+        "[ADDON]\r\n"
+        "disabledaddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\r\n"
+        "KeyOverlay=36\r\n";
+    constexpr std::string_view wrongCaseKeyExpected =
+        "[ADDON]\r\n"
+        "disabledaddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\r\n"
+        "KeyOverlay=36\r\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\r\n";
+
+    CHECK_EQ(std::string(wrongCaseSectionExpected),
+        UpdateDisabledAddonsIni(wrongCaseSection, kNeuralAddon, true));
+    CHECK_EQ(std::string(wrongCaseKeyExpected),
+        UpdateDisabledAddonsIni(wrongCaseKey, kNeuralAddon, true));
+}
+
+void reshade_68_utf8_bom_is_ignored_for_lookup_and_preserved_test()
+{
+    const std::string input =
+        std::string("\xEF\xBB\xBF") + "[ADDON]\r\nDisabledAddons=" + std::string(kNeuralAddon) + "\r\n";
+    const std::string enabledExpected =
+        std::string("\xEF\xBB\xBF") + "[ADDON]\r\nDisabledAddons=\r\n";
+
+    CHECK_EQ(input, UpdateDisabledAddonsIni(input, kNeuralAddon, true));
+    CHECK_EQ(enabledExpected, UpdateDisabledAddonsIni(input, kNeuralAddon, false));
+    const ConfigUpdate state = EvaluateNeuralAddonConfigUpdate(input, input, false, false);
+    CHECK(state.ok);
+    CHECK(!state.addonEnabled);
+}
+
+void disabled_addons_insertion_uses_target_section_line_ending_test()
+{
+    constexpr std::string_view input =
+        "[GENERAL]\r\n"
+        "PresetPath=.\\ReShadePreset.ini\r\n"
+        "[ADDON]\n"
+        "KeyOverlay=36\n"
+        "[INPUT]\r\n"
+        "KeyMenu=36\r\n";
+    constexpr std::string_view expected =
+        "[GENERAL]\r\n"
+        "PresetPath=.\\ReShadePreset.ini\r\n"
+        "[ADDON]\n"
+        "KeyOverlay=36\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\n"
+        "[INPUT]\r\n"
+        "KeyMenu=36\r\n";
+
+    CHECK_EQ(std::string(expected), UpdateDisabledAddonsIni(input, kNeuralAddon, true));
+}
+
+// NREnableUpscaling is a RenoDX 4.70 key that 6.x deleted, so it is no longer
+// managed - and a leftover copy in a user's ReShade.ini is left exactly where
+// it is, at exactly the value they had. The two keys that replaced it are
+// appended at the end of the section, which is where UpdateExactIniKey puts a
+// key the section does not already carry.
+void neural_addon_runtime_settings_enable_neural_and_hold_native_resolution_test()
+{
+    constexpr std::string_view input =
+        "[ADDON]\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64,legacy.addon64\n"
+        "[RenoDX.DLSS5]\n"
+        "EnableHooks=0\n"
+        "NeuralUplift=0\n"
+        "NREnableUpscaling=1\n"
+        "NRIntensity=1.25\n";
+    constexpr std::string_view expected =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64\n"
+        "[RenoDX.DLSS5]\n"
+        "EnableHooks=2\n"
+        "NeuralUplift=1\n"
+        "NREnableUpscaling=1\n"
+        "NRIntensity=1.25\n"
+        "NRFollowInputRes=0\n"
+        "NRResolutionScale=1\n";
+
+    const std::string updated = UpdateNeuralAddonIni(input, true);
+    CHECK_EQ(std::string(expected), updated);
+    CHECK_EQ(updated, UpdateNeuralAddonIni(updated, true));
+}
+
+void neural_addon_runtime_settings_are_created_at_native_resolution_test()
+{
+    constexpr std::string_view input =
+        "[GENERAL]\r\n"
+        "PresetPath=.\\ReShadePreset.ini\r\n";
+    constexpr std::string_view expected =
+        "[GENERAL]\r\n"
+        "PresetPath=.\\ReShadePreset.ini\r\n"
+        "[ADDON]\r\n"
+        "DisabledAddons=\r\n"
+        "[RenoDX.DLSS5]\r\n"
+        "ConfigVersion=6\r\n"
+        "EnableHooks=2\r\n"
+        "NeuralUplift=1\r\n"
+        "NRFollowInputRes=0\r\n"
+        "NRResolutionScale=1\r\n";
+
+    CHECK_EQ(std::string(expected), UpdateNeuralAddonIni(input, true));
+}
+
+// RenoDX 6.5.3 reads a [RenoDX.DLSS5] without ConfigVersion as schema v0 and
+// migrates it on load, adopting its own NRChainedHistory/NRCodecMode for that
+// launch. A section this player wrote - its managed keys and its overrides, and
+// nothing else - is stamped with the version the add-on stamps itself; one with
+// anybody else's key or a version of its own is left to the add-on.
+void neural_addon_section_this_player_writes_carries_the_addon_schema_version_test()
+{
+    const std::vector<NeuralAddonOverride> overrides{{"NRChainedHistory", "0"}, {"NRPasses", "2"}};
+    // Created: the version opens the section, before the managed contract.
+    const std::string created = UpdateNeuralAddonIni("", true, overrides);
+    CHECK_EQ(std::string("[ADDON]\r\nDisabledAddons=\r\n[RenoDX.DLSS5]\r\nConfigVersion=6\r\n"
+                         "EnableHooks=2\r\nNeuralUplift=1\r\nNRFollowInputRes=0\r\n"
+                         "NRResolutionScale=1\r\nNRChainedHistory=0\r\nNRPasses=2\r\n"),
+             created);
+    CHECK_EQ(created, UpdateNeuralAddonIni(created, true, overrides));
+
+    // Repaired: a section an earlier build wrote and the add-on never loaded.
+    // Every user value stays where and what it was; the version is appended.
+    constexpr std::string_view unversioned =
+        "[ADDON]\nDisabledAddons=\n[RenoDX.DLSS5]\nEnableHooks=2\nNeuralUplift=1\n"
+        "; the user's note\nNRChainedHistory=0\nNRFollowInputRes=0\nNRResolutionScale=1\n"
+        "NRPasses=2\n[OVERLAY]\nWindow=x\n";
+    const std::string repaired = UpdateNeuralAddonIni(unversioned, true, overrides);
+    CHECK_EQ(std::string("[ADDON]\nDisabledAddons=\n[RenoDX.DLSS5]\nEnableHooks=2\nNeuralUplift=1\n"
+                         "; the user's note\nNRChainedHistory=0\nNRFollowInputRes=0\nNRResolutionScale=1\n"
+                         "NRPasses=2\nConfigVersion=6\n[OVERLAY]\nWindow=x\n"),
+             repaired);
+    CHECK_EQ(repaired, UpdateNeuralAddonIni(repaired, true, overrides));
+    // The worker's own call writes no overrides: a section it did not write
+    // entirely is not its to stamp, and one already stamped stays as it is -
+    // so a resident helper never sees a "repair" the player's write implied.
+    CHECK_EQ(repaired, UpdateNeuralAddonIni(repaired, true));
+    CHECK(UpdateNeuralAddonIni(unversioned, true).find("ConfigVersion") == std::string::npos);
+    // An empty section is one this player may have created.
+    CHECK(UpdateNeuralAddonIni("[RenoDX.DLSS5]\n", true).find("ConfigVersion=6") != std::string::npos);
+
+    // Somebody else's keys may be pre-v6 ones: the add-on's migration is for them.
+    for (const std::string_view foreign : {
+            std::string_view("[RenoDX.DLSS5]\nNREnableUpscaling=0\nNRChainedHistory=0\n"),
+            std::string_view("[RenoDX.DLSS5]\nNRChainedHistory=0\nFutureTuning=1\n"),
+            std::string_view("[RenoDX.DLSS5]\nConfigVersion=4\nNRChainedHistory=0\n"),
+            std::string_view("[RenoDX.DLSS5]\nConfigVersion=7\n"),
+            std::string_view("[RenoDX.DLSS5]\nConfigVersion = 6\nNRCodecMode=2\n")}) {
+        const std::string updated = UpdateNeuralAddonIni(foreign, true, overrides);
+        const size_t first = updated.find("ConfigVersion");
+        const bool hadVersion = foreign.find("ConfigVersion") != std::string_view::npos;
+        CHECK_EQ(hadVersion, first != std::string::npos);
+        if (hadVersion) CHECK_EQ(std::string::npos, updated.find("ConfigVersion", first + 1));
+        // The user's lines are untouched, in order.
+        CHECK(updated.find(foreign.substr(std::string_view("[RenoDX.DLSS5]\n").size())) !=
+              std::string::npos);
+    }
+
+    // Disabling never creates the section, and the version is not an override.
+    CHECK(UpdateNeuralAddonIni("", false, overrides).find("RenoDX.DLSS5") == std::string::npos);
+    const NeuralAddonOverride version{"ConfigVersion", "5"};
+    bool rejected = false;
+    try { (void)UpdateNeuralAddonIni("", true, std::span{&version, 1}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    CHECK(rejected);
+}
+
+void neural_addon_runtime_settings_fail_closed_on_duplicate_managed_keys_test()
+{
+    constexpr std::string_view input =
+        "[ADDON]\n"
+        "DisabledAddons=\n"
+        "[RenoDX.DLSS5]\n"
+        "NeuralUplift=1\n"
+        "NeuralUplift=0\n";
+    bool rejected = false;
+    try {
+        (void)UpdateNeuralAddonIni(input, true);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    CHECK(rejected);
+}
+
+void reshade_trailing_section_text_uses_reshade_section_boundaries_test()
+{
+    constexpr std::string_view input =
+        "[ADDON] ; ReShade accepts trailing text\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\n"
+        "[RenoDX.DLSS5] ; existing settings\n"
+        "NRIntensity=1.25\n"
+        "[OTHER] ; this must end the RenoDX section\n"
+        "Foo=1\n";
+    constexpr std::string_view expected =
+        "[ADDON] ; ReShade accepts trailing text\n"
+        "DisabledAddons=\n"
+        "[RenoDX.DLSS5] ; existing settings\n"
+        "NRIntensity=1.25\n"
+        "EnableHooks=2\n"
+        "NeuralUplift=1\n"
+        "NRFollowInputRes=0\n"
+        "NRResolutionScale=1\n"
+        "[OTHER] ; this must end the RenoDX section\n"
+        "Foo=1\n";
+
+    CHECK_EQ(std::string(expected), UpdateNeuralAddonIni(input, true));
+}
+
+void configure_neural_addon_is_idempotent_test()
+{
+    const std::filesystem::path path = process_temp_path(L"PolicyTests-ReShade.ini");
+    remove_file_if_present(path);
+    constexpr std::string_view input =
+        "[GENERAL]\n"
+        "PresetPath=C:\\Games\\Player\n"
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64\n";
+    constexpr std::string_view expected =
+        "[GENERAL]\n"
+        "PresetPath=C:\\Games\\Player\n"
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64\n"
+        "[RenoDX.DLSS5]\n"
+        "ConfigVersion=6\n"
+        "EnableHooks=2\n"
+        "NeuralUplift=1\n"
+        "NRFollowInputRes=0\n"
+        "NRResolutionScale=1\n";
+    write_binary_file(path, input);
+
+    const ConfigUpdate first = ConfigureNeuralAddon(path, true);
+    CHECK(first.ok);
+    CHECK(first.changed);
+    CHECK(first.addonEnabled);
+    CHECK(first.error.empty());
+    CHECK_EQ(std::string(expected), read_binary_file(path));
+
+    const std::string afterFirst = read_binary_file(path);
+    const ConfigUpdate second = ConfigureNeuralAddon(path, true);
+    CHECK(second.ok);
+    CHECK(!second.changed);
+    CHECK(second.previousAddonEnabled);
+    CHECK(second.addonEnabled);
+    CHECK(second.error.empty());
+    CHECK_EQ(afterFirst, read_binary_file(path));
+
+    remove_file_if_present(path);
+}
+
+void configure_neural_addon_reports_semantic_state_across_text_canonicalization_test()
+{
+    const std::filesystem::path path = process_temp_path(L"PolicyTests-ReShade-semantic.ini");
+    remove_file_if_present(path);
+
+    constexpr std::string_view missingAddonInput =
+        "[GENERAL]\n"
+        "PresetPath=.\\ReShadePreset.ini\n";
+    write_binary_file(path, missingAddonInput);
+    const ConfigUpdate missingAddon = ConfigureNeuralAddon(path, true);
+    CHECK(missingAddon.ok);
+    CHECK(missingAddon.changed);
+    CHECK(missingAddon.previousAddonEnabled);
+    CHECK(missingAddon.addonEnabled);
+
+    constexpr std::string_view duplicateTargetInput =
+        "[ADDON]\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64,legacy.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64\n";
+    write_binary_file(path, duplicateTargetInput);
+    const ConfigUpdate duplicateTarget = ConfigureNeuralAddon(path, false);
+    CHECK(duplicateTarget.ok);
+    CHECK(duplicateTarget.changed);
+    CHECK(!duplicateTarget.previousAddonEnabled);
+    CHECK(!duplicateTarget.addonEnabled);
+
+    remove_file_if_present(path);
+}
+
+void configure_neural_addon_safe_then_normal_observes_reshade_state_test()
+{
+    const std::filesystem::path path =
+        process_temp_path(L"PolicyTests-ReShade-safe-normal.ini");
+    remove_file_if_present(path);
+    constexpr std::string_view legacyInput =
+        "[ADDON]\r\n"
+        "DisabledAddons=legacy.addon64,renodx-dlss5.addon64\r\n";
+    constexpr std::string_view safeExpected =
+        "[ADDON]\r\n"
+        "DisabledAddons=legacy.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64\r\n";
+    constexpr std::string_view normalExpected =
+        "[ADDON]\r\n"
+        "DisabledAddons=legacy.addon64\r\n"
+        "[RenoDX.DLSS5]\r\n"
+        "ConfigVersion=6\r\n"
+        "EnableHooks=2\r\n"
+        "NeuralUplift=1\r\n"
+        "NRFollowInputRes=0\r\n"
+        "NRResolutionScale=1\r\n";
+    write_binary_file(path, legacyInput);
+
+    const ConfigUpdate safe = ConfigureNeuralAddon(path, false);
+    CHECK(safe.ok);
+    CHECK(safe.changed);
+    CHECK(safe.previousAddonEnabled);
+    CHECK(!safe.addonEnabled);
+    CHECK_EQ(std::string(safeExpected), read_binary_file(path));
+
+    const ConfigUpdate safeAgain = ConfigureNeuralAddon(path, false);
+    CHECK(safeAgain.ok);
+    CHECK(!safeAgain.changed);
+    CHECK(!safeAgain.previousAddonEnabled);
+    CHECK(!safeAgain.addonEnabled);
+    CHECK_EQ(std::string(safeExpected), read_binary_file(path));
+
+    const ConfigUpdate normal = ConfigureNeuralAddon(path, true);
+    CHECK(normal.ok);
+    CHECK(normal.changed);
+    CHECK(!normal.previousAddonEnabled);
+    CHECK(normal.addonEnabled);
+    CHECK_EQ(std::string(normalExpected), read_binary_file(path));
+
+    const ConfigUpdate normalAgain = ConfigureNeuralAddon(path, true);
+    CHECK(normalAgain.ok);
+    CHECK(!normalAgain.changed);
+    CHECK(normalAgain.previousAddonEnabled);
+    CHECK(normalAgain.addonEnabled);
+    CHECK_EQ(std::string(normalExpected), read_binary_file(path));
+
+    remove_file_if_present(path);
+}
+
+void evaluated_config_update_observes_actual_final_bytes_test()
+{
+    constexpr std::string_view enabledIni =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64\n";
+    constexpr std::string_view disabledIni =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64,DLSS 5 Neural Rendering@renodx-dlss5.addon64\n";
+
+    const ConfigUpdate mismatch = EvaluateNeuralAddonConfigUpdate(enabledIni, disabledIni, true, true);
+    CHECK(!mismatch.ok);
+    CHECK(mismatch.changed);
+    CHECK(mismatch.previousAddonEnabled);
+    CHECK(!mismatch.addonEnabled);
+    CHECK(!mismatch.error.empty());
+
+    const ConfigUpdate observed = EvaluateNeuralAddonConfigUpdate(disabledIni, enabledIni, true, true);
+    CHECK(observed.ok);
+    CHECK(observed.changed);
+    CHECK(!observed.previousAddonEnabled);
+    CHECK(observed.addonEnabled);
+    CHECK(observed.error.empty());
+}
+
+void configure_neural_addon_fails_closed_for_malformed_ini_test()
+{
+    const std::filesystem::path path = process_temp_path(L"PolicyTests-ReShade-malformed.ini");
+    remove_file_if_present(path);
+    constexpr char nulContent[] = "[ADDON]\nDisabledAddons=legacy.addon64\0tail";
+    const std::string nulInput{nulContent, sizeof(nulContent) - 1};
+    write_binary_file(path, nulInput);
+
+    const ConfigUpdate nulResult = ConfigureNeuralAddon(path, false);
+    CHECK(!nulResult.ok);
+    CHECK(!nulResult.changed);
+    CHECK(!nulResult.addonEnabled);
+    CHECK(!nulResult.error.empty());
+    CHECK_EQ(nulInput, read_binary_file(path));
+
+    constexpr std::string_view duplicateInput =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\n";
+    write_binary_file(path, duplicateInput);
+    const ConfigUpdate duplicateResult = ConfigureNeuralAddon(path, true);
+    CHECK(!duplicateResult.ok);
+    CHECK(!duplicateResult.changed);
+    CHECK(!duplicateResult.addonEnabled);
+    CHECK(!duplicateResult.error.empty());
+    CHECK_EQ(std::string(duplicateInput), read_binary_file(path));
+
+    constexpr std::string_view crossSectionDuplicateInput =
+        "[ADDON]\n"
+        "DisabledAddons=legacy.addon64\n"
+        "[ADDON]\n"
+        "DisabledAddons=DLSS 5 Neural Rendering@renodx-dlss5.addon64\n";
+    write_binary_file(path, crossSectionDuplicateInput);
+    const ConfigUpdate crossSectionResult = ConfigureNeuralAddon(path, true);
+    CHECK(!crossSectionResult.ok);
+    CHECK(!crossSectionResult.changed);
+    CHECK(!crossSectionResult.addonEnabled);
+    CHECK(!crossSectionResult.error.empty());
+    CHECK_EQ(std::string(crossSectionDuplicateInput), read_binary_file(path));
+
+    remove_file_if_present(path);
+}
+
+void configure_neural_addon_rejects_non_regular_path_before_replacement_test()
+{
+    const std::filesystem::path path = process_temp_path(L"PolicyTests-ReShade-directory");
+    std::error_code removeError;
+    std::filesystem::remove_all(path, removeError);
+    CHECK(!removeError);
+    std::filesystem::create_directory(path, removeError);
+    CHECK(!removeError);
+    CHECK(std::filesystem::is_directory(path, removeError));
+    CHECK(!removeError);
+
+    const ConfigUpdate result = ConfigureNeuralAddon(path, true);
+    CHECK(!result.ok);
+    CHECK(!result.changed);
+    CHECK(!result.addonEnabled);
+    CHECK(!result.error.empty());
+    CHECK(std::filesystem::is_directory(path));
+
+    std::filesystem::remove_all(path, removeError);
+    CHECK(!removeError);
+    CHECK(!std::filesystem::exists(path, removeError));
+    CHECK(!removeError);
+}
+
+void youtube_url_validation_accepts_only_supported_video_routes_test()
+{
+    const std::array accepted{
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ",
+        L"https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        L"https://m.youtube.com/watch?v=dQw4w9WgXcQ",
+        L"https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+        L"https://youtu.be/dQw4w9WgXcQ",
+        L"https://youtu.be/dQw4w9WgXcQ?t=12",
+        L"https://youtube.com/shorts/dQw4w9WgXcQ",
+        L"https://youtube.com/watch?list=PL123&v=dQw4w9WgXcQ&index=2",
+        L"https://youtube.com:443/watch?v=dQw4w9WgXcQ",
+        L"https://youtube.com:8443/watch?v=dQw4w9WgXcQ",
+    };
+
+    for (const std::wstring_view value : accepted) {
+        CHECK(IsSupportedYouTubeUrl(value));
+    }
+}
+
+void youtube_url_validation_rejects_unsafe_or_unselected_inputs_test()
+{
+    std::vector<std::wstring> rejected{
+        L"http://youtube.com/watch?v=dQw4w9WgXcQ",
+        L"https://user@youtube.com/watch?v=dQw4w9WgXcQ",
+        L"https://user:secret@youtube.com/watch?v=dQw4w9WgXcQ",
+        L"https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ",
+        L"https://notyoutube.com/watch?v=dQw4w9WgXcQ",
+        L"https://example.com/watch?v=dQw4w9WgXcQ",
+        L"file:///C:/video.mp4",
+        L"C:\\video.mp4",
+        L"\\\\server\\share\\video.mp4",
+        L"https://youtube.com/watch?v=bad\nvalue",
+        L"https://youtube.com/watch?v=\"secret\"",
+        L"https://youtube.com/watch?v='secret'",
+        L"",
+        L"   ",
+        L" https://youtube.com/watch?v=dQw4w9WgXcQ",
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ ",
+        L"https://youtube.com/playlist?list=PL123",
+        L"https://youtube.com/watch?list=PL123",
+        L"https://youtube.com/watch?v=",
+        L"https://youtube.com/shorts/",
+        L"https://youtu.be/",
+        L"https://youtube.com/embed/dQw4w9WgXcQ",
+        L"https://youtube.com./watch?v=dQw4w9WgXcQ",
+        L"https://youtube.com.evil.example./watch?v=dQw4w9WgXcQ",
+        L"https://y\u043eutube.com/watch?v=dQw4w9WgXcQ",
+        L"https://youtube.com\u3002evil.example/watch?v=dQw4w9WgXcQ",
+        L"https://xn--youtube-9d0b.com/watch?v=dQw4w9WgXcQ",
+    };
+    rejected.push_back(L"https://youtube.com/watch?v=" + std::wstring(2049, L'a'));
+
+    std::wstring embeddedNul = L"https://youtube.com/watch?v=dQw4w9WgXcQ";
+    embeddedNul.push_back(L'\0');
+    embeddedNul.append(L"dQw4w9WgXcQ");
+    rejected.push_back(std::move(embeddedNul));
+
+    for (const std::wstring& value : rejected) {
+        CHECK(!IsSupportedYouTubeUrl(value));
+    }
+}
+
+void youtube_watch_query_requires_one_unambiguous_lowercase_v_field_test()
+{
+    // Every id below is a valid eleven-character one, so only the field rules
+    // can be what rejects these.
+    const std::array rejected{
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ&v=dQw4w9WgXcQ",
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ&v=dQw4w9WgXcR",
+        L"https://youtube.com/watch?v=&v=dQw4w9WgXcQ",
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ&v=",
+        L"https://youtube.com/watch?V=dQw4w9WgXcQ",
+        L"https://youtube.com/watch?V=dQw4w9WgXcQ&v=dQw4w9WgXcR",
+        L"https://youtube.com/watch?%76=dQw4w9WgXcQ",
+        L"https://youtube.com/watch?%56=dQw4w9WgXcQ&v=dQw4w9WgXcR",
+        L"https://youtube.com/watch?v%3DdQw4w9WgXcQ",
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ%26v%3DdQw4w9WgXcR",
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ%26list%3DPL123",
+    };
+
+    for (const std::wstring_view value : rejected) {
+        CHECK(!IsSupportedYouTubeUrl(value));
+    }
+}
+
+void youtube_video_id_must_be_exactly_eleven_characters_test()
+{
+    // The alphabet was always enforced; the length is part of the format too,
+    // and a recent-history entry that is not eleven characters is not an id.
+    for (const auto* route : {L"https://youtube.com/watch?v=", L"https://youtu.be/", L"https://youtube.com/shorts/"}) {
+        CHECK(IsSupportedYouTubeUrl(std::wstring(route) + L"dQw4w9WgXcQ"));
+        CHECK(IsSupportedYouTubeUrl(std::wstring(route) + L"-_A1b2C3d4E"));
+        CHECK(!IsSupportedYouTubeUrl(std::wstring(route) + L"dQw4w9WgXc"));
+        CHECK(!IsSupportedYouTubeUrl(std::wstring(route) + L"dQw4w9WgXcQQ"));
+        CHECK(!IsSupportedYouTubeUrl(std::wstring(route) + std::wstring(2000, L'a')));
+        CHECK(CanonicalYouTubeVideoId(std::wstring(route) + L"dQw4w9WgXc").empty());
+        CHECK_EQ(std::string("dQw4w9WgXcQ"), CanonicalYouTubeVideoId(std::wstring(route) + L"dQw4w9WgXcQ"));
+    }
+}
+
+void youtube_url_validation_enforces_exact_2048_character_boundary_test()
+{
+    // Padding goes into a playlist field the watch route ignores, so the id
+    // itself stays eleven characters and only the total length is at issue.
+    constexpr std::wstring_view prefix = L"https://youtube.com/watch?v=dQw4w9WgXcQ&list=";
+    const std::wstring accepted = std::wstring(prefix) +
+                                  std::wstring(2048 - prefix.size(), L'a');
+    const std::wstring rejected = accepted + L'a';
+
+    CHECK_EQ(size_t{2048}, accepted.size());
+    CHECK(IsSupportedYouTubeUrl(accepted));
+    CHECK_EQ(size_t{2049}, rejected.size());
+    CHECK(!IsSupportedYouTubeUrl(rejected));
+}
+
+void resolver_output_accepts_one_https_googlevideo_url_and_trims_crlf_test()
+{
+    struct Case {
+        std::string_view output;
+        std::wstring_view expected;
+    };
+    const std::array accepted{
+        Case{"https://googlevideo.com/videoplayback?id=plain",
+             L"https://googlevideo.com/videoplayback?id=plain"},
+        Case{"https://rr1---sn-a5mekn6r.googlevideo.com/videoplayback?id=abc",
+             L"https://rr1---sn-a5mekn6r.googlevideo.com/videoplayback?id=abc"},
+        Case{"https://rr1---sn-a5mekn6r.googlevideo.com/videoplayback?id=abc\n",
+             L"https://rr1---sn-a5mekn6r.googlevideo.com/videoplayback?id=abc"},
+        Case{"https://rr1---sn-a5mekn6r.googlevideo.com/videoplayback?id=abc\r\n",
+             L"https://rr1---sn-a5mekn6r.googlevideo.com/videoplayback?id=abc"},
+    };
+
+    for (const Case& test : accepted) {
+        const ResolveResult result = ParseResolverOutput(test.output, 0);
+        CHECK(result.ok);
+        CHECK_EQ(ResolveError::None, result.error);
+        CHECK_EQ(std::wstring(test.expected), result.mediaUrl);
+        CHECK_EQ(std::wstring(test.expected), result.audioUrl);
+        CHECK_EQ(0.0, result.durationSeconds);
+        CHECK(result.detail.empty());
+        CHECK(result.mediaUrl.find(L'\r') == std::wstring::npos);
+        CHECK(result.mediaUrl.find(L'\n') == std::wstring::npos);
+    }
+}
+
+void resolver_output_accepts_separate_https_video_and_audio_urls_test()
+{
+    const ResolveResult result = ParseResolverOutput(
+        "https://v1.googlevideo.com/videoplayback?id=video&itag=137&expire=999\r\n"
+        "https://a1.googlevideo.com/videoplayback?id=audio&itag=140&expire=999\r\n", 0);
+    CHECK(result.ok);
+    CHECK_EQ(std::wstring(L"https://v1.googlevideo.com/videoplayback?id=video&itag=137&expire=999"),
+             result.mediaUrl);
+    CHECK_EQ(std::wstring(L"https://a1.googlevideo.com/videoplayback?id=audio&itag=140&expire=999"),
+             result.audioUrl);
+    CHECK_EQ(std::string("video-itag=137|audio-itag=140"),
+             StableYouTubeStreamIdentity(result.mediaUrl,result.audioUrl));
+    CHECK_EQ(StableYouTubeStreamIdentity(result.mediaUrl,result.audioUrl),
+             StableYouTubeStreamIdentity(
+                 L"https://v2.googlevideo.com/videoplayback?expire=123&itag=137",
+                 L"https://a2.googlevideo.com/videoplayback?expire=456&itag=140"));
+    CHECK(StableYouTubeStreamIdentity(
+        L"https://v1.googlevideo.com/videoplayback?id=video",
+        L"https://a1.googlevideo.com/videoplayback?id=audio").empty());
+    constexpr auto audio = L"https://a.googlevideo.com/videoplayback?itag=140";
+    for(const auto* hls : {
+        L"https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/123/itag/270/signature/one/file/index.m3u8",
+        L"https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/456/itag/270/signature/two/file/index.m3u8"}) {
+        CHECK_EQ(std::string("video-itag=270|audio-itag=140"),StableYouTubeStreamIdentity(hls,audio));
+    }
+    for(const auto* invalid : {
+        L"https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/not-a-number/file/index.m3u8",
+        L"https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/270/itag/271/file/index.m3u8",
+        L"https://manifest.googlevideo.com/api/manifest/hls_playlist/itag//file/index.m3u8",
+        L"https://manifest.googlevideo.com/api/manifest/hls_playlist/itag/123456789/file/index.m3u8",
+        L"https://manifest.googlevideo.com/unrelated/itag/270/file/index.m3u8",
+        L"https://googlevideo.com.example.invalid/api/manifest/hls_playlist/itag/270/file/index.m3u8"}) {
+        CHECK(StableYouTubeStreamIdentity(invalid,audio).empty());
+    }
+    CHECK_EQ(std::string("9lrThxCoznw"),
+             CanonicalYouTubeVideoId(L"https://www.youtube.com/watch?v=9lrThxCoznw"));
+    CHECK_EQ(std::string("9lrThxCoznw"),
+             CanonicalYouTubeVideoId(L"https://youtu.be/9lrThxCoznw"));
+}
+
+void resolver_output_accepts_authoritative_duration_before_stream_urls_test()
+{
+    const std::array accepted{
+        std::pair{"duration=167;live_status=not_live\nhttps://v.googlevideo.com/video\n", 167.0},
+        std::pair{"duration=167.25;live_status=not_live\r\nhttps://v.googlevideo.com/video\r\nhttps://a.googlevideo.com/audio\r\n", 167.25},
+        std::pair{"duration=2592000;live_status=was_live\nhttps://v.googlevideo.com/video", 2592000.0},
+    };
+    for (const auto& [output, expectedDuration] : accepted) {
+        const auto result = ParseResolverOutput(output, 0);
+        CHECK(result.ok);
+        CHECK_EQ(ResolveError::None, result.error);
+        CHECK_EQ(std::wstring(L"https://v.googlevideo.com/video"), result.mediaUrl);
+        CHECK_EQ(expectedDuration, result.durationSeconds);
+    }
+}
+
+void resolver_output_rejects_invalid_duration_live_status_and_metadata_framing_test()
+{
+    const std::array rejectedMetadata{
+        "duration=;live_status=not_live", "duration=NA;live_status=not_live",
+        "duration=0;live_status=not_live", "duration=-1;live_status=not_live",
+        "duration=nan;live_status=not_live", "duration=inf;live_status=not_live",
+        "duration=1e309;live_status=not_live", "duration=2592001;live_status=not_live",
+        "duration=167seconds;live_status=not_live", "duration=167 ;live_status=not_live",
+        "duration= 167;live_status=not_live", "duration=+167;live_status=not_live",
+        "duration=167;live_status=is_live", "duration=167;live_status=is_upcoming",
+        "duration=167;live_status=post_live", "duration=167;live_status=NA",
+        "duration=167;live_status=not_live;extra=1", "duration=167",
+        "duration=167;live_status=not_live\nduration=167;live_status=not_live",
+        "duration=167;live_status=not_live\n", "duration=167;live_status=not_live\r\r",
+    };
+    for (const auto metadata : rejectedMetadata) {
+        const auto result = ParseResolverOutput(
+            std::string(metadata) + "\nhttps://v.googlevideo.com/video\n", 0);
+        CHECK(!result.ok);
+        CHECK_EQ(ResolveError::InvalidOutput, result.error);
+        CHECK(result.mediaUrl.empty());
+        CHECK(result.audioUrl.empty());
+        CHECK_EQ(0.0, result.durationSeconds);
+        CHECK(result.detail.find(L"http") == std::wstring::npos);
+        CHECK(result.detail.find(L"live_status") == std::wstring::npos);
+    }
+    CHECK(!ParseResolverOutput("duration=167;live_status=not_live\n", 0).ok);
+    CHECK(!ParseResolverOutput(
+        "duration=167;live_status=not_live\nhttps://untrusted.example/video\n", 0).ok);
+    CHECK(!ParseResolverOutput(
+        "https://v.googlevideo.com/video\nduration=167;live_status=not_live\n", 0).ok);
+    CHECK(!ParseResolverOutput(
+        "duration=167;live_status=not_live\nhttps://v.googlevideo.com/video\n\n", 0).ok);
+}
+
+void resolver_output_rejects_empty_multiple_oversize_or_untrusted_urls_test()
+{
+    const std::vector<std::string> rejected{
+        "",
+        "\r\n",
+        "https://a.googlevideo.com/one\nhttps://b.googlevideo.com/two\nhttps://c.googlevideo.com/three",
+        "http://a.googlevideo.com/videoplayback?id=abc",
+        "https://googlevideo.com.evil.example/videoplayback?id=abc",
+        "https://evilgooglevideo.com/videoplayback?id=abc",
+        "https://example.com/videoplayback?id=abc",
+        "https://user@googlevideo.com/videoplayback?id=abc",
+        "not-a-url",
+        "a.googlevideo.com/videoplayback?id=abc",
+        "https: //a.googlevideo.com/videoplayback?id=abc",
+        "\nhttps://a.googlevideo.com/videoplayback?id=abc",
+        "https://a.googlevideo.com/videoplayback?id=abc\n\n",
+        "https://a.googlevideo.com/videoplayback?id=abc\r\n\r\n",
+        "https://a.googlevideo.com/videoplayback?id=abc\r",
+        std::string{"https://a.googlevideo.com/\xc3\x28", 28},
+        std::string("https://a.googlevideo.com/") + std::string(16 * 1024, 'a'),
+    };
+
+    for (const std::string& output : rejected) {
+        const ResolveResult result = ParseResolverOutput(output, 0);
+        CHECK(!result.ok);
+        CHECK_EQ(ResolveError::InvalidOutput, result.error);
+        CHECK(result.mediaUrl.empty());
+        CHECK(result.audioUrl.empty());
+        CHECK(result.detail.size() <= 4096);
+        CHECK(result.detail.find(L"http") == std::wstring::npos);
+        CHECK(result.detail.find(L"googlevideo") == std::wstring::npos);
+        CHECK(result.detail.find(L"not-a-url") == std::wstring::npos);
+    }
+}
+
+void resolver_output_enforces_raw_16k_and_single_trailing_line_ending_test()
+{
+    constexpr std::string_view prefix = "https://a.googlevideo.com/";
+    const std::string exactRaw = std::string(prefix) +
+                                 std::string(16 * 1024 - prefix.size(), 'a');
+    const std::string overRaw = exactRaw + 'a';
+    const std::string exactWithCrLf = std::string(prefix) +
+        std::string(16 * 1024 - prefix.size() - 2, 'a') + "\r\n";
+    const std::string overWithCrLf = std::string(prefix) +
+        std::string(16 * 1024 - prefix.size() - 1, 'a') + "\r\n";
+
+    CHECK_EQ(size_t{16 * 1024}, exactRaw.size());
+    CHECK(ParseResolverOutput(exactRaw, 0).ok);
+    CHECK_EQ(size_t{16 * 1024 + 1}, overRaw.size());
+    CHECK_EQ(ResolveError::InvalidOutput, ParseResolverOutput(overRaw, 0).error);
+    CHECK_EQ(size_t{16 * 1024}, exactWithCrLf.size());
+    CHECK(ParseResolverOutput(exactWithCrLf, 0).ok);
+    CHECK_EQ(size_t{16 * 1024 + 1}, overWithCrLf.size());
+    CHECK_EQ(ResolveError::InvalidOutput, ParseResolverOutput(overWithCrLf, 0).error);
+}
+
+void resolver_nonzero_exit_returns_fixed_generic_non_url_detail_test()
+{
+    constexpr std::wstring_view expectedDetail =
+        L"Could not extract a playable YouTube stream.";
+    const std::vector<std::string> diagnostics{
+        "ERROR: video unavailable\r\n",
+        "ERROR: rejected https://example.com/watch?v=secret-token\r\n",
+        "ERROR: rejected https: //example.com/watch?v=split-secret\r\n",
+        "Bearer abc123",
+        "Authorization=Basic-secret password=hunter2 token=abc secret=qwerty cookie=session",
+        "(https://example.com/watch?v=adjacent-secret); [Bearer abc123]",
+        std::string(8 * 1024, 'x'),
+    };
+
+    for (const std::string& diagnostic : diagnostics) {
+        const ResolveResult result = ParseResolverOutput(diagnostic, 7);
+        CHECK(!result.ok);
+        CHECK_EQ(ResolveError::ExtractionFailed, result.error);
+        CHECK(result.mediaUrl.empty());
+        CHECK_EQ(std::wstring(expectedDetail), result.detail);
+        CHECK(result.detail.size() <= 4096);
+    }
+}
+
+void youtube_resolver_windows_argument_quoting_covers_empty_spaces_quotes_and_slashes_test()
+{
+    struct Case {
+        std::wstring_view input;
+        std::wstring_view expected;
+    };
+    const std::array cases{
+        Case{L"", L"\"\""},
+        Case{L"plain", L"plain"},
+        Case{L"two words", L"\"two words\""},
+        Case{L"a\\\\\"b", L"\"a\\\\\\\\\\\"b\""},
+        Case{L"ends with slash \\", L"\"ends with slash \\\\\""},
+        Case{L"https://youtube.com/watch?v=abc&list=PL123", L"https://youtube.com/watch?v=abc&list=PL123"},
+    };
+
+    for (const Case& test : cases) {
+        CHECK_EQ(std::wstring(test.expected), QuoteWindowsArgument(test.input));
+    }
+}
+
+void youtube_resolver_argument_vector_is_exact_and_ordered_test()
+{
+    const std::filesystem::path helperDirectory = LR"(C:\Program Files\DLSS Player)";
+    constexpr std::wstring_view url =
+        L"https://youtube.com/watch?v=abc_DEF-123&list=PL123";
+    const std::vector<std::wstring> expected{
+        L"--no-config",
+        L"--no-cache-dir",
+        L"--no-plugin-dirs",
+        L"--no-playlist",
+        L"--no-warnings",
+        L"--js-runtimes",
+        LR"(deno:C:\Program Files\DLSS Player\deno.exe)",
+        L"-f",
+        L"bv*[height=1080]+ba/b[height=1080]",
+        L"--format-sort-force",
+        L"-S",
+        L"height,vbr,abr",
+        L"--get-url",
+        L"--print",
+        L"duration=%(duration)s;live_status=%(live_status)s;video_available_at=%(requested_formats.0.available_at,available_at|0)s;audio_available_at=%(requested_formats.1.available_at|0)s;selected_height=%(height)s;video_kbps=%(requested_formats.0.vbr,vbr,tbr|0)s;age_limit=%(age_limit)s",
+        // The end of the options: nothing after it is read as one.
+        L"--",
+        std::wstring(url),
+    };
+
+    CHECK_EQ(expected, BuildYouTubeResolverArguments(
+                           helperDirectory, url, YouTubeSourceQuality::P1080));
+}
+
+void youtube_source_quality_selectors_pin_exact_rungs_and_cap_auto_at_1440_test()
+{
+    const std::array cases{
+        // Auto climbs to the tallest rung at or below 1440p and only falls through
+        // to 2160p when a video publishes nothing shorter.
+        std::pair{YouTubeSourceQuality::Auto,
+                  std::wstring_view(L"bv*[height<=1440]+ba/b[height<=1440]/bv*[height<=2160]+ba/b[height<=2160]")},
+        std::pair{YouTubeSourceQuality::P2160,
+                  std::wstring_view(L"bv*[height=2160]+ba/b[height=2160]")},
+        std::pair{YouTubeSourceQuality::P1440,
+                  std::wstring_view(L"bv*[height=1440]+ba/b[height=1440]")},
+        std::pair{YouTubeSourceQuality::P1080,
+                  std::wstring_view(L"bv*[height=1080]+ba/b[height=1080]")},
+    };
+    for (const auto& [quality, expected] : cases) {
+        CHECK_EQ(expected, YouTubeFormatSelector(quality));
+    }
+}
+
+void resolver_metadata_reports_selected_height_video_bitrate_and_age_limit_test()
+{
+    const ResolveResult restricted = ParseResolverOutput(
+        "duration=167;live_status=not_live;video_available_at=0;audio_available_at=0"
+        ";selected_height=1080;video_kbps=3898.893;age_limit=18"
+        "\nhttps://v.googlevideo.com/video\nhttps://a.googlevideo.com/audio\n", 0);
+    CHECK(restricted.ok);
+    CHECK_EQ(167.0, restricted.durationSeconds);
+    CHECK_EQ(1080, restricted.selectedHeight);
+    CHECK_EQ(3898.893, restricted.videoKbps);
+    CHECK_EQ(18, restricted.ageLimit);
+
+    // yt-dlp prints NA for any field it could not fill, and these three only
+    // describe what was picked. The stream URLs are what playback needs, so an
+    // unusable metric reads as zero instead of failing a usable resolve.
+    for (const auto* metrics : {";selected_height=NA;video_kbps=NA;age_limit=NA",
+                                ";selected_height=;video_kbps=;age_limit=",
+                                ";selected_height=-1;video_kbps=-1;age_limit=-1"}) {
+        const ResolveResult result = ParseResolverOutput(
+            std::string("duration=167;live_status=not_live") + metrics +
+            "\nhttps://v.googlevideo.com/video\n", 0);
+        CHECK(result.ok);
+        CHECK_EQ(167.0, result.durationSeconds);
+        CHECK_EQ(0, result.selectedHeight);
+        CHECK_EQ(0.0, result.videoKbps);
+        CHECK_EQ(0, result.ageLimit);
+    }
+
+    const ResolveResult withoutMetrics = ParseResolverOutput(
+        "duration=167;live_status=not_live;video_available_at=1788425760;audio_available_at=0"
+        "\nhttps://v.googlevideo.com/video\n", 0);
+    CHECK(withoutMetrics.ok);
+    CHECK_EQ(int64_t{1788425760}, withoutMetrics.availableAtUnixSeconds);
+    CHECK_EQ(0, withoutMetrics.selectedHeight);
+    CHECK_EQ(0.0, withoutMetrics.videoKbps);
+    CHECK_EQ(0, withoutMetrics.ageLimit);
+}
+
+std::filesystem::path current_test_executable()
+{
+    std::wstring value(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, value.data(), static_cast<DWORD>(value.size()));
+    CHECK(length > 0);
+    CHECK(length < value.size());
+    value.resize(length);
+    return std::filesystem::path(std::move(value));
+}
+
+// A child that has just been terminated keeps its image file mapped for a short
+// while after the process count drops, so deleting the directory it was copied
+// into fails with a sharing violation for a few milliseconds. Retry briefly
+// instead of failing the test that already proved what it set out to prove.
+void remove_fixture_directory(const std::filesystem::path& directory)
+{
+    std::error_code error;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    do {
+        error.clear();
+        std::filesystem::remove_all(directory, error);
+        if (!error) return;
+        Sleep(10);
+    } while (std::chrono::steady_clock::now() < deadline);
+    CHECK(!error);
+}
+
+struct ResolverFixture {
+    std::filesystem::path directory;
+
+    explicit ResolverFixture(bool validHelper = true)
+    {
+        const auto unique = std::to_wstring(GetCurrentProcessId()) + L"-" +
+                            std::to_wstring(GetTickCount64());
+        directory = std::filesystem::temp_directory_path() /
+                    (L"PolicyTests-YouTubeResolver-" + unique);
+        std::error_code error;
+        std::filesystem::create_directories(directory, error);
+        CHECK(!error);
+        if (validHelper) {
+            CHECK(CopyFileW(current_test_executable().c_str(),
+                            (directory / L"yt-dlp.exe").c_str(), FALSE) != FALSE);
+        } else {
+            write_binary_file(directory / L"yt-dlp.exe", "not a Windows executable");
+        }
+        write_binary_file(directory / L"deno.exe", "test-only placeholder");
+    }
+
+    ~ResolverFixture()
+    {
+        remove_fixture_directory(directory);
+    }
+};
+
+void youtube_bitrate_selection_uses_real_helper_without_network_test()
+{
+    const auto helpers = current_test_executable().parent_path();
+    const auto executable = helpers / L"yt-dlp.exe";
+    if (!std::filesystem::is_regular_file(executable)) {
+        std::cout << "SKIP: bitrate selection requires the staged yt-dlp helper.\n";
+        return;
+    }
+    ResolverFixture fixture;
+    const auto metadata = fixture.directory / L"formats.info.json";
+    const auto selected = fixture.directory / L"selected.txt";
+    const std::string audio = R"({"format_id":"140","url":"https://example.invalid/aac","ext":"m4a","vcodec":"none","acodec":"mp4a.40.2","abr":128},
+        {"format_id":"251","url":"https://example.invalid/opus","ext":"webm","vcodec":"none","acodec":"opus","abr":160})";
+    const std::string p1080 = R"({"format_id":"av1","url":"https://example.invalid/av1","ext":"mp4","height":1080,"width":1920,"fps":60,"vcodec":"av01","acodec":"none","vbr":1555,"quality":10,"preference":10},
+        {"format_id":"avc","url":"https://example.invalid/avc","ext":"mp4","height":1080,"width":1920,"fps":30,"vcodec":"avc1","acodec":"none","vbr":4000},
+        {"format_id":"vp9","url":"https://example.invalid/vp9","ext":"webm","height":1080,"width":1920,"fps":30,"vcodec":"vp9","acodec":"none","vbr":6000},
+        {"format_id":"unknown","url":"https://example.invalid/unknown","ext":"mp4","height":1080,"width":1920,"fps":60,"vcodec":"av01","acodec":"none","quality":99,"preference":99})";
+    const std::string others = R"({"format_id":"720","url":"https://example.invalid/720","ext":"mp4","height":720,"width":1280,"vcodec":"avc1","acodec":"none","vbr":20000},
+        {"format_id":"1440av1","url":"https://example.invalid/1440av1","ext":"mp4","height":1440,"width":2560,"vcodec":"av01","acodec":"none","vbr":5000},
+        {"format_id":"1440avc","url":"https://example.invalid/1440avc","ext":"mp4","height":1440,"width":2560,"vcodec":"avc1","acodec":"none","vbr":8000},
+        {"format_id":"2160av1","url":"https://example.invalid/2160av1","ext":"mp4","height":2160,"width":3840,"vcodec":"av01","acodec":"none","vbr":7000},
+        {"format_id":"2160vp9","url":"https://example.invalid/2160vp9","ext":"webm","height":2160,"width":3840,"vcodec":"vp9","acodec":"none","vbr":12000})";
+    const std::string ultraOnly = R"({"format_id":"2160av1","url":"https://example.invalid/2160av1","ext":"mp4","height":2160,"width":3840,"vcodec":"av01","acodec":"none","vbr":7000},
+        {"format_id":"2160vp9","url":"https://example.invalid/2160vp9","ext":"webm","height":2160,"width":3840,"vcodec":"vp9","acodec":"none","vbr":12000})";
+    auto checkSelection = [&](YouTubeSourceQuality quality, const std::string& video,
+                              std::string_view expected) {
+        write_binary_file(metadata, "{\"id\":\"fixture\",\"title\":\"Offline formats\",\"duration\":10,\"extractor\":\"youtube\",\"formats\":[" + audio + "," + video + "]}");
+        std::filesystem::remove(selected);
+        auto args = BuildYouTubeResolverArguments(helpers, L"https://youtu.be/fixture", quality);
+        // Keep production selection arguments; substitute an offline catalog for
+        // the network URL and print only the selected format IDs.
+        args.erase(std::find(args.begin(), args.end(), L"--get-url"), args.end());
+        args.insert(args.end(), {L"--simulate", L"--no-check-formats", L"--quiet",
+            L"--load-info-json", metadata.wstring(), L"--print-to-file",
+            L"%(format_id)s", selected.wstring()});
+        std::wstring command = QuoteWindowsArgument(executable.wstring());
+        for (const auto& arg : args) command += L" " + QuoteWindowsArgument(arg);
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        const bool started = CreateProcessW(executable.c_str(), command.data(), nullptr,
+            nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != FALSE;
+        CHECK(started);
+        if (!started) return;
+        CloseHandle(process.hThread);
+        const DWORD wait = WaitForSingleObject(process.hProcess, 30000);
+        CHECK_EQ(DWORD{WAIT_OBJECT_0}, wait);
+        if (wait != WAIT_OBJECT_0) {
+            TerminateProcess(process.hProcess, 1);
+            WaitForSingleObject(process.hProcess, 2000);
+        }
+        DWORD code = 1;
+        GetExitCodeProcess(process.hProcess, &code);
+        CloseHandle(process.hProcess);
+        if (expected.empty()) { CHECK(code != 0); return; }
+        CHECK_EQ(DWORD{0}, code);
+        std::ifstream input(selected, std::ios::binary);
+        std::string actual;
+        std::getline(input, actual);
+        if (!actual.empty() && actual.back() == '\r') actual.pop_back();
+        if (actual != expected) std::cerr << "Selected " << actual << "; expected " << expected << '\n';
+        CHECK_EQ(expected, actual);
+    };
+    checkSelection(YouTubeSourceQuality::P1080, p1080 + "," + others, "vp9+251");
+    checkSelection(YouTubeSourceQuality::P1440, p1080 + "," + others, "1440avc+251");
+    checkSelection(YouTubeSourceQuality::P2160, p1080 + "," + others, "2160vp9+251");
+    // Auto stops at the 1440p rung even when 2160p is published, and takes the
+    // fattest stream inside that rung rather than the first codec listed.
+    checkSelection(YouTubeSourceQuality::Auto, p1080 + "," + others, "1440avc+251");
+    checkSelection(YouTubeSourceQuality::Auto, others, "1440avc+251");
+    // Nothing at or below 1440p: the second rung keeps 4K-only videos playable.
+    checkSelection(YouTubeSourceQuality::Auto, ultraOnly, "2160vp9+251");
+    checkSelection(YouTubeSourceQuality::P1080, others, "");
+    checkSelection(YouTubeSourceQuality::P1080, p1080 + R"(,
+        {"format_id":"combined","url":"https://example.invalid/combined","ext":"mp4","height":1080,"width":1920,"vcodec":"avc1","acodec":"mp4a.40.2","vbr":7000,"abr":128})", "combined");
+}
+
+std::wstring read_environment_variable(std::wstring_view name)
+{
+    const DWORD needed = GetEnvironmentVariableW(name.data(), nullptr, 0);
+    if (needed == 0) return {};
+    std::wstring value(needed, L'\0');
+    const DWORD written = GetEnvironmentVariableW(name.data(), value.data(), needed);
+    CHECK(written < needed);
+    if (written >= needed) return {};
+    value.resize(written);
+    return value;
+}
+
+struct ScopedEnvironmentVariable {
+    explicit ScopedEnvironmentVariable(std::wstring_view name, std::wstring_view value)
+        : name(name), previous(read_environment_variable(name))
+    {
+        hadPrevious = !previous.empty();
+        CHECK(SetEnvironmentVariableW(this->name.c_str(), std::wstring(value).c_str()) != FALSE);
+    }
+
+    ~ScopedEnvironmentVariable()
+    {
+        CHECK(SetEnvironmentVariableW(name.c_str(), hadPrevious ? previous.c_str() : nullptr) != FALSE);
+    }
+
+    std::wstring name;
+    std::wstring previous;
+    bool hadPrevious{};
+};
+
+size_t count_named_processes(std::wstring_view executableName);
+bool wait_for_named_process_count(std::wstring_view executableName,size_t expected,std::chrono::milliseconds timeout);
+// A handle-leak check takes its baseline after one run of the code under test.
+// The first run in a process creates handles that live until it exits - the
+// thread pool's, the loader's, the first window's - so a check that happened to
+// run first, as `--only=` runs it, counted those as a leak and failed, while
+// the same check passed in the full run only because an earlier case had paid
+// for them.
+template<class WarmUp>
+DWORD handle_count_after_warm_up(WarmUp&& warmUp)
+{
+    warmUp();
+    DWORD count=0;
+    CHECK(GetProcessHandleCount(GetCurrentProcess(),&count)!=FALSE);
+    return count;
+}
+// How long a child the decoder closed may take to be gone. A leaked child never
+// exits, so a long wait keeps the leak check and drops only a latency one, and a
+// wait that is met returns at once. It was 500 ms outside AddressSanitizer, and
+// a loaded machine - suites run in parallel by `ctest -j`, or a build beside
+// them - missed it: the fake ffmpeg/ffprobe are copies of this executable, and
+// their start and exit slow down with everything else.
+constexpr std::chrono::milliseconds kChildExitWait{5000};
+
+struct MediaFixture {
+    std::filesystem::path directory;
+    MediaFixture()
+    {
+        directory=std::filesystem::temp_directory_path()/(L"PolicyTests-NetworkMedia-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
+        std::error_code error;std::filesystem::create_directories(directory,error);CHECK(!error);
+        CHECK(CopyFileW(current_test_executable().c_str(),(directory/L"ffprobe.exe").c_str(),FALSE)!=FALSE);
+        CHECK(CopyFileW(current_test_executable().c_str(),(directory/L"ffmpeg.exe").c_str(),FALSE)!=FALSE);
+    }
+    ~MediaFixture(){remove_fixture_directory(directory);}
+};
+
+void video_decoder_prefers_video_duration_tag_over_longer_container_test()
+{
+    MediaFixture fixture;
+    const std::array cases{
+        std::pair{L"durationtag_valid", 1.0},
+        std::pair{L"durationtag_fractional", 3723.25},
+        std::pair{L"durationtag_missing", 3.0},
+        std::pair{L"durationtag_badminute", 3.0},
+        std::pair{L"durationtag_badsecond", 3.0},
+        std::pair{L"durationtag_negative", 3.0},
+        std::pair{L"durationtag_nonfinite", 3.0},
+        std::pair{L"durationtag_trailing", 3.0},
+        std::pair{L"durationtag_overflow", 3.0},
+        std::pair{L"durationtag_zero", 3.0},
+        std::pair{L"durationtag_mp4", 1.25},
+    };
+    for (const auto& [scenario, expectedDuration] : cases) {
+        auto decoder = VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(std::wstring(L"https://media.invalid/") + scenario,
+                                      MediaSourceKind::YouTube));
+        CHECK_EQ(expectedDuration, decoder->DurationSeconds());
+        decoder->Close();
+    }
+}
+
+void youtube_decoder_probe_and_frame_reads_are_bounded_nonblocking_test()
+{
+    MediaFixture fixture;
+    {
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        const auto started=std::chrono::steady_clock::now();
+        CHECK(decoder->Open(L"https://media.invalid/trickle",MediaSourceKind::YouTube));
+        CHECK(std::chrono::steady_clock::now()-started<std::chrono::seconds{1});
+        VideoFrame frame;VideoReadResult result=VideoReadResult::NotReady;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{1};
+        while(result==VideoReadResult::NotReady&&std::chrono::steady_clock::now()<deadline){result=decoder->ReadNextAvailable(frame);Sleep(5);}
+        CHECK_EQ(VideoReadResult::FrameReady,result);CHECK_EQ(size_t{16},frame.bgra.size());
+        const auto closeStarted=std::chrono::steady_clock::now();decoder->Close();CHECK(std::chrono::steady_clock::now()-closeStarted<std::chrono::seconds{1});
+    }
+    {
+        // Non-blocking means a read never waits for the child. This child writes
+        // a quarter of a frame and then nothing, and the stall timeout is set far
+        // beyond the bound: a read that waited for the frame or for the stall
+        // would take those 5 s, while a poll answers NotReady at once. The bound
+        // is a full second because a loaded runner can hold a thread off the CPU
+        // for tens of milliseconds, which the 40 ms this used to allow did not
+        // survive - but never for a second.
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory,std::chrono::milliseconds{250},std::chrono::seconds{5});
+        CHECK(decoder->Open(L"https://media.invalid/stallmid",MediaSourceKind::YouTube));
+        VideoFrame frame;
+        const auto callStarted=std::chrono::steady_clock::now();
+        const VideoReadResult result=decoder->ReadNextAvailable(frame);
+        CHECK(std::chrono::steady_clock::now()-callStarted<std::chrono::seconds{1});
+        CHECK_EQ(VideoReadResult::NotReady,result);
+        const auto closeStarted=std::chrono::steady_clock::now();decoder->Close();CHECK(std::chrono::steady_clock::now()-closeStarted<std::chrono::seconds{1});
+    }
+    {
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory,std::chrono::milliseconds{120},std::chrono::milliseconds{80});
+        const auto started=std::chrono::steady_clock::now();CHECK(!decoder->Open(L"https://media.invalid/holdprobe",MediaSourceKind::YouTube));
+        CHECK(std::chrono::steady_clock::now()-started<std::chrono::seconds{1});
+    }
+}
+
+void youtube_decoder_partial_stall_cancel_and_exit_leave_no_children_test()
+{
+    MediaFixture fixture;
+    // One untimed cycle first. The first decoder a process opens creates handles
+    // that live for the whole process (the kill-on-close job, the log, the
+    // thread pool) and pays a cold start for the fake child, so a baseline taken
+    // before it counted those as a leak and the first read could miss its
+    // deadline - but only when this case ran on its own; in the full suite an
+    // earlier case had already paid both.
+    //
+    // The child counts are taken BEFORE it, though. Taken after, they could
+    // include the warm-up's own child while it was still exiting - slow under
+    // AddressSanitizer - and once it was gone the count sat below the baseline,
+    // so no wait could ever match it (CI saw exactly that, intermittently).
+    const size_t beforeFfmpeg=count_named_processes(L"ffmpeg.exe");const size_t beforeProbe=count_named_processes(L"ffprobe.exe");
+    const auto childrenBack=[&](const char* when){
+        const bool ffmpeg=wait_for_named_process_count(L"ffmpeg.exe",beforeFfmpeg,kChildExitWait);
+        const bool ffprobe=wait_for_named_process_count(L"ffprobe.exe",beforeProbe,kChildExitWait);
+        if(!ffmpeg||!ffprobe)std::cout<<"  children "<<when<<": ffmpeg "<<count_named_processes(L"ffmpeg.exe")<<" (expected "<<beforeFfmpeg
+                                         <<"), ffprobe "<<count_named_processes(L"ffprobe.exe")<<" (expected "<<beforeProbe<<")\n";
+        return ffmpeg&&ffprobe;
+    };
+    {
+        auto warm=VideoDecoderTestAccess::Create(fixture.directory,std::chrono::milliseconds{250},std::chrono::milliseconds{75});
+        if(warm->Open(L"https://media.invalid/stallmid",MediaSourceKind::YouTube)){
+            VideoFrame frame;const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{5};
+            while(warm->ReadNextAvailable(frame)==VideoReadResult::NotReady&&std::chrono::steady_clock::now()<deadline)Sleep(5);
+        }
+        warm->Close();
+    }
+    CHECK(childrenBack("after the warm-up"));
+    DWORD beforeHandles=0,afterHandles=0;CHECK(GetProcessHandleCount(GetCurrentProcess(),&beforeHandles)!=FALSE);
+    for(int cycle=0;cycle<4;++cycle){
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory,std::chrono::milliseconds{250},std::chrono::milliseconds{75});
+        CHECK(decoder->Open(L"https://media.invalid/stallmid",MediaSourceKind::YouTube));VideoFrame frame;VideoReadResult result=VideoReadResult::NotReady;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{1};
+        while(result==VideoReadResult::NotReady&&std::chrono::steady_clock::now()<deadline){result=decoder->ReadNextAvailable(frame);Sleep(5);}
+        CHECK_EQ(VideoReadResult::Stalled,result);decoder->Close();
+    }
+    {
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);CHECK(decoder->Open(L"https://media.invalid/hold",MediaSourceKind::YouTube));
+        const auto closeStarted=std::chrono::steady_clock::now();decoder->Close();CHECK(std::chrono::steady_clock::now()-closeStarted<std::chrono::seconds{1});
+    }
+    {
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);CHECK(decoder->Open(L"https://media.invalid/exit",MediaSourceKind::YouTube));VideoFrame frame;
+        // A deadline rather than 50 polls of 5 ms: the fake child that exits at
+        // once still has to start, which under AddressSanitizer took longer than
+        // those 250 ms on CI (build-windows on c55d29f). A decoder that never
+        // reports the exit still fails here, only later.
+        VideoReadResult result=VideoReadResult::NotReady;const auto exitDeadline=std::chrono::steady_clock::now()+kChildExitWait;
+        while(result==VideoReadResult::NotReady&&std::chrono::steady_clock::now()<exitDeadline){result=decoder->ReadNextAvailable(frame);Sleep(5);}
+        CHECK(result==VideoReadResult::EndOfStream||result==VideoReadResult::Error);
+    }
+    CHECK(childrenBack("at the end"));
+    CHECK(GetProcessHandleCount(GetCurrentProcess(),&afterHandles)!=FALSE);CHECK(afterHandles<=beforeHandles+2);
+}
+
+void youtube_decoder_discards_only_expected_trailing_partial_frame_test()
+{
+    MediaFixture fixture;
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(decoder->Open(L"https://media.invalid/partialend",MediaSourceKind::YouTube));
+    VideoFrame frame;VideoReadResult result=VideoReadResult::NotReady;size_t frames=0;
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{1};
+    while(std::chrono::steady_clock::now()<deadline){
+        result=decoder->ReadNextAvailable(frame);
+        if(result==VideoReadResult::FrameReady){++frames;result=VideoReadResult::NotReady;}
+        else if(result!=VideoReadResult::NotReady)break;
+        Sleep(5);
+    }
+    CHECK_EQ(size_t{2},frames);
+    CHECK_EQ(VideoReadResult::EndOfStream,result);
+}
+
+void youtube_decoder_background_seek_trickles_and_cancels_boundedly_test()
+{
+    MediaFixture fixture;
+    {
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);CHECK(decoder->Open(L"https://media.invalid/trickle",MediaSourceKind::YouTube));CHECK(decoder->SeekSeconds(12.0));
+        VideoFrame frame;VideoReadResult result=VideoReadResult::NotReady;const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{1};
+        while(result==VideoReadResult::NotReady&&std::chrono::steady_clock::now()<deadline){result=decoder->ReadNextAvailable(frame);Sleep(5);}
+        CHECK_EQ(VideoReadResult::FrameReady,result);CHECK(frame.timestamp100ns>=120000000);
+    }
+    {
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory,std::chrono::milliseconds{250},std::chrono::seconds{5});CHECK(decoder->Open(L"https://media.invalid/hold",MediaSourceKind::YouTube));CHECK(decoder->SeekSeconds(9.0));
+        const auto started=std::chrono::steady_clock::now();std::jthread worker([&](std::stop_token stop){VideoFrame frame;while(decoder->ReadNextAvailable(frame,stop)==VideoReadResult::NotReady)Sleep(5);});Sleep(30);worker.request_stop();worker.join();decoder->Close();CHECK(std::chrono::steady_clock::now()-started<std::chrono::seconds{1});
+    }
+}
+
+// Regression: StopFrameQueue used to reset m_frameTerminal back to NotReady after
+// joining the queue thread, and never notified. The queue thread exits on its own stop
+// token without publishing a terminal state, so a reader parked in ReadNextBlocking
+// waited forever on a predicate that could not become true again. ReadNext runs on the
+// UI message pump for local files, so that wedged the whole window.
+void video_decoder_close_releases_a_blocked_blocking_read_test()
+{
+    MediaFixture fixture;
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory,std::chrono::milliseconds{250},std::chrono::seconds{5});
+    // "/hold" never emits a frame, so the reader is guaranteed to park on the queue.
+    CHECK(decoder->Open(L"https://media.invalid/hold",MediaSourceKind::YouTube));
+    VideoFrame frameStorage;
+    VideoReadResult result=VideoReadResult::NotReady;
+    // A default-constructed stop token has no stop state, which is exactly how the UI
+    // path calls in: only the decoder shutdown can release this reader.
+    std::jthread reader([&]{result=decoder->ReadNextBlocking(frameStorage);});
+    Sleep(50);
+    const auto closeStarted=std::chrono::steady_clock::now();
+    decoder->Close();
+    reader.join();
+    CHECK(std::chrono::steady_clock::now()-closeStarted<std::chrono::seconds{1});
+    CHECK_EQ(VideoReadResult::Cancelled,result);
+}
+
+void video_decoder_hardware_failure_falls_back_to_software_test()
+{
+    MediaFixture fixture;
+    const auto marker=fixture.directory/L"acceleration-order.txt";
+    ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ACCEL_MARKER",marker.wstring());
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory,std::chrono::seconds{2},std::chrono::seconds{2});
+    CHECK(decoder->Open(L"https://media.invalid/hardwarefallbackdelayedexit",MediaSourceKind::YouTube));
+    VideoFrame frame;VideoReadResult result=VideoReadResult::NotReady;
+    const auto started=std::chrono::steady_clock::now();
+    const auto deadline=started+std::chrono::seconds{5};
+    while(result==VideoReadResult::NotReady&&std::chrono::steady_clock::now()<deadline){result=decoder->ReadNextAvailable(frame);Sleep(5);}
+    const std::string accelerationOrder=read_binary_file(marker);
+    if(result!=VideoReadResult::FrameReady){
+        const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count();
+        std::cerr<<"hardware fallback diagnostic: result="<<static_cast<int>(result)
+                 <<" elapsed_ms="<<elapsed<<" marker="<<accelerationOrder<<'\n';
+    }
+    CHECK_EQ(VideoReadResult::FrameReady,result);CHECK_EQ(size_t{16},frame.bgra.size());
+    CHECK_EQ(std::string("cuda\nd3d11va\nsoftware\n"),accelerationOrder);
+}
+
+// A failed hardware path stays failed: the next decoder in the same process
+// launches software directly, which is what keeps a seek to one process start.
+void video_decoder_remembers_dead_hardware_paths_test()
+{
+    MediaFixture fixture;
+    {
+        const auto first=fixture.directory/L"first-order.txt";
+        ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ACCEL_MARKER",first.wstring());
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory,std::chrono::seconds{2},std::chrono::seconds{2});
+        CHECK(decoder->Open(L"https://media.invalid/hardwarefallbackdelayedexit",MediaSourceKind::YouTube));
+        VideoFrame frame;VideoReadResult result=VideoReadResult::NotReady;
+        for(const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{5};
+            result==VideoReadResult::NotReady&&std::chrono::steady_clock::now()<deadline;)
+            {result=decoder->ReadNextAvailable(frame);Sleep(5);}
+        CHECK_EQ(VideoReadResult::FrameReady,result);
+        CHECK_EQ(std::string("cuda\nd3d11va\nsoftware\n"),read_binary_file(first));
+    }
+    // Same process, new decoder, no reset: the two dead paths are skipped.
+    const auto second=fixture.directory/L"second-order.txt";
+    ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ACCEL_MARKER",second.wstring());
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory,std::chrono::seconds{2},std::chrono::seconds{2},
+                                                VideoDecoder::FailureStage::None,false);
+    CHECK(decoder->Open(L"https://media.invalid/hardwarefallbackdelayedexit",MediaSourceKind::YouTube));
+    VideoFrame frame;VideoReadResult result=VideoReadResult::NotReady;
+    for(const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{5};
+        result==VideoReadResult::NotReady&&std::chrono::steady_clock::now()<deadline;)
+        {result=decoder->ReadNextAvailable(frame);Sleep(5);}
+    CHECK_EQ(VideoReadResult::FrameReady,result);
+    CHECK_EQ(std::string("software\n"),read_binary_file(second));
+}
+
+void video_decoder_drains_complete_raw_frame_buffered_after_child_exit_test()
+{
+    MediaFixture fixture;
+    const auto marker=fixture.directory/L"sequential-acceleration.txt";
+    ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ACCEL_MARKER",marker.wstring());
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(decoder->OpenSequential(L"drainexit",MediaSourceKind::LocalFile));
+    VideoFrame frame;VideoReadResult result=VideoReadResult::NotReady;
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{2};
+    while(result==VideoReadResult::NotReady&&std::chrono::steady_clock::now()<deadline){
+        result=decoder->ReadNextAvailable(frame);Sleep(1);
+    }
+    CHECK_EQ(VideoReadResult::FrameReady,result);
+    // 1920x1080 is even, so OpenSequential picks NV12 (w*h*3/2 bytes, not w*h*4):
+    // 11.1 MB BGRA -> 4.2 MB NV12 per 2578x1080 frame is the same saving at this size.
+    CHECK(decoder->PixelLayout()==VideoPixelLayout::Nv12);
+    CHECK(frame.layout==VideoPixelLayout::Nv12);
+    CHECK_EQ(size_t{1920u*1080u*3u/2u},frame.bgra.size());
+    // OpenSequential now requests CUDA decode (NVDEC is a separate engine from
+    // NVENC/D3D12 and the GPU is idle during export), so the fake ffmpeg child
+    // launches with -hwaccel cuda.
+    CHECK_EQ(std::string("cuda\n"),read_binary_file(marker));
+}
+
+void video_decoder_background_queue_is_bounded_to_four_frames_test()
+{
+    MediaFixture fixture;
+    const auto marker=fixture.directory/L"large-frame-progress.bin";
+    ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_FRAME_MARKER",marker.wstring());
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(decoder->Open(L"https://media.invalid/largeburst",MediaSourceKind::YouTube));
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds{750};
+    uintmax_t produced=0;
+    while(std::chrono::steady_clock::now()<deadline){
+        std::error_code error;produced=std::filesystem::file_size(marker,error);if(!error&&produced>=4)break;Sleep(10);
+    }
+    Sleep(75);
+    std::error_code error;produced=std::filesystem::file_size(marker,error);if(error)produced=0;
+    // Four queued frames plus the two the stdout pipe is sized to hold, so the
+    // child can decode one frame while the reader copies the previous one out.
+    CHECK(produced>=4);CHECK(produced<=7);
+}
+
+// The fake child stamps every frame with its absolute source index, so a seek
+// that keeps the running child can be held to the exact frame a restarting seek
+// hands out - the property the whole optimisation rests on.
+uint32_t stamped_frame_index(const VideoFrame& frame)
+{
+    CHECK_EQ(size_t{16},frame.bgra.size());
+    uint32_t index=0;
+    for(int byte=0;byte<4;++byte)index|=static_cast<uint32_t>(frame.bgra[static_cast<size_t>(byte)])<<(8*byte);
+    return index;
+}
+
+VideoFrame read_one_frame(VideoDecoder& decoder)
+{
+    VideoFrame frame;VideoReadResult result=VideoReadResult::NotReady;
+    for(const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{5};
+        std::chrono::steady_clock::now()<deadline;){
+        result=decoder.ReadNextAvailable(frame);
+        if(result!=VideoReadResult::NotReady)break;
+        Sleep(1);
+    }
+    CHECK_EQ(VideoReadResult::FrameReady,result);
+    return frame;
+}
+
+// Regression guard for the LocalFile queue thread's blocking ReadFile: once the fake
+// child parks in Sleep(INFINITE) with the pipe empty, the queue thread has nothing left
+// to peek-sleep-poll for and sits inside the kernel read instead. StopFrameQueue has to
+// unpark it with CancelSynchronousIo (rather than wait on a child that never exits), so
+// Close must still return promptly.
+void video_decoder_close_returns_promptly_when_local_queue_thread_is_blocked_on_pipe_read_test()
+{
+    MediaFixture fixture;
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(decoder->OpenSequential(L"largeburst",MediaSourceKind::LocalFile));
+    // 1024x1024 is even, so this OpenSequential open picks NV12: the fake child
+    // writes exactly 20 frames of 1024x1024 NV12 (w*h*3/2 bytes) and then parks.
+    // Every one of them has to be consumed here: with any still unread the queue
+    // thread would be waiting for queue space, not inside the kernel read this
+    // test is about.
+    CHECK(decoder->PixelLayout()==VideoPixelLayout::Nv12);
+    for(int index=0;index<20;++index)CHECK_EQ(size_t{1024u*1024u*3u/2u},read_one_frame(*decoder).bgra.size());
+    // Give the queue thread a chance to settle into the blocking read for data that
+    // will never arrive.
+    Sleep(75);
+    const auto closeStarted=std::chrono::steady_clock::now();
+    decoder->Close();
+    const double elapsedMs=
+        std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-closeStarted).count();
+    // The regression is a Close that never returns - the child sleeps forever
+    // and the join waits on it - so the bound only has to be finite. 2 s was
+    // a speed claim a loaded runner could fail; 10 s is not.
+    CHECK(elapsedMs<10000.0);
+}
+
+// NV12 needs even plane dimensions (the UV plane is half-resolution in both
+// axes), so OpenSequential's NV12 preference is conditional on the probed
+// geometry: even geometry gets NV12, odd geometry falls back to BGRA exactly
+// like normal playback.
+void video_decoder_open_sequential_selects_nv12_for_even_geometry_test()
+{
+    MediaFixture fixture;
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(decoder->OpenSequential(L"nv12geom",MediaSourceKind::LocalFile));
+    CHECK(decoder->PixelLayout()==VideoPixelLayout::Nv12);
+    const VideoFrame frame=read_one_frame(*decoder);
+    CHECK(frame.layout==VideoPixelLayout::Nv12);
+    CHECK_EQ(FrameBytes(VideoPixelLayout::Nv12,4,2),frame.bgra.size());
+}
+
+// A caller can opt out of OpenSequential's NV12 preference (preferNv12=false) to
+// keep BGRA even for geometry that would otherwise qualify for NV12 - the neural
+// render uses this when the GPU is the scarce resource and ffmpeg's CPU-side
+// conversion is cheaper to spend than a GPU cycle.
+void video_decoder_open_sequential_can_keep_bgra_for_even_geometry_test()
+{
+    MediaFixture fixture;
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(decoder->OpenSequential(L"nv12geom",MediaSourceKind::LocalFile,{},/*preferNv12=*/false));
+    CHECK(decoder->PixelLayout()==VideoPixelLayout::Bgra);
+    const VideoFrame frame=read_one_frame(*decoder);
+    CHECK(frame.layout==VideoPixelLayout::Bgra);
+    CHECK_EQ(FrameBytes(VideoPixelLayout::Bgra,4,2),frame.bgra.size());
+}
+
+void video_decoder_open_sequential_stays_bgra_for_odd_geometry_test()
+{
+    MediaFixture fixture;
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(decoder->OpenSequential(L"oddgeom",MediaSourceKind::LocalFile));
+    CHECK(decoder->PixelLayout()==VideoPixelLayout::Bgra);
+    const VideoFrame frame=read_one_frame(*decoder);
+    CHECK(frame.layout==VideoPixelLayout::Bgra);
+    CHECK_EQ(FrameBytes(VideoPixelLayout::Bgra,3,3),frame.bgra.size());
+}
+
+// Cached playback describes the original with OpenMetadata and lets the pair
+// decode it, so the layout the renderer is configured from has to come out of
+// the probe alone - and be the one the pair's decoder, opened from Media(),
+// then takes. A full Open used to run an ffmpeg child nobody read for this.
+void video_decoder_open_metadata_decides_the_playback_layout_without_a_decoder_test()
+{
+    MediaFixture fixture;
+    for(const wchar_t* scenario:{L"nv12geom",L"colortag_bt601full",L"colortag_none",L"oddgeom"}){
+        auto opened=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(opened->Open(scenario,MediaSourceKind::LocalFile,{},/*preferNv12=*/true));
+        auto described=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(described->OpenMetadata(scenario,MediaSourceKind::LocalFile,{},/*preferNv12=*/true));
+        CHECK(!described->Ready());
+        CHECK(described->PixelLayout()==opened->PixelLayout());
+        auto sibling=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(sibling->OpenKnown(scenario,described->Media(),MediaSourceKind::LocalFile,{},/*preferNv12=*/true));
+        CHECK(sibling->PixelLayout()==described->PixelLayout());
+    }
+    auto nv12=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(nv12->OpenMetadata(L"nv12geom",MediaSourceKind::LocalFile,{},/*preferNv12=*/true));
+    CHECK(nv12->PixelLayout()==VideoPixelLayout::Nv12);
+    // Asking for nothing keeps the old answer.
+    auto plain=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(plain->OpenMetadata(L"nv12geom",MediaSourceKind::LocalFile));
+    CHECK(plain->PixelLayout()==VideoPixelLayout::Bgra);
+}
+
+// Only the tail is kept, whatever the child writes, and it reaches the log as
+// printable lines with the helper's name in front of each.
+void child_stderr_tail_keeps_the_last_bytes_as_log_lines_test()
+{
+    std::string tail;
+    for(int index=0;index<100;++index)ChildStderrTail::Append(tail,std::string(100,char('a'+index%26))+"\n",256);
+    CHECK(tail.size()<=512);
+    CHECK(tail.ends_with(std::string(100,char('a'+99%26))+"\n"));
+    ChildStderrTail::Append(tail,std::string(1000,'z'),256);
+    CHECK_EQ(size_t{256},tail.size());
+    CHECK_EQ(std::string(256,'z'),tail);
+
+    const std::string text=ChildStderrTail::ForLog("first\r\n\n  \n\x1b[31mred\x1b[0m\nlast",">> ");
+    CHECK_EQ(std::string(">> first\n>> [31mred [0m\n>> last"),text);
+    CHECK(ChildStderrTail::ForLog("\n\n","x").empty());
+    // Only the last `capacity` bytes, even of text handed over whole.
+    CHECK_EQ(std::string("p: 6789"),ChildStderrTail::ForLog("0123456789","p: ",4));
+}
+
+// ffmpeg and ffprobe wrote stderr to NUL, so a decode that died mid-file left
+// nothing to diagnose it by - and a child that exited non-zero between two
+// frames read as the end of the file, so playback stopped as if finished.
+void video_decoder_reports_child_stderr_and_a_mid_file_failure_is_not_the_end_test()
+{
+    MediaFixture fixture;
+    const auto drain=[](VideoDecoder& decoder,int& frames){
+        VideoFrame frame;VideoReadResult result=VideoReadResult::FrameReady;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds{10};
+        while(std::chrono::steady_clock::now()<deadline){
+            result=decoder.ReadNextBlocking(frame);
+            if(result!=VideoReadResult::FrameReady)break;
+            ++frames;
+        }
+        return result;
+    };
+    {
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->Open(L"stderrcase_diesmid",MediaSourceKind::LocalFile));
+        int frames=0;
+        CHECK(drain(*decoder,frames)==VideoReadResult::Error);
+        CHECK_EQ(3,frames);
+        CHECK(decoder->LastErrorOutput().find("Invalid data found when processing input (stderr-marker)")!=std::string::npos);
+        // The refused hardware paths said why too; the last failure is the one kept.
+        CHECK(decoder->LastErrorOutput().find("hwaccel unavailable")==std::string::npos);
+    }
+    {
+        // The same exit where the file ends is the end of the file.
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->Open(L"stderrcase_diesend",MediaSourceKind::LocalFile));
+        int frames=0;
+        CHECK(drain(*decoder,frames)==VideoReadResult::EndOfStream);
+        CHECK_EQ(3,frames);
+        CHECK(decoder->LastErrorOutput().find("stderr-marker")!=std::string::npos);
+    }
+    {
+        // 256 KiB of stderr ahead of the frames: an undrained pipe would have
+        // blocked the child on its first few KiB and no frame would arrive.
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->Open(L"stderrcase_chatty",MediaSourceKind::LocalFile));
+        int frames=0;
+        CHECK(drain(*decoder,frames)==VideoReadResult::EndOfStream);
+        CHECK_EQ(5,frames);
+        // A clean end that is not early is not a failure, so nothing it wrote
+        // is kept; what is kept is the refused hardware path's reason.
+        CHECK(decoder->LastErrorOutput().find("chatty")==std::string::npos);
+        CHECK(decoder->LastErrorOutput().find("hwaccel unavailable")!=std::string::npos);
+    }
+    {
+        // A probe's reason reaches the log beside its exit code.
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(!decoder->OpenMetadata(L"stderrcase_probefails",MediaSourceKind::LocalFile));
+        std::ifstream log(Log::Path(),std::ios::binary);
+        const std::string written((std::istreambuf_iterator<char>(log)),std::istreambuf_iterator<char>());
+        CHECK(written.find("  ffprobe: probefails: No such file or directory (probe-marker)")!=std::string::npos);
+    }
+}
+
+// A source with no duration (browser-recorded WebM) reported 0.0, and every
+// seek was clamped to [0, 0] - straight back to the first frame.
+void video_decoder_seeks_a_source_with_an_unknown_duration_test()
+{
+    MediaFixture fixture;
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(decoder->Open(L"seekreuse_noduration",MediaSourceKind::LocalFile));
+    CHECK_EQ(0.0,decoder->DurationSeconds());
+    CHECK(decoder->SeekSeconds(12.0));
+    const VideoFrame frame=read_one_frame(*decoder);
+    CHECK_EQ(uint32_t{360},stamped_frame_index(frame));
+    CHECK_EQ(int64_t{120000000},frame.timestamp100ns);
+    CHECK(!decoder->SeekSeconds(std::numeric_limits<double>::quiet_NaN()));
+}
+
+// A drop of several files opened whatever Explorer listed first - a folder, a
+// subtitle - and silently discarded the rest.
+// The drop note is true of the file the drop opened while that file is on
+// screen: not before the asynchronous load finishes, across the Unload that
+// load does on the way in (nothing here is cleared by it), under the other
+// spelling the render job hands the path back as, and never for another file.
+// The decode note's Play retries where decoding stopped instead of replaying
+// the whole clip to reach the same failure; a clip that ended starts over.
+void status_notes_last_exactly_as_long_as_they_are_true_test()
+{
+    using namespace status_note;
+    CHECK(SameSource(L"C:\\Clips\\Film.mkv",L"c:/clips/./film.MKV"));
+    CHECK(!SameSource(L"C:\\Clips\\Film.mkv",L"C:\\Clips\\Film2.mkv"));
+    CHECK(!SameSource(L"",L""));
+
+    DropNote note;
+    CHECK(note.Visible(true,L"C:\\Clips\\Film.mkv").empty());
+    note.Set(L"Opened one dropped file; 2 others were ignored",L"C:\\Clips\\Film.mkv");
+    // Still loading: nothing is on screen for the note to describe.
+    CHECK(note.Visible(false,L"").empty());
+    CHECK(note.Visible(true,L"c:\\clips\\film.mkv")==L"Opened one dropped file; 2 others were ignored");
+    // Another file on screen - a derived carrier, say - is not what it is about.
+    CHECK(note.Visible(true,L"C:\\Cache\\carrier.mkv").empty());
+    // An open by name ends it; the same file opened again later is a new open.
+    note.Clear();
+    CHECK(note.Visible(true,L"C:\\Clips\\Film.mkv").empty());
+
+    CHECK_EQ(0.0,PlayRestartSeconds(false,12.5));
+    CHECK_EQ(12.5,PlayRestartSeconds(true,12.5));
+    CHECK_EQ(0.0,PlayRestartSeconds(true,0.0));
+}
+
+void dropped_files_open_the_first_supported_file_and_count_the_rest_test()
+{
+    using namespace dropped_files;
+    constexpr std::wstring_view patterns=L"*.mp4;*.mkv;*.webm";
+    CHECK(MatchesPatterns(L"C:\\clips\\Film.MKV",patterns));
+    CHECK(!MatchesPatterns(L"C:\\clips\\film.srt",patterns));
+    CHECK(!MatchesPatterns(L"C:\\clips.mp4\\readme",patterns));
+    CHECK(!MatchesPatterns(L"C:\\clips\\mp4",patterns));
+    CHECK(!MatchesPatterns(L"C:\\clips\\film.mp",patterns));
+
+    const auto folders=[](const std::wstring& path){return path.ends_with(L"\\folder");};
+    const std::vector<std::wstring> mixed{L"C:\\a\\folder",L"C:\\a\\film.srt",L"C:\\a\\film.mkv",L"C:\\a\\other.mp4"};
+    const Choice picked=Choose(mixed,patterns,folders);
+    CHECK(picked.open.has_value());
+    CHECK_EQ(size_t{2},picked.open.value_or(99));
+    CHECK_EQ(size_t{3},picked.ignored);
+
+    // Nothing listed: the first file of any kind, since FFmpeg opens more
+    // than the dialog lists.
+    const std::vector<std::wstring> unlisted{L"C:\\a\\folder",L"C:\\a\\capture.xyz",L"C:\\a\\notes.txt"};
+    const Choice fallback=Choose(unlisted,patterns,folders);
+    CHECK_EQ(size_t{1},fallback.open.value_or(99));
+    CHECK_EQ(size_t{2},fallback.ignored);
+
+    // One file is the ordinary drop: nothing ignored, nothing to say.
+    const Choice single=Choose(std::vector<std::wstring>{L"C:\\a\\film.webm"},patterns,folders);
+    CHECK_EQ(size_t{0},single.open.value_or(99));
+    CHECK_EQ(size_t{0},single.ignored);
+
+    // Only folders, or names the shell could not return: nothing opens.
+    const Choice none=Choose(std::vector<std::wstring>{L"C:\\a\\folder",L""},patterns,folders);
+    CHECK(!none.open.has_value());
+    CHECK_EQ(size_t{2},none.ignored);
+}
+
+// A header's width, height and rate are untrusted. A crafted 20000x20000 file
+// asked for ~11 GB of frame buffers, and a known open took any rate at all
+// although FrameRate() promises 1..240.
+void video_decoder_bounds_declared_geometry_and_known_rates_test()
+{
+    MediaFixture fixture;
+    const auto describes=[&](const wchar_t* scenario){
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        return decoder->OpenMetadata(scenario,MediaSourceKind::LocalFile);
+    };
+    CHECK(!describes(L"geomcap_huge"));
+    // 142 Mpx: within the texture limit, past any codec level.
+    CHECK(!describes(L"geomcap_pixels"));
+    // 8K DCI is the largest real video there is, and still opens.
+    CHECK(describes(L"geomcap_8k"));
+    // A 200 MP phone photo is one frame and is held to the texture limit only.
+    CHECK(describes(L"geomcap_photo"));
+
+    VideoDecoder::KnownMedia media{};
+    media.width=2;media.height=2;media.durationSec=30.0;
+    media.fps=1000.0;
+    auto fast=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(fast->OpenKnown(L"knownrate",media,MediaSourceKind::LocalFile));
+    CHECK_EQ(240.0,fast->FrameRate());
+    media.fps=0.25;
+    auto slow=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(slow->OpenKnown(L"knownrate",media,MediaSourceKind::LocalFile));
+    CHECK_EQ(1.0,slow->FrameRate());
+    media.fps=30.0;media.width=20000;media.height=20000;
+    auto huge=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(!huge->OpenKnown(L"knownrate",media,MediaSourceKind::LocalFile));
+}
+
+// The GPU source conversion is a matrix plus a range mapping. A source that
+// declares neither, or declares a matrix the conversion has no coefficients for,
+// cannot be converted correctly - so it is never handed over as NV12, however
+// loudly the caller asked for it. Undeclared is not BT.709.
+void video_decoder_open_sequential_refuses_nv12_for_an_unconvertible_source_test()
+{
+    MediaFixture fixture;
+    {
+        // Declares nothing at all - the common case for a clip nobody tagged.
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(L"colortag_none",MediaSourceKind::LocalFile));
+        CHECK(decoder->PixelLayout()==VideoPixelLayout::Bgra);
+        CHECK(decoder->ColorDescription().matrix==ColorMatrix::Unspecified);
+        CHECK(decoder->ColorDescription().range==ColorRange::Unspecified);
+        // The refusal is not a failure: the frames still arrive, converted by
+        // ffmpeg on the CPU, at BGRA's four bytes per pixel.
+        const VideoFrame frame=read_one_frame(*decoder);
+        CHECK(frame.layout==VideoPixelLayout::Bgra);
+        CHECK_EQ(FrameBytes(VideoPixelLayout::Bgra,4,2),frame.bgra.size());
+    }
+    {
+        // Declares everything, and declares BT.2020 constant luminance-free plus a
+        // PQ transfer. Declared-but-unhandled must refuse exactly like undeclared,
+        // and must not be rounded to the nearest matrix the shader does have.
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(L"colortag_bt2020",MediaSourceKind::LocalFile));
+        CHECK(decoder->PixelLayout()==VideoPixelLayout::Bgra);
+        CHECK(decoder->ColorDescription().matrix==ColorMatrix::Bt2020Ncl);
+        CHECK(decoder->ColorDescription().range==ColorRange::Limited);
+        // PQ and BT.2020 are named rather than folded into Other: they are what
+        // makes the stream HDR, and the decoder tone maps exactly those.
+        CHECK(decoder->ColorDescription().transfer==ColorTransfer::Pq);
+        CHECK(decoder->ColorDescription().primaries==ColorPrimaries::Bt2020);
+        CHECK(read_one_frame(*decoder).layout==VideoPixelLayout::Bgra);
+    }
+    {
+        // HLG is the other HDR transfer, and the same refusal.
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(L"colortag_hlg",MediaSourceKind::LocalFile));
+        CHECK(decoder->PixelLayout()==VideoPixelLayout::Bgra);
+        CHECK(decoder->ColorDescription().transfer==ColorTransfer::Hlg);
+        CHECK(decoder->ColorDescription().primaries==ColorPrimaries::Bt2020);
+    }
+}
+
+// What the decoder asks ffmpeg for, per source. The marker collects one line per
+// child the decoder started; only the first (the CUDA attempt, which the fake
+// accepts) is looked at.
+static std::string first_decode_command(const std::filesystem::path& marker)
+{
+    const std::string all=read_binary_file(marker);
+    return all.substr(0,all.find('\n'));
+}
+
+// An HDR source reaches every consumer tone mapped to SDR BT.709, for the peak its
+// metadata states, and keeps the ten bits until the curve has run: as P010 for the
+// decoder's own pass (HdrToneMap.h) when the matrix is BT.2020's, through ffmpeg's
+// float chain when it is anything else. An SDR source's command is untouched.
+void video_decoder_tone_maps_hdr_sources_to_sdr_test()
+{
+    MediaFixture fixture;
+    const auto decode=[&](const wchar_t* scenario,std::string& command)->std::unique_ptr<VideoDecoder>{
+        const auto marker=fixture.directory/(std::wstring(scenario)+L"-args.txt");
+        ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ARGS_MARKER",marker.wstring());
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(scenario,MediaSourceKind::LocalFile));
+        const VideoFrame frame=read_one_frame(*decoder);
+        CHECK(frame.layout==VideoPixelLayout::Bgra);
+        CHECK_EQ(FrameBytes(VideoPixelLayout::Bgra,4,2),frame.bgra.size());
+        command=first_decode_command(marker);
+        return decoder;
+    };
+    std::string command;
+    {
+        // MaxCLL 1000 beats the 4000-nit mastering display.
+        auto decoder=decode(L"hdrsrc_pqmeta",command);
+        CHECK(decoder->SourceHdrSignal()==hdr_policy::HdrSignal::Pq);
+        CHECK_EQ(1000.0,decoder->HdrPeakNits());
+        CHECK(decoder->ToneMapsItself());
+        CHECK(decoder->DecodingP010());
+        CHECK_EQ(std::string("|hdr-sdr-hable-v2-lut65-pq-peak1000"),decoder->ToneMapIdentityTerm());
+        // NV12 was asked for and refused; ffmpeg hands over the ten bits as P010
+        // and the decoder runs the curve, so the command carries no curve at all.
+        CHECK(decoder->PixelLayout()==VideoPixelLayout::Bgra);
+        CHECK(command.find("-hwaccel cuda")!=std::string::npos);
+        CHECK(command.find("scale_cuda=4:2:format=p010:")!=std::string::npos);
+        CHECK(command.find("hwdownload,format=p010le -pix_fmt p010le")!=std::string::npos);
+        CHECK(command.find("zscale")==std::string::npos);
+        CHECK(command.find("tonemap")==std::string::npos);
+        // A known open of the same source converts it identically, without a probe.
+        const VideoDecoder::KnownMedia media=decoder->Media();
+        CHECK_EQ(1000.0,media.hdrPeakNits);
+        const auto marker=fixture.directory/L"known-args.txt";
+        ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ARGS_MARKER",marker.wstring());
+        auto known=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(known->OpenKnown(L"hdrsrc_pqmeta",media,MediaSourceKind::LocalFile));
+        CHECK_EQ(std::string("|hdr-sdr-hable-v2-lut65-pq-peak1000"),known->ToneMapIdentityTerm());
+        read_one_frame(*known);
+        CHECK(first_decode_command(marker).find("-pix_fmt p010le")!=std::string::npos);
+    }
+    {
+        auto decoder=decode(L"hdrsrc_pqmastering",command);
+        CHECK_EQ(4000.0,decoder->HdrPeakNits());
+        CHECK_EQ(std::string("|hdr-sdr-hable-v2-lut65-pq-peak4000"),decoder->ToneMapIdentityTerm());
+    }
+    {
+        // No static metadata at all: the default peak, not ffmpeg's 10000.
+        auto decoder=decode(L"hdrsrc_pqnometa",command);
+        CHECK_EQ(1000.0,decoder->HdrPeakNits());
+        CHECK_EQ(std::string("|hdr-sdr-hable-v2-lut65-pq-peak1000"),decoder->ToneMapIdentityTerm());
+    }
+    {
+        // No matrix declared: BT.2020 NCL, as ffmpeg's chain would assume.
+        auto decoder=decode(L"hdrsrc_pqnomatrix",command);
+        CHECK(decoder->ToneMapsItself());
+        CHECK(command.find("-pix_fmt p010le")!=std::string::npos);
+    }
+    {
+        // A PQ stream that declares a BT.709 matrix would otherwise be handed to
+        // the GPU NV12 conversion, which knows nothing of PQ.
+        // Nor the decoder's own pass, which implements BT.2020's matrix only: this
+        // one keeps ffmpeg's float chain, and the key term says so.
+        auto decoder=decode(L"hdrsrc_pq709",command);
+        CHECK(decoder->PixelLayout()==VideoPixelLayout::Bgra);
+        CHECK(!decoder->ToneMapsItself());
+        CHECK(!decoder->DecodingP010());
+        CHECK(command.find("tonemap=tonemap=hable:desat=0:peak=10.000000")!=std::string::npos);
+        CHECK(command.find(",format=bgra -pix_fmt bgra")!=std::string::npos);
+        CHECK_EQ(std::string("|hdr-sdr-hable-v1-pq-peak1000"),decoder->ToneMapIdentityTerm());
+    }
+    {
+        auto decoder=decode(L"hdrsrc_hlg",command);
+        CHECK(decoder->SourceHdrSignal()==hdr_policy::HdrSignal::Hlg);
+        CHECK_EQ(std::string("|hdr-sdr-hable-v2-lut65-hlg-peak1000"),decoder->ToneMapIdentityTerm());
+        CHECK(command.find("-pix_fmt p010le")!=std::string::npos);
+    }
+    {
+        // SDR: no tone map, no key term, the NV12 path it always had.
+        const auto marker=fixture.directory/L"sdr-args.txt";
+        ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ARGS_MARKER",marker.wstring());
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(L"nv12geom",MediaSourceKind::LocalFile));
+        CHECK(decoder->PixelLayout()==VideoPixelLayout::Nv12);
+        read_one_frame(*decoder);
+        CHECK(decoder->ToneMapIdentityTerm().empty());
+        CHECK_EQ(0.0,decoder->HdrPeakNits());
+        const std::string sdr=first_decode_command(marker);
+        CHECK(!sdr.empty());
+        CHECK(sdr.find("zscale")==std::string::npos);
+        CHECK(sdr.find("format=nv12:interp_algo")!=std::string::npos);
+    }
+}
+
+// A portrait phone clip is stored landscape with a display matrix. The probe
+// that reads the geometry reads the matrix too, the geometry the decoder
+// reports is the upright one, and every path it can take stands the frames up
+// itself with ffmpeg's autorotation turned off - on the GPU for CUDA, after the
+// download for D3D11VA, on the CPU otherwise. The fake child writes frames of
+// the upright shape, so a decoder that still expected the stored one would
+// never assemble a frame from them.
+void video_decoder_stands_turned_video_up_on_every_path_test()
+{
+    MediaFixture fixture;
+    const auto lines=[](const std::filesystem::path& marker){
+        std::vector<std::string> commands;std::istringstream in(read_binary_file(marker));
+        for(std::string line;std::getline(in,line);)if(!line.empty())commands.push_back(line);
+        return commands;
+    };
+    {
+        const auto marker=fixture.directory/L"turned-args.txt";
+        ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ARGS_MARKER",marker.wstring());
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(L"turned_quarter",MediaSourceKind::LocalFile));
+        // Stored 4x2 at 2:1, shown 2x4 at 1:2.
+        CHECK_EQ(uint32_t{2},decoder->Width());
+        CHECK_EQ(uint32_t{4},decoder->Height());
+        CHECK_EQ(uint32_t{2},decoder->NativeWidth());
+        CHECK(std::abs(decoder->DisplayAspectRatio()-0.5)<1e-9);
+        CHECK(decoder->DisplayOrientation()==display_orientation::Orientation::CounterClockwise);
+        CHECK_EQ(std::string("|display-cclock-v1"),decoder->OrientationIdentityTerm());
+        const VideoFrame frame=read_one_frame(*decoder);
+        CHECK_EQ(FrameBytes(decoder->PixelLayout(),2,4),frame.bgra.size());
+        const std::string command=first_decode_command(marker);
+        CHECK(command.find("-noautorotate")!=std::string::npos);
+        CHECK(command.find("-noautorotate")<command.find(" -i "));
+        CHECK(command.find("-vf transpose_cuda=dir=cclock,scale_cuda=2:4:")!=std::string::npos);
+
+        // Reopened as a known sibling - cached playback's original - it is
+        // stood up exactly the same way, without a probe.
+        const VideoDecoder::KnownMedia media=decoder->Media();
+        CHECK(media.orientation==display_orientation::Orientation::CounterClockwise);
+        CHECK_EQ(uint32_t{2},media.width);
+        const auto knownMarker=fixture.directory/L"turned-known-args.txt";
+        ScopedEnvironmentVariable knownVariable(L"DLSS_VIDEO_TEST_ARGS_MARKER",knownMarker.wstring());
+        auto known=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(known->OpenKnown(L"turned_quarter",media,MediaSourceKind::LocalFile));
+        CHECK_EQ(std::string("|display-cclock-v1"),known->OrientationIdentityTerm());
+        CHECK_EQ(FrameBytes(known->PixelLayout(),2,4),read_one_frame(*known).bgra.size());
+        CHECK(first_decode_command(knownMarker).find("-vf transpose_cuda=dir=cclock,scale_cuda=2:4:")!=std::string::npos);
+    }
+    {
+        // Both hardware paths refused: each child the decoder falls back through
+        // turns the picture in its own place, and the frames it finally reads
+        // are the upright shape.
+        const auto marker=fixture.directory/L"turned-fallback-args.txt";
+        ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ARGS_MARKER",marker.wstring());
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->Open(L"turned_fallback",MediaSourceKind::LocalFile));
+        CHECK_EQ(FrameBytes(VideoPixelLayout::Bgra,2,4),read_one_frame(*decoder).bgra.size());
+        const auto commands=lines(marker);
+        CHECK_EQ(size_t{3},commands.size());
+        if(commands.size()==3){
+            for(const auto& command:commands)CHECK(command.find("-noautorotate")!=std::string::npos);
+            CHECK(commands[0].find("-hwaccel cuda")!=std::string::npos);
+            CHECK(commands[0].find("transpose_cuda=dir=cclock,scale_cuda=2:4:")!=std::string::npos);
+            CHECK(commands[1].find("-hwaccel d3d11va")!=std::string::npos);
+            CHECK(commands[1].find("-vf hwdownload,format=nv12,transpose=cclock,scale=2:4:")!=std::string::npos);
+            CHECK(commands[2].find("-hwaccel")==std::string::npos);
+            CHECK(commands[2].find("-vf transpose=cclock ")!=std::string::npos);
+        }
+    }
+    {
+        // A half turn keeps the frame's shape, so only the key term tells its
+        // renders from the upside-down ones the CUDA path used to make.
+        const auto marker=fixture.directory/L"turned-half-args.txt";
+        ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ARGS_MARKER",marker.wstring());
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(L"turned_half",MediaSourceKind::LocalFile));
+        CHECK_EQ(uint32_t{4},decoder->Width());
+        CHECK_EQ(uint32_t{2},decoder->Height());
+        CHECK(decoder->DisplayOrientation()==display_orientation::Orientation::HalfTurn);
+        CHECK_EQ(std::string("|display-reversal-v1"),decoder->OrientationIdentityTerm());
+        read_one_frame(*decoder);
+        CHECK(first_decode_command(marker).find("-vf transpose_cuda=dir=reversal,scale_cuda=4:2:")!=std::string::npos);
+    }
+    {
+        // Upright: no turn and no key term, and ffmpeg is still told not to
+        // turn anything the probe did not see.
+        const auto marker=fixture.directory/L"upright-args.txt";
+        ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ARGS_MARKER",marker.wstring());
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(L"nv12geom",MediaSourceKind::LocalFile));
+        CHECK(decoder->DisplayOrientation()==display_orientation::Orientation::Upright);
+        CHECK(decoder->OrientationIdentityTerm().empty());
+        read_one_frame(*decoder);
+        const std::string command=first_decode_command(marker);
+        CHECK(command.find("transpose")==std::string::npos);
+        CHECK(command.find("-noautorotate")!=std::string::npos);
+    }
+}
+
+// An HDR display asks for the original as PQ. Only the presentation ever asks,
+// only an HDR source answers, and a running child keeps what it was started with
+// until a seek, which then cannot be served by that child.
+void video_decoder_decodes_hdr_originals_as_pq_on_request_test()
+{
+    MediaFixture fixture;
+    const auto marker=fixture.directory/L"pq-args.txt";
+    ScopedEnvironmentVariable markerVariable(L"DLSS_VIDEO_TEST_ARGS_MARKER",marker.wstring());
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+    decoder->SetHdrPresentation(true);
+    CHECK(decoder->Open(L"hdrsrc_pqmeta",MediaSourceKind::LocalFile,{},true));
+    CHECK(decoder->PixelLayout()==VideoPixelLayout::Bgra);
+    const VideoFrame frame=read_one_frame(*decoder);
+    CHECK(frame.pq);
+    CHECK(decoder->DecodingPq());
+    // Four bytes a pixel, like BGRA: R10G10B10A2.
+    CHECK_EQ(FrameBytes(VideoPixelLayout::Bgra,4,2),frame.bgra.size());
+    const std::string command=first_decode_command(marker);
+    CHECK(command.find("hwdownload,format=p010le,zscale=tin=smpte2084:pin=bt2020:t=smpte2084:p=bt2020:npl=100,format=gbrp10le")!=std::string::npos);
+    CHECK(command.find("-pix_fmt x2bgr10le")!=std::string::npos);
+    CHECK(command.find("tonemap")==std::string::npos);
+    // The cache key is about what the model is shown, which a presentation request
+    // never changes.
+    CHECK_EQ(std::string("|hdr-sdr-hable-v2-lut65-pq-peak1000"),decoder->ToneMapIdentityTerm());
+    // Back to SDR: the next seek restarts rather than walking the PQ child forward.
+    decoder->SetHdrPresentation(false);
+    CHECK(decoder->SeekSeconds(0.1));
+    CHECK(!decoder->LastSeekTiming().reusedChild);
+    const VideoFrame after=read_one_frame(*decoder);
+    CHECK(!after.pq);
+    const std::string all=read_binary_file(marker);
+    CHECK(all.substr(all.find('\n')+1).find("-pix_fmt p010le")!=std::string::npos);
+    CHECK(!decoder->DecodingPq());
+    CHECK(decoder->DecodingP010());
+    // An SDR source ignores the request.
+    auto sdr=VideoDecoderTestAccess::Create(fixture.directory);
+    sdr->SetHdrPresentation(true);
+    CHECK(sdr->OpenSequential(L"colortag_bt601full",MediaSourceKind::LocalFile,{},false));
+    CHECK(!read_one_frame(*sdr).pq);
+    CHECK(!sdr->DecodingPq());
+}
+
+// A source that does declare a description the conversion implements keeps the
+// NV12 path, and the description travels far enough out of the decoder for the
+// renderer to specialise the shader from it rather than assume BT.709.
+void video_decoder_open_sequential_keeps_nv12_for_a_declared_source_test()
+{
+    MediaFixture fixture;
+    {
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(L"nv12geom",MediaSourceKind::LocalFile));
+        CHECK(decoder->PixelLayout()==VideoPixelLayout::Nv12);
+        const SourceColorDescription color=decoder->ColorDescription();
+        CHECK(color.matrix==ColorMatrix::Bt709);
+        CHECK(color.range==ColorRange::Limited);
+        CHECK(color.primaries==ColorPrimaries::Bt709);
+        CHECK(color.transfer==ColorTransfer::Bt709);
+        CHECK(SourceNv12ConversionFor(color)==SourceNv12Conversion::Bt709Limited);
+    }
+    {
+        // BT.601 full range, and the stub prints the colour entries before the
+        // geometry ones, so this also covers the description surviving ffprobe's
+        // own ordering.
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        CHECK(decoder->OpenSequential(L"colortag_bt601full",MediaSourceKind::LocalFile));
+        CHECK(decoder->PixelLayout()==VideoPixelLayout::Nv12);
+        const SourceColorDescription color=decoder->ColorDescription();
+        CHECK(color.matrix==ColorMatrix::Bt601);
+        CHECK(color.range==ColorRange::Full);
+        CHECK(SourceNv12ConversionFor(color)==SourceNv12Conversion::Bt601Full);
+        const VideoFrame frame=read_one_frame(*decoder);
+        CHECK(frame.layout==VideoPixelLayout::Nv12);
+        CHECK_EQ(FrameBytes(VideoPixelLayout::Nv12,4,2),frame.bgra.size());
+    }
+}
+
+void video_decoder_swap_carries_probe_derived_state_test()
+{
+    MediaFixture fixture;
+    VideoDecoderTestAccess::CheckSwapCarriesSource(fixture.directory);
+}
+
+// The seven numbers the NV12 source pass is compiled with, per conversion. The
+// BT.709 limited-range row is frozen: it is the program every cached render on
+// disk was made with, and because the constants reach the shader as preprocessor
+// tokens, these exact strings are what make that arm's bytecode byte-identical to
+// the day it shipped. Changing one of them silently re-colours every cache hit.
+void source_nv12_conversion_constants_are_the_shipped_coefficients_test()
+{
+    using d3d12_renderer_detail::SourceNv12ConstantsFor;
+    const auto* limited709=SourceNv12ConstantsFor(SourceNv12Conversion::Bt709Limited);
+    CHECK(limited709!=nullptr);
+    if(limited709){
+        CHECK_EQ(std::string("16.0"),std::string(limited709->lumaOffset));
+        CHECK_EQ(std::string("219.0"),std::string(limited709->lumaScale));
+        CHECK_EQ(std::string("224.0"),std::string(limited709->chromaScale));
+        CHECK_EQ(std::string("1.5748"),std::string(limited709->redV));
+        CHECK_EQ(std::string("0.187324"),std::string(limited709->greenU));
+        CHECK_EQ(std::string("0.468124"),std::string(limited709->greenV));
+        CHECK_EQ(std::string("1.8556"),std::string(limited709->blueU));
+    }
+    // BT.601 selects BT.601's coefficients, not 709's, and keeps the studio-swing
+    // range mapping it shares with 709 limited.
+    const auto* limited601=SourceNv12ConstantsFor(SourceNv12Conversion::Bt601Limited);
+    CHECK(limited601!=nullptr);
+    if(limited601){
+        CHECK_EQ(std::string("1.402"),std::string(limited601->redV));
+        CHECK_EQ(std::string("0.344136"),std::string(limited601->greenU));
+        CHECK_EQ(std::string("0.714136"),std::string(limited601->greenV));
+        CHECK_EQ(std::string("1.772"),std::string(limited601->blueU));
+        CHECK_EQ(std::string("16.0"),std::string(limited601->lumaOffset));
+        CHECK_EQ(std::string("219.0"),std::string(limited601->lumaScale));
+        CHECK_EQ(std::string("224.0"),std::string(limited601->chromaScale));
+    }
+    // Full range keeps its matrix and drops the studio-swing mapping: no 16 offset
+    // and the whole byte in both planes.
+    const auto* full601=SourceNv12ConstantsFor(SourceNv12Conversion::Bt601Full);
+    CHECK(full601!=nullptr);
+    if(full601){
+        CHECK_EQ(std::string("0.0"),std::string(full601->lumaOffset));
+        CHECK_EQ(std::string("255.0"),std::string(full601->lumaScale));
+        CHECK_EQ(std::string("255.0"),std::string(full601->chromaScale));
+        CHECK_EQ(std::string("1.402"),std::string(full601->redV));
+    }
+    // No nearest variant: a description the pass cannot honour yields no constants,
+    // which is what leaves the renderer nothing to compile.
+    CHECK(SourceNv12ConstantsFor(SourceNv12Conversion::Unsupported)==nullptr);
+}
+
+// A per-arm label is not evidence that the arm took effect. Each conversion is
+// compiled here the way the renderer compiles it - same text, same flags, no
+// device - and the four programs must come out pairwise different, which is only
+// true if the constants actually reached the compiler.
+void source_nv12_conversion_compiles_a_distinct_program_per_arm_test()
+{
+    const std::array conversions{SourceNv12Conversion::Bt709Limited,SourceNv12Conversion::Bt709Full,
+                                 SourceNv12Conversion::Bt601Limited,SourceNv12Conversion::Bt601Full};
+    std::vector<std::string> programs;
+    for(const SourceNv12Conversion conversion:conversions){
+        Microsoft::WRL::ComPtr<ID3DBlob> blob;
+        CHECK(D3D12RendererTestAccess::CompileSourceNv12(conversion,blob));
+        if(!blob)continue;
+        programs.emplace_back(static_cast<const char*>(blob->GetBufferPointer()),blob->GetBufferSize());
+    }
+    CHECK_EQ(conversions.size(),programs.size());
+    for(size_t a=0;a+1<programs.size();++a)
+        for(size_t b=a+1;b<programs.size();++b)
+            CHECK(programs[a]!=programs[b]);
+    // An unsupported conversion has no program at all, so nothing can bind one.
+    Microsoft::WRL::ComPtr<ID3DBlob> refused;
+    CHECK(!D3D12RendererTestAccess::CompileSourceNv12(SourceNv12Conversion::Unsupported,refused));
+    CHECK(refused==nullptr);
+}
+
+// The last scaling step. The backbuffers follow the player's window and the present
+// pass resamples into them; the offline carrier, and a window that is the output's
+// size, keep the 1:1 PSPresent path the cache capture shares.
+void present_scale_follows_the_window_only_where_it_should_test()
+{
+    using present_scale::Choose;
+    // A 4K output in the default window: scaled, at the window's size.
+    auto target=Choose(true,true,1440,810,3840,2160);
+    CHECK(target.scaled);CHECK_EQ(1440u,target.width);CHECK_EQ(810u,target.height);
+    // The same window at the output's size is PSPresent at 1:1.
+    target=Choose(true,true,3840,2160,3840,2160);
+    CHECK(!target.scaled);CHECK_EQ(3840u,target.width);CHECK_EQ(2160u,target.height);
+    // The offline carrier never follows its hidden window, whatever it measures.
+    target=Choose(false,false,100,100,2560,1440);
+    CHECK(!target.scaled);CHECK_EQ(2560u,target.width);CHECK_EQ(1440u,target.height);
+    // No scaled program, or no backbuffer yet: the output's size.
+    CHECK(!Choose(true,false,1440,810,3840,2160).scaled);
+    CHECK(!Choose(true,true,0,0,3840,2160).scaled);
+    // One tap magnifying, then one per texel of footprint, capped.
+    CHECK_EQ(1u,present_scale::FootprintTaps(0.5f));
+    CHECK_EQ(1u,present_scale::FootprintTaps(1.0f));
+    CHECK_EQ(2u,present_scale::FootprintTaps(2.0f));
+    CHECK_EQ(3u,present_scale::FootprintTaps(3840.0f/1440.0f));
+    CHECK_EQ(8u,present_scale::FootprintTaps(40.0f));
+    // Both presents compile from the one program text, and they are different
+    // programs: the scaled one is not the capture's.
+    Microsoft::WRL::ComPtr<ID3DBlob> plain,scaled;
+    CHECK(D3D12RendererTestAccess::CompilePresentProgram("PSPresent",plain));
+    CHECK(D3D12RendererTestAccess::CompilePresentProgram("PSPresentScaled",scaled));
+    if(plain&&scaled)
+        CHECK(std::string(static_cast<const char*>(plain->GetBufferPointer()),plain->GetBufferSize())!=
+              std::string(static_cast<const char*>(scaled->GetBufferPointer()),scaled->GetBufferSize()));
+}
+
+// The compositor draws what the cache capture's PSPresent cannot - tags, a swapped
+// split - through a cbuffer (b1) and textures (t3, t4) of its own. fxc drops what an
+// entry point never reads, so PSPresent's program, which every cached render on disk
+// was made with, still binds exactly the four things it always did. Its reflection is
+// part of its bytecode, so this is a test that the capture program kept its shape.
+static std::vector<std::string> present_program_bindings(const char* entry)
+{
+    std::vector<std::string> names;
+    Microsoft::WRL::ComPtr<ID3DBlob> blob;
+    if(!D3D12RendererTestAccess::CompilePresentProgram(entry,blob)||!blob)return names;
+    Microsoft::WRL::ComPtr<ID3D12ShaderReflection> reflection;
+    if(FAILED(D3DReflect(blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&reflection))))return names;
+    D3D12_SHADER_DESC desc{};
+    if(FAILED(reflection->GetDesc(&desc)))return names;
+    for(UINT index=0;index<desc.BoundResources;++index){
+        D3D12_SHADER_INPUT_BIND_DESC bind{};
+        if(SUCCEEDED(reflection->GetResourceBindingDesc(index,&bind)))
+            names.push_back(std::string(bind.Name)+"@"+std::to_string(bind.BindPoint));
+    }
+    std::sort(names.begin(),names.end());
+    return names;
+}
+
+void compare_compositor_stays_out_of_the_capture_program_test()
+{
+    CHECK((present_program_bindings("PSPresent")==std::vector<std::string>{"Params@0","Ref@1","S@0","T@0"}));
+    for(const char* entry:{"PSConvert","PSCaptureLuma","PSCaptureChroma"}){
+        const auto bound=present_program_bindings(entry);
+        CHECK(!bound.empty());
+        for(const std::string& name:bound)CHECK(name.rfind("Compose@",0)!=0&&name.rfind("Labels@",0)!=0);
+    }
+    const auto scaled=present_program_bindings("PSPresentScaled");
+    CHECK(std::find(scaled.begin(),scaled.end(),"Compose@1")!=scaled.end());
+    CHECK(std::find(scaled.begin(),scaled.end(),"Labels@4")!=scaled.end());
+    // Subtitles are composited after the network by the window compositor alone:
+    // the capture, the conversion and the NV12 capture never bind their texture,
+    // so a subtitle can never reach the cache or the model's input.
+    CHECK(std::find(scaled.begin(),scaled.end(),"Subtitles@5")!=scaled.end());
+    for(const char* entry:{"PSPresent","PSConvert","PSCaptureLuma","PSCaptureChroma"}){
+        const auto bound=present_program_bindings(entry);
+        CHECK(std::find(bound.begin(),bound.end(),"Subtitles@5")==bound.end());
+    }
+    // RTX VSR (P2.8) is the compositor's too: presentation only, never in the capture,
+    // the conversion or the NV12 capture, so no cached render can hold it.
+    CHECK(std::find(scaled.begin(),scaled.end(),"Vsr@6")!=scaled.end());
+    // The Compose cbuffer is exactly the root constants the renderer sets: a member added
+    // on one side only would shift every value after it, or read past what was set.
+    {
+        Microsoft::WRL::ComPtr<ID3DBlob> blob;
+        CHECK(D3D12RendererTestAccess::CompilePresentProgram("PSPresentScaled",blob));
+        Microsoft::WRL::ComPtr<ID3D12ShaderReflection> reflection;
+        if(blob&&SUCCEEDED(D3DReflect(blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&reflection)))){
+            D3D12_SHADER_BUFFER_DESC compose{};
+            CHECK(SUCCEEDED(reflection->GetConstantBufferByName("Compose")->GetDesc(&compose)));
+            CHECK_EQ(UINT(D3D12RendererTestAccess::ComposeConstantCount()*4u),compose.Size);
+        }else CHECK(false);
+    }
+    for(const char* entry:{"PSPresent","PSConvert","PSConvertDebanded","PSCaptureLuma","PSCaptureChroma","PSCaptureDithered"}){
+        const auto bound=present_program_bindings(entry);
+        CHECK(std::find(bound.begin(),bound.end(),"Vsr@6")==bound.end());
+    }
+    // The window compositor takes over at 1:1 only for what PSPresent cannot draw.
+    using present_scale::Choose;
+    CHECK(!Choose(true,true,1920,1080,1920,1080,false).scaled);
+    auto target=Choose(true,true,1920,1080,1920,1080,true);
+    CHECK(target.scaled);CHECK_EQ(1920u,target.width);CHECK_EQ(1080u,target.height);
+    // Never for the offline carrier, which has no compositor and no window to follow.
+    CHECK(!Choose(false,false,1920,1080,1920,1080,true).scaled);
+    CHECK(!Choose(true,false,1920,1080,1920,1080,true).scaled);
+    ComparisonSettings comparison;
+    CHECK(!ComparisonNeedsCompositor(comparison));
+    comparison.mode=ComparisonMode::Blend;CHECK(!ComparisonNeedsCompositor(comparison));
+    for(const ComparisonMode mode:{ComparisonMode::Original,ComparisonMode::SplitVertical,ComparisonMode::Wipe,ComparisonMode::Difference,ComparisonMode::Vsr}){
+        comparison.mode=mode;CHECK(ComparisonNeedsCompositor(comparison));
+    }
+}
+
+// RTX VSR (P2.8): when the view can be shown and what it says when it cannot, the
+// ladder, the size of the frame it makes, and which views ask the renderer for it.
+// RTX VSR as the playback upscaler (docs/measurements/vsr-quality-20261002): it
+// takes the picture's upscale from the compositor wherever the window shows the
+// video larger than it is, and stands aside for everything that is not that one
+// plain picture - DLSS Super Resolution's own output, a comparison, an HDR frame,
+// a debug view - and where there is nothing to upscale.
+void vsr_policy_playback_upscales_only_a_plain_picture_shown_larger_test()
+{
+    using vsr_policy::PlaybackState;
+    using vsr_policy::PlaybackUpscales;
+    PlaybackState state{};
+    state.enabled = true;
+    state.ready = true;
+    state.finalView = true;
+    state.sourceW = 960;
+    state.sourceH = 540;
+    state.targetW = 1920;
+    state.targetH = 1080;
+    CHECK(PlaybackUpscales(state));
+    const auto without = [&](auto change) { PlaybackState other = state; change(other); return PlaybackUpscales(other); };
+    CHECK(!without([](PlaybackState& s) { s.enabled = false; }));
+    CHECK(!without([](PlaybackState& s) { s.ready = false; }));
+    CHECK(!without([](PlaybackState& s) { s.superResolution = true; }));
+    CHECK(!without([](PlaybackState& s) { s.comparing = true; }));
+    CHECK(!without([](PlaybackState& s) { s.hdr = true; }));
+    CHECK(!without([](PlaybackState& s) { s.finalView = false; }));
+    // Shown at its own size or smaller: nothing to upscale.
+    CHECK(!without([](PlaybackState& s) { s.targetW = 960; s.targetH = 540; }));
+    CHECK(!without([](PlaybackState& s) { s.targetW = 800; s.targetH = 1080; }));
+    CHECK(!without([](PlaybackState& s) { s.sourceW = 0; }));
+    // One axis larger is enough: the fitted picture grows.
+    CHECK(without([](PlaybackState& s) { s.targetW = 1280; s.targetH = 2000; }));
+    // On by default: it measured above every plain scaler and DLSS SR.
+    CHECK(vsr_policy::kPlaybackDefault);
+}
+
+// RTX VSR was measured on an RTX 5090 only; on a slower GPU High can cost a frame.
+// Playback that falls behind while VSR takes a real share of the frame budget steps
+// it down for that video - a quality at a time, then off - and never on one bad
+// window, nor for drops VSR cannot be the cause of.
+// The press-and-hold A/B and the Original view compare the render with what it was
+// made from. With RTX VSR upscaling one member and the plain scale the other, the A/B
+// would show a scaler change as the model's. So both single-picture views get VSR -
+// the render in the DLSS 5 view, the original in the Original view and the peek - and
+// every view that draws both members gets neither.
+void vsr_policy_playback_treats_both_single_picture_views_alike_test()
+{
+    using vsr_policy::PlaybackPicture;
+    using vsr_policy::PlaybackInput;
+    // No reference: the one picture is the decoded frame, whatever the settings say.
+    CHECK(PlaybackPicture(false, true, false, true, false) == PlaybackInput::Decoded);
+    CHECK(PlaybackPicture(false, false, true, false, true) == PlaybackInput::Decoded);
+    // With a reference: the DLSS 5 view untouched is the decoded (neural) frame...
+    CHECK(PlaybackPicture(true, true, false, true, false) == PlaybackInput::Decoded);
+    // ...but not at another Mix or under a mask, which draw both members.
+    CHECK(PlaybackPicture(true, true, false, false, false) == PlaybackInput::None);
+    CHECK(PlaybackPicture(true, true, false, true, true) == PlaybackInput::None);
+    // The Original view and the peek are the reference, at any Mix.
+    CHECK(PlaybackPicture(true, false, true, true, false) == PlaybackInput::Reference);
+    CHECK(PlaybackPicture(true, false, true, false, true) == PlaybackInput::Reference);
+    // Split, Wipe, Difference, Side by side, 2 x 2 and the VSR view itself: neither.
+    CHECK(PlaybackPicture(true, false, false, true, false) == PlaybackInput::None);
+}
+
+void vsr_policy_holds_a_new_output_size_until_the_window_settles_test()
+{
+    using namespace vsr_policy;
+    const Size small{1920, 1080}, mid{2400, 1350}, large{3840, 2160};
+    SizeSettle settle;
+    // Nothing made yet: the first size is made at once, so an export or a window that
+    // opens at its size has VSR on its first frame.
+    CHECK(SizeSettled(settle, Size{}, small, 0.0));
+    // The size already made is used at once, however briefly it has been asked for.
+    CHECK(SizeSettled(settle, small, small, 1.0));
+    // A drag: every present asks for a new size, and none of them is made.
+    CHECK(!SizeSettled(settle, small, mid, 10.0));
+    CHECK(!SizeSettled(settle, small, Size{2500, 1406}, 20.0));
+    CHECK(!SizeSettled(settle, small, large, 30.0));
+    // The drag stops at `large`: three presents are not enough before 100 ms have passed...
+    CHECK(!SizeSettled(settle, small, large, 40.0));
+    CHECK(!SizeSettled(settle, small, large, 50.0));
+    CHECK(!SizeSettled(settle, small, large, 129.0));
+    // ...and 100 ms are not enough before three presents, counted from the first.
+    CHECK(SizeSettled(settle, small, large, 130.0));
+    SizeSettle slow;
+    CHECK(!SizeSettled(slow, small, large, 0.0));
+    CHECK(!SizeSettled(slow, small, large, 500.0));
+    CHECK(SizeSettled(slow, small, large, 501.0));
+    // With `large` made, a drag through `mid` waits again, and coming back to `large`
+    // needs no new texture, so it is used at once.
+    CHECK(!SizeSettled(slow, large, mid, 600.0));
+    CHECK(SizeSettled(slow, large, large, 601.0));
+    // A size asked for, left, and asked for again starts its count over.
+    SizeSettle again;
+    CHECK(!SizeSettled(again, small, large, 0.0));
+    CHECK(!SizeSettled(again, small, large, 60.0));
+    CHECK(!SizeSettled(again, small, mid, 120.0));
+    CHECK(!SizeSettled(again, small, large, 180.0));
+    CHECK(!SizeSettled(again, small, large, 240.0));
+    CHECK(SizeSettled(again, small, large, 300.0));
+}
+
+void vsr_policy_keep_up_guard_steps_down_only_for_sustained_drops_it_explains_test()
+{
+    using namespace vsr_policy;
+    // 30 fps for 3 s asks for 90 frames: 5 dropped is over 5 %, 4 is not.
+    CHECK(WindowFellBehind(3.0, 5, 30.0, 8.0));
+    CHECK(!WindowFellBehind(3.0, 4, 30.0, 8.0));
+    // VSR at 2 ms of a 33 ms budget is not what is dropping frames.
+    CHECK(!WindowFellBehind(3.0, 30, 30.0, 2.0));
+    CHECK(WindowFellBehind(3.0, 30, 30.0, 6.7));
+    CHECK(!WindowFellBehind(0.0, 30, 30.0, 8.0));
+    CHECK(!WindowFellBehind(3.0, 30, 0.0, 8.0));
+
+    KeepUpGuard guard;
+    CHECK(guard.Observe(true, Quality::High) == KeepUpStep::Hold);
+    CHECK(guard.Observe(false, Quality::High) == KeepUpStep::Hold);   // a good window clears it
+    CHECK(guard.Observe(true, Quality::High) == KeepUpStep::Hold);
+    CHECK(guard.Observe(true, Quality::High) == KeepUpStep::StepDown);
+    // A step starts over: the next quality gets two windows of its own.
+    CHECK(guard.Observe(true, Quality::Medium) == KeepUpStep::Hold);
+    CHECK(guard.Observe(true, Quality::Medium) == KeepUpStep::StepDown);
+    CHECK(guard.Observe(true, Quality::Low) == KeepUpStep::Hold);
+    CHECK(guard.Observe(true, Quality::Low) == KeepUpStep::TurnOff);
+    guard.Reset();
+    CHECK(guard.Observe(true, Quality::Ultra) == KeepUpStep::Hold);
+
+    CHECK(LowerQuality(Quality::Ultra) == Quality::High);
+    CHECK(LowerQuality(Quality::High) == Quality::Medium);
+    CHECK(LowerQuality(Quality::Medium) == Quality::Low);
+    CHECK(LowerQuality(Quality::Low) == Quality::Low);
+}
+
+void vsr_policy_decides_the_view_its_ladder_and_its_size_test()
+{
+    using namespace vsr_policy;
+    // The conditions, most fundamental first.
+    Capabilities caps;
+    CHECK(Decide(caps)==Reason::NotBuilt);
+    caps.built=true;CHECK(Decide(caps)==Reason::NoSession);
+    caps.session=true;CHECK(Decide(caps)==Reason::QueryFailed);
+    caps.queried=true;CHECK(Decide(caps)==Reason::MissingRuntime);
+    caps.availableRead=true;CHECK(Decide(caps)==Reason::Unsupported);
+    caps.available=true;CHECK(Decide(caps)==Reason::Ready);
+    // An old driver is named before anything it would also explain.
+    Capabilities old=caps;old.needsUpdatedDriver=true;old.available=false;CHECK(Decide(old)==Reason::NeedsDriver);
+    caps.createAttempted=true;CHECK(Decide(caps)==Reason::CreateFailed);
+    caps.createSucceeded=true;CHECK(Decide(caps)==Reason::Ready);
+    // Every reason has its own English sentence, and the two with numbers take them.
+    Localizer localizer;
+    std::vector<std::wstring> texts;
+    for(const Reason reason:{Reason::Ready,Reason::NotBuilt,Reason::NoSession,Reason::QueryFailed,Reason::NeedsDriver,
+                             Reason::MissingRuntime,Reason::Unsupported,Reason::CreateFailed}){
+        const std::wstring text=localizer.Get(ReasonKey(reason));
+        CHECK(text!=ReasonKey(reason));
+        CHECK(std::find(texts.begin(),texts.end(),text)==texts.end());
+        texts.push_back(text);
+    }
+    CHECK(localizer.Get(ReasonKey(Reason::NeedsDriver)).find(L"%u.%02u")!=std::wstring::npos);
+    CHECK(localizer.Get(ReasonKey(Reason::CreateFailed)).find(L"%s")!=std::wstring::npos);
+    // The ladder: NGX's own numbers, High by default, anything else read as High.
+    CHECK(static_cast<int>(kDefaultQuality)==3);
+    CHECK(LoadQuality(1)==Quality::Low);CHECK(LoadQuality(4)==Quality::Ultra);
+    CHECK(LoadQuality(0)==kDefaultQuality);CHECK(LoadQuality(5)==kDefaultQuality);CHECK(LoadQuality(-1)==kDefaultQuality);
+    for(size_t index=0;index<kQualities.size();++index)CHECK_EQ(index,QualityIndex(kQualities[index]));
+    CHECK_EQ(size_t(app_menu::IDM_COMPARE_VSR_QUALITY_COUNT),kQualities.size());
+    CHECK(localizer.Get(L"menu.compare_vsr_quality_2").find(L"default")!=std::wstring::npos);
+    // 1x where the window shows the picture no larger than the source...
+    CHECK((OutputSize(1920,1080,1920,1080)==Size{1920,1080}));
+    CHECK((OutputSize(2560,1440,1920,1080)==Size{2560,1440}));
+    CHECK((OutputSize(1920,1080,1280,1080)==Size{1920,1080}));
+    CHECK((OutputSize(1920,1080,0,0)==Size{1920,1080}));
+    // ...and the picture's fitted size where it is larger, the aspect held.
+    CHECK((OutputSize(1920,1080,2560,1440)==Size{2560,1440}));
+    CHECK((OutputSize(1920,1080,3840,2400)==Size{3840,2160}));
+    CHECK((OutputSize(1280,720,2560,1600)==Size{2560,1440}));
+    CHECK((OutputSize(640,360,3840,2160)==Size{3840,2160}));
+    // Never past D3D12's texture limit.
+    const Size huge=OutputSize(1920,1080,40000,22500);
+    CHECK(huge.width<=kMaxDimension&&huge.height<=kMaxDimension&&huge.width==kMaxDimension);
+    CHECK((OutputSize(0,1080,1920,1080)==Size{}));
+    // Which views ask for it: its own, the 2x2, and the modes that compare, when
+    // told to compare against it. The Mix and the mask alone never do.
+    ComparisonSettings comparison;
+    CHECK(!ComparisonReadsVsr(comparison));
+    comparison.againstVsr=true;CHECK(!ComparisonReadsVsr(comparison));
+    comparison.strength=0.5f;comparison.mask=true;CHECK(!ComparisonReadsVsr(comparison));
+    comparison={};
+    for(const ComparisonMode mode:{ComparisonMode::Vsr,ComparisonMode::Quad}){comparison.mode=mode;CHECK(ComparisonReadsVsr(comparison));}
+    for(const ComparisonMode mode:{ComparisonMode::SplitVertical,ComparisonMode::Wipe,ComparisonMode::Difference,ComparisonMode::SideBySide}){
+        comparison.mode=mode;comparison.againstVsr=false;
+        CHECK(!ComparisonReadsVsr(comparison));CHECK(!ComparisonComparesAgainstVsr(comparison));
+        comparison.againstVsr=true;
+        CHECK(ComparisonReadsVsr(comparison));CHECK(ComparisonComparesAgainstVsr(comparison));
+    }
+    comparison.mode=ComparisonMode::Original;CHECK(!ComparisonComparesAgainstVsr(comparison));
+    comparison.mode=ComparisonMode::Quad;CHECK(!ComparisonComparesAgainstVsr(comparison));
+    // RTX VSR reads 8-bit SDR, so a view that runs it takes the SDR original, as
+    // Difference does; and it reads the original, so the reference is uploaded.
+    comparison={};comparison.mode=ComparisonMode::Vsr;
+    CHECK(ComparisonCombinesPixels(comparison));CHECK(ComparisonReadsReference(comparison));
+    comparison.mode=ComparisonMode::SideBySide;CHECK(!ComparisonCombinesPixels(comparison));
+    comparison.againstVsr=true;CHECK(ComparisonCombinesPixels(comparison));
+    // Appended: the persisted numbers of the modes before it are unchanged.
+    CHECK_EQ(7,static_cast<int>(ComparisonMode::Quad));CHECK_EQ(8,static_cast<int>(ComparisonMode::Vsr));
+}
+
+static std::string program_bytes(const char* entry,bool hdrOutput)
+{
+    Microsoft::WRL::ComPtr<ID3DBlob> blob;
+    if(!D3D12RendererTestAccess::CompilePresentProgram(entry,blob,hdrOutput)||!blob)return {};
+    return std::string(static_cast<const char*>(blob->GetBufferPointer()),blob->GetBufferSize());
+}
+
+// HDR output is the backbuffer's business alone. HDR_OUTPUT changes the compositor
+// and the debug views and nothing the cache capture or the model's input runs:
+// those compile to the same bytes with it defined as without, which is the whole
+// of the proof that a render made on an HDR display is the render made on any
+// other. (Their bytes against the pre-HDR build were compared with fxc when the
+// HDR text went in: PSPresent, PSConvert, both NV12 capture passes and the BT.709
+// NV12 source conversion are unchanged.)
+void hdr_output_leaves_the_capture_programs_alone_test()
+{
+    for(const char* entry:{"PSPresent","PSConvert","PSCaptureLuma","PSCaptureChroma"}){
+        const std::string sdr=program_bytes(entry,false);
+        CHECK(!sdr.empty());
+        CHECK(sdr==program_bytes(entry,true));
+    }
+    CHECK((present_program_bindings("PSPresent")==std::vector<std::string>{"Params@0","Ref@1","S@0","T@0"}));
+    // The HDR compositor is a different program from the SDR one, and both compile.
+    const std::string scaled=program_bytes("PSPresentScaled",false),scaledHdr=program_bytes("PSPresentScaled",true);
+    CHECK(!scaled.empty());CHECK(!scaledHdr.empty());CHECK(scaled!=scaledHdr);
+    for(const char* entry:{"PSMotion","PSDepth"}){
+        const std::string sdr=program_bytes(entry,false),hdr=program_bytes(entry,true);
+        CHECK(!sdr.empty());CHECK(!hdr.empty());CHECK(sdr!=hdr);
+    }
+    // The PQ source conversion reads its SDR white from the compositor's constants.
+    const auto convert=present_program_bindings("PSConvertPq");
+    CHECK(std::find(convert.begin(),convert.end(),"Compose@1")!=convert.end());
+    CHECK(std::find(convert.begin(),convert.end(),"T@0")!=convert.end());
+}
+
+// Which output the window is on, what SDR white Windows asks for, and when an HDR
+// original is shown as HDR rather than as the model saw it.
+void hdr_output_follows_the_display_under_the_window_test()
+{
+    using namespace hdr_policy;
+    // Windows' SDR content brightness: thousandths of 80 nits; 0 is unanswered.
+    CHECK_EQ(80.0f,SdrWhiteNits(1000));
+    CHECK_EQ(200.0f,SdrWhiteNits(2500));
+    CHECK_EQ(203.0f,SdrWhiteNits(0));
+    CHECK_EQ(480.0f,SdrWhiteNits(100000));
+    CHECK_EQ(80.0f,SdrWhiteNits(1));
+    const DesktopRect outputs[]={{0,0,1920,1080},{1920,0,4480,1440},{-1280,0,0,1024}};
+    // Mostly on the second display, straddling the first.
+    CHECK_EQ(1,OutputUnderWindow({1500,100,3000,900},outputs,3));
+    CHECK_EQ(0,OutputUnderWindow({100,100,1000,900},outputs,3));
+    CHECK_EQ(2,OutputUnderWindow({-1000,10,100,900},outputs,3));
+    // Minimised windows live at -32000, on no display at all.
+    CHECK_EQ(-1,OutputUnderWindow({-32000,-32000,-31840,-31972},outputs,3));
+    CHECK_EQ(-1,OutputUnderWindow({0,0,100,100},outputs,0));
+    OriginalPresentation state{true,true,false,false,false};
+    CHECK(DecodeOriginalAsPq(state));
+    state.hdrSwapchain=false;CHECK(!DecodeOriginalAsPq(state));state.hdrSwapchain=true;
+    state.sourceHdr=false;CHECK(!DecodeOriginalAsPq(state));state.sourceHdr=true;
+    state.compareAtSdr=true;CHECK(!DecodeOriginalAsPq(state));state.compareAtSdr=false;
+    state.sourceFeedsSdrConsumer=true;CHECK(!DecodeOriginalAsPq(state));state.sourceFeedsSdrConsumer=false;
+    state.viewCombinesPixels=true;CHECK(!DecodeOriginalAsPq(state));
+    // The views that compute with the original's values, and those that only place it.
+    ComparisonSettings comparison;
+    CHECK(!ComparisonCombinesPixels(comparison));
+    for(const ComparisonMode mode:{ComparisonMode::Original,ComparisonMode::SplitVertical,ComparisonMode::Wipe,ComparisonMode::SideBySide}){
+        comparison.mode=mode;CHECK(!ComparisonCombinesPixels(comparison));
+    }
+    for(const ComparisonMode mode:{ComparisonMode::Blend,ComparisonMode::Difference,ComparisonMode::Quad}){
+        comparison.mode=mode;CHECK(ComparisonCombinesPixels(comparison));
+    }
+    comparison.mode=ComparisonMode::SplitVertical;comparison.strength=0.5f;CHECK(ComparisonCombinesPixels(comparison));
+    comparison.strength=1.0f;comparison.mask=true;CHECK(ComparisonCombinesPixels(comparison));
+    // The presentation decode stays HDR end to end, in R10G10B10A2's four bytes.
+    const std::wstring pq=PqPresentationFilter(HdrSignal::Pq,true);
+    CHECK(pq.find(L"t=smpte2084:p=bt2020")!=std::wstring::npos);
+    CHECK(pq.find(L"tonemap")==std::wstring::npos);
+    CHECK(pq.find(L"format=gbrp10le")!=std::wstring::npos);
+    CHECK(PqPresentationFilter(HdrSignal::Hlg,false).find(L"tin=arib-std-b67:min=bt2020nc")!=std::wstring::npos);
+}
+
+// Press, drag and hold on the picture are three gestures that share one button.
+// Issue #14's log: twenty compare presses in eighty seconds, every one refused
+// and nothing on screen to say why. A refusal names the missing piece.
+void compare_refusal_names_what_is_missing_test()
+{
+    using compare_availability::RefusalKey;
+    CHECK(RefusalKey(true, true, true, false) == nullptr);
+    CHECK(std::wstring_view(RefusalKey(false, false, false, false)) == L"compare.refused.no_video");
+    // The same words the compare bar already uses for this state.
+    CHECK(std::wstring_view(RefusalKey(true, false, false, false)) == L"compare.hint.unavailable");
+    CHECK(std::wstring_view(RefusalKey(true, false, true, false)) == L"compare.hint.unavailable");
+    CHECK(std::wstring_view(RefusalKey(true, true, false, false)) == L"compare.refused.no_render");
+    // A render already on its way is waited for, not asked for again.
+    CHECK(std::wstring_view(RefusalKey(true, true, false, true)) == L"compare.refused.render_starting");
+    const Localizer localizer;
+    for (const wchar_t* key : {L"compare.refused.no_video", L"compare.hint.unavailable", L"compare.refused.no_render",
+                               L"compare.refused.render_starting"}) {
+        const std::wstring text = localizer.Get(key);
+        CHECK(!text.empty() && text != key);
+    }
+}
+
+void compare_gesture_tells_press_drag_and_hold_apart_test()
+{
+    using namespace compare_gesture;
+    State state;
+    // A click in split or wipe puts the divider under the pointer at once, as always.
+    Step step=Press(state,POINT{100,100},true,false);
+    CHECK(step.setDivider);CHECK(!step.startPeek);
+    // Small moves still drag the divider, but it is not yet a drag...
+    step=Move(state,POINT{102,101},4);
+    CHECK(step.setDivider);CHECK(state.phase==Phase::Pressed);
+    // ...so holding still after them is a peek.
+    step=HoldElapsed(state);
+    CHECK(step.startPeek);CHECK(state.phase==Phase::Peeking);
+    // Wobble inside the slop keeps the peek; moving past it turns it into the drag.
+    CHECK(!Move(state,POINT{104,103},4).endPeek);
+    step=Move(state,POINT{120,100},4);
+    CHECK(step.endPeek);CHECK(step.setDivider);CHECK(state.phase==Phase::Dragging);
+    step=Release(state);
+    CHECK(!step.endPeek);CHECK(state.phase==Phase::Idle);
+    // A drag that pauses is still a drag: the hold timer firing late does nothing.
+    Press(state,POINT{0,0},true,false);
+    Move(state,POINT{30,0},4);
+    CHECK(!HoldElapsed(state).startPeek);
+    Release(state);
+    // Outside the divider modes a press sets nothing, and a hold is a peek that the
+    // release ends.
+    step=Press(state,POINT{50,50},false,false);
+    CHECK(!step.setDivider);
+    CHECK(HoldElapsed(state).startPeek);
+    CHECK(Release(state).endPeek);
+    // With a pan available a drag outside the divider modes pans.
+    Press(state,POINT{50,50},false,true);
+    step=Move(state,POINT{80,50},4);
+    CHECK(step.pan);CHECK(!step.setDivider);
+    // In a divider mode the drag is the divider's, never a pan.
+    Press(state,POINT{50,50},true,true);
+    step=Move(state,POINT{80,50},4);
+    CHECK(!step.pan);CHECK(step.setDivider);
+    Release(state);
+    // Nothing happens to an idle state.
+    CHECK(!Move(state,POINT{1,1},4).setDivider);CHECK(!HoldElapsed(state).startPeek);CHECK(!Release(state).endPeek);
+}
+
+// The strength dial and Blend were two controls for one lerp; a file written by
+// either becomes the one Mix without the picture changing.
+void compare_settings_migrate_strength_and_blend_to_the_mix_test()
+{
+    using namespace compare_settings;
+    const std::array<int,4> known{kNeural,kOriginal,kSplit,kWipe};
+    // Written by this build: the Mix wins, clamped, and the mode survives.
+    auto loaded=Migrate(1.4f,kWipe,0.3f,0.2f,known);
+    CHECK_EQ(1.4f,loaded.mix);CHECK_EQ(kWipe,loaded.mode);
+    CHECK_EQ(2.0f,Migrate(9.0f,kNeural,0.5f,1.0f,known).mix);
+    // An older file: the neural view keeps its strength.
+    loaded=Migrate(std::nullopt,kSplit,0.5f,0.4f,known);
+    CHECK_EQ(0.4f,loaded.mix);CHECK_EQ(kSplit,loaded.mode);
+    // Blend at 0.3 over a strength of 1 is the neural view at a Mix of 0.3...
+    loaded=Migrate(std::nullopt,kBlend,0.3f,1.0f,known);
+    CHECK(std::abs(loaded.mix-0.3f)<1e-6f);CHECK_EQ(kNeural,loaded.mode);
+    // ...and over a lower strength it is their product, which is the same lerp of lerps.
+    CHECK(std::abs(Migrate(std::nullopt,kBlend,0.5f,0.6f,known).mix-0.3f)<1e-6f);
+    // Above 1 the extension cannot be blended by one dial; the amount is kept.
+    CHECK(std::abs(Migrate(std::nullopt,kBlend,0.5f,1.6f,known).mix-0.5f)<1e-6f);
+    // Original is a view, not a mode to reopen in; an unknown number reads as Neural.
+    CHECK_EQ(kNeural,Migrate(1.0f,kOriginal,0.5f,1.0f,known).mode);
+    CHECK_EQ(kNeural,Migrate(1.0f,77,0.5f,1.0f,known).mode);
+    CHECK_EQ(kNeural,Migrate(1.0f,kBlend,0.5f,1.0f,known).mode);
+    // Garbage in either old key reads as its default.
+    CHECK_EQ(1.0f,Migrate(std::nullopt,kNeural,0.5f,std::numeric_limits<float>::quiet_NaN(),known).mix);
+    // [ and ] step by a tenth on the 0.05 grid and stop at both ends.
+    CHECK(std::abs(StepMix(1.0f,0.1f)-1.1f)<1e-6f);
+    CHECK_EQ(0.0f,StepMix(0.05f,-0.1f));
+    CHECK_EQ(2.0f,StepMix(1.95f,0.1f));
+    CHECK(std::abs(StepMix(0.33f,0.1f)-0.45f)<1e-6f);
+    // The Difference view's gain walks a doubling ladder from 1x to 32x, starting at 4x.
+    CHECK_EQ(8.0f,StepDifferenceGain(4.0f,+1));
+    CHECK_EQ(2.0f,StepDifferenceGain(4.0f,-1));
+    CHECK_EQ(32.0f,StepDifferenceGain(32.0f,+1));
+    CHECK_EQ(1.0f,StepDifferenceGain(1.0f,-1));
+    CHECK_EQ(4.0f,LoadDifferenceGain(5.0f));
+    CHECK_EQ(kDefaultDifferenceGain,LoadDifferenceGain(-1.0f));
+    CHECK_EQ(kDefaultDifferenceGain,LoadDifferenceGain(std::numeric_limits<float>::infinity()));
+    CHECK_EQ(32.0f,LoadDifferenceGain(1000.0f));
+    // Difference is a mode a file can come back to.
+    const std::array<int,5> withDifference{kNeural,kOriginal,kSplit,kWipe,kDifference};
+    CHECK_EQ(kDifference,Migrate(1.0f,kDifference,0.5f,1.0f,withDifference).mode);
+}
+
+// GDI draws the tags opaque; the compositor needs them premultiplied over a plate
+// that is only partly opaque, and the two must agree over any background.
+void compare_label_premultiply_matches_the_gdi_composite_test()
+{
+    using compare_labels::Bgra;
+    const Bgra plate{6,5,5,255},text{232,235,236,255};
+    constexpr float plateAlpha=0.78f;
+    // Plate only: the plate's colour at its own alpha.
+    Bgra texel=compare_labels::Premultiply(plate,plate,text,plateAlpha);
+    CHECK_EQ(int(std::lround(0.78*255.0)),int(texel.a));
+    CHECK(texel.g<=5);
+    // Solid text: opaque text.
+    texel=compare_labels::Premultiply(text,plate,text,plateAlpha);
+    CHECK_EQ(255,int(texel.a));CHECK_EQ(235,int(texel.g));
+    // An antialiased edge composited over black and over white lands where GDI would
+    // have put the same edge drawn over the plate composited over that background.
+    const float t=0.5f;
+    const Bgra edge{uint8_t(std::lround(t*232+(1-t)*6)),uint8_t(std::lround(t*235+(1-t)*5)),uint8_t(std::lround(t*236+(1-t)*5)),255};
+    texel=compare_labels::Premultiply(edge,plate,text,plateAlpha);
+    for(const float background:{0.0f,255.0f}){
+        const float composed=float(texel.g)+background*(1.0f-float(texel.a)/255.0f);
+        const float expected=t*235.0f+(1.0f-t)*(plateAlpha*5.0f+(1.0f-plateAlpha)*background);
+        CHECK(std::abs(composed-expected)<2.0f);
+    }
+}
+
+// The compare bar's layout, hit testing and the Mix track's mapping.
+void compare_bar_lays_out_and_hit_tests_test()
+{
+    using namespace compare_bar;
+    const auto layout=LayoutBar(1440,700,96,EstimatedMetrics(4,96),false);
+    CHECK_EQ(700L,layout.bar.top);CHECK_EQ(700L+kBarHeightDip,layout.bar.bottom);
+    CHECK(!layout.compact);CHECK(layout.tier==Tier::Full);CHECK(layout.fits);
+    size_t modes=0;
+    for(const Item& item:layout.items)if(item.part==Part::Mode)++modes;
+    CHECK_EQ(size_t{4},modes);
+    // Every item lies inside the bar, left to right, without overlapping.
+    LONG previous=0;
+    for(const Item& item:layout.items){
+        CHECK(item.bounds.left>=previous);CHECK(item.bounds.right<=1440);
+        CHECK(item.bounds.top>=layout.bar.top);CHECK(item.bounds.bottom<=layout.bar.bottom);
+        previous=item.bounds.right;
+    }
+    CHECK(layout.hint.right>layout.hint.left);
+    // A point hits the item under it; the Mix track answers across the whole bar height.
+    const Item& second=layout.items[1];
+    const Item* hit=HitTest(layout,POINT{(second.bounds.left+second.bounds.right)/2,(second.bounds.top+second.bounds.bottom)/2});
+    CHECK(hit!=nullptr);if(hit){CHECK(hit->part==Part::Mode);CHECK_EQ(1,hit->index);}
+    hit=HitTest(layout,POINT{(layout.mixTrack.left+layout.mixTrack.right)/2,layout.bar.top+1});
+    CHECK(hit!=nullptr&&hit->part==Part::MixTrack);
+    CHECK(HitTest(layout,POINT{2,layout.bar.top+10})==nullptr);
+    // The track spans 0..200% with 100% at the centre, and snaps to it nearby.
+    const RECT track{100,0,300,10};
+    CHECK_EQ(0.0f,MixFromX(track,90));CHECK_EQ(2.0f,MixFromX(track,400));
+    CHECK_EQ(1.0f,MixFromX(track,202));
+    CHECK(std::abs(MixFromX(track,150)-0.5f)<1e-6f);
+    CHECK_EQ(200L,LONG(XFromMix(track,1.0f)));CHECK_EQ(100L,LONG(XFromMix(track,-1.0f)));
+    // A narrow window gets the compact widths, and a narrower one drops the hint.
+    const auto narrow=LayoutBar(700,0,96,EstimatedMetrics(4,96),true);
+    CHECK(narrow.compact);CHECK(narrow.hint.right<=narrow.hint.left);CHECK(narrow.fits);
+    // Scaled with the DPI.
+    const auto large=LayoutBar(2880,0,192,EstimatedMetrics(4,192),false);
+    CHECK_EQ(LONG(2*kBarHeightDip),large.bar.bottom-large.bar.top);
+}
+
+// The bar with the seven modes the player offers, its labels measured in the font it
+// paints with, at every width from the player's minimum up and at five DPIs. The
+// first version clipped "Difference" and "Side by side" and pushed Swap off the right
+// edge at the default window (1440 px at 175%); nothing may be clipped or dropped at
+// any width the window can have.
+void compare_bar_fits_every_width_and_dpi_test()
+{
+    using namespace compare_bar;
+    const std::array<const wchar_t*,8> full{L"DLSS 5",L"Original",L"RTX VSR",L"Split",L"Wipe",L"Difference",L"Side by side",L"2 \u00d7 2"};
+    const std::array<const wchar_t*,8> brief{L"DLSS 5",L"Orig.",L"VSR",L"Split",L"Wipe",L"Diff.",L"Side",L"2 \u00d7 2"};
+    HDC dc=CreateCompatibleDC(nullptr);
+    CHECK(dc!=nullptr);if(!dc)return;
+    for(const UINT dpi:{96u,120u,144u,168u,192u}){
+        HFONT font=CreateFontW(-Scale(14,dpi),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
+                               CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI");
+        const HGDIOBJ old=SelectObject(dc,font);
+        const auto measure=[&](const wchar_t* text){SIZE size{};GetTextExtentPoint32W(dc,text,int(wcslen(text)),&size);return int(size.cx);};
+        Metrics metrics;
+        for(size_t index=0;index<full.size();++index){metrics.modeLabels.push_back(measure(full[index]));metrics.modeShortLabels.push_back(measure(brief[index]));}
+        metrics.swapLabel=measure(L"Swap");metrics.loupeLabel=measure(L"Loupe");metrics.mixLabel=measure(L"Mix");
+        metrics.icon=Scale(17,dpi);   // a Tabler glyph is one em of the 17 dip icon font
+        SelectObject(dc,old);DeleteObject(font);
+        const int gutter=Scale(kGutterDip,dpi),inset=Scale(kLabelInsetDip,dpi);
+        const int minimum=MinimumToolbarClientWidth(dpi);
+        Tier widest=Tier::Tight;
+        for(int width=minimum;width<=Scale(1600,dpi);width+=std::max(1,Scale(3,dpi))){
+            const Layout bar=LayoutBar(width,0,dpi,metrics,true);
+            CHECK(bar.fits);
+            // Wider never steps down.
+            CHECK(int(bar.tier)<=int(widest));widest=bar.tier;
+            LONG previous=gutter;
+            bool swap=false,loupe=false,zoom=false,menu=false;size_t modes=0;
+            for(const Item& item:bar.items){
+                CHECK(item.bounds.left>=previous);CHECK(item.bounds.right<=width-gutter);
+                previous=item.bounds.right;
+                const auto shown=[&](int text){return item.bounds.right-item.bounds.left>=text+2*inset;};
+                switch(item.part){
+                case Part::Mode:
+                    ++modes;
+                    CHECK(shown(item.face==Face::ShortLabel?metrics.modeShortLabels[size_t(item.index)]:metrics.modeLabels[size_t(item.index)]));
+                    break;
+                case Part::ModeMenu:{
+                    menu=true;
+                    int longest=0;for(size_t index=0;index<full.size();++index)longest=std::max(longest,item.face==Face::ShortLabel?metrics.modeShortLabels[index]:metrics.modeLabels[index]);
+                    CHECK(shown(longest+Scale(kChevronDip,dpi)));
+                    break;}
+                case Part::Swap:swap=true;CHECK(item.face==Face::Icon||shown(metrics.swapLabel));break;
+                case Part::Loupe:loupe=true;CHECK(item.face==Face::Icon||shown(metrics.loupeLabel));break;
+                case Part::ZoomIn:zoom=true;break;
+                default:break;
+                }
+            }
+            // Every control is there at every width: eight segments or the menu.
+            CHECK(swap&&loupe&&zoom);CHECK(menu?modes==0:modes==full.size());
+            CHECK(bar.mixValue.right>bar.mixValue.left&&bar.zoomValue.right>bar.zoomValue.left);
+            CHECK((bar.tier==Tier::Tight)==(bar.mixLabel.right<=bar.mixLabel.left));
+        }
+        // The widest window gets the full labels at every DPI here.
+        CHECK(LayoutBar(Scale(1600,dpi),0,dpi,metrics,true).tier==Tier::Full);
+    }
+    DeleteDC(dc);
+    // The default window on the machine the bug was seen on: short labels, all of them.
+    const Metrics estimate=EstimatedMetrics(8,168);
+    const Layout seen=LayoutBar(1440,0,168,estimate,true);
+    CHECK(seen.fits);CHECK(seen.tier!=Tier::Full);
+    // Below the short labels the modes fold into one button, which answers a click like
+    // any other part. The player's own minimum is wider than this today; the menu is for
+    // translations with longer names, and for the tight tier's sake nothing is dropped.
+    const Layout folded=LayoutBar(700,0,96,EstimatedMetrics(8,96),true);
+    CHECK(folded.tier==Tier::Menu);CHECK(folded.fits);
+    const Layout tight=LayoutBar(520,0,96,EstimatedMetrics(8,96),true);
+    CHECK(tight.tier==Tier::Tight);CHECK(tight.fits);
+    const Item& button=folded.items.front();
+    CHECK(button.part==Part::ModeMenu);
+    const Item* hit=HitTest(folded,POINT{(button.bounds.left+button.bounds.right)/2,(button.bounds.top+button.bounds.bottom)/2});
+    CHECK(hit!=nullptr&&hit->part==Part::ModeMenu);
+    // Without the icon font the toggles keep their words, even when tight.
+    Metrics wordy=EstimatedMetrics(8,96);wordy.icon=0;
+    const Layout plain=LayoutBar(MinimumToolbarClientWidth(96),0,96,wordy,true);
+    for(const Item& item:plain.items)if(item.part==Part::Swap||item.part==Part::Loupe)CHECK(item.face==Face::Label);
+}
+
+// The zoom ladder is in screen pixels per output pixel, so the same step is a
+// different scale in a different window, and steps that would not magnify are skipped.
+void compare_zoom_ladder_zooms_at_the_pointer_and_pans_test()
+{
+    using namespace compare_zoom;
+    // A 4K render in a 1440-wide view: 1:1 is 2.67x the fitted picture.
+    CHECK_EQ(1.0f,ScaleForStep(0,3840,1440));
+    CHECK(std::abs(ScaleForStep(1,3840,1440)-3840.0f/1440.0f)<1e-4f);
+    CHECK(std::abs(ScaleForStep(4,3840,1440)-8.0f*3840.0f/1440.0f)<1e-3f);
+    CHECK_EQ(1,Step(0,+1,3840,1440,false));
+    // A 1080p render in a 1440p-wide view: 1:1 would shrink it, so Z goes straight to
+    // 2x; in a 4K-wide view 2x is exactly Fit and is skipped as well.
+    CHECK(!Reachable(1,1920,2560));
+    CHECK_EQ(2,Step(0,+1,1920,2560,false));
+    CHECK_EQ(0,Step(2,-1,1920,2560,false));
+    CHECK_EQ(3,Step(0,+1,1920,3840,false));
+    // Past 8x: Z wraps back to Fit, the wheel and the bar stop.
+    CHECK_EQ(0,Step(4,+1,3840,1440,true));
+    CHECK_EQ(4,Step(4,+1,3840,1440,false));
+    CHECK_EQ(0,Step(0,-1,3840,1440,false));
+    // No renderer yet: multiples of Fit, so the ladder still does something.
+    CHECK_EQ(2.0f,ScaleForStep(2,0,1440));
+    CHECK_EQ(2,Step(0,+1,0,0,false));
+    // Zooming keeps the image point under the anchor where it was...
+    const Centre fit{};
+    for(const float anchor:{0.1f,0.37f,0.5f,0.8f}){
+        const Centre zoomed=ZoomAt(fit,1.0f,2.0f,anchor,anchor);
+        CHECK(std::abs(ImageAt(zoomed.x,2.0f,anchor)-ImageAt(fit.x,1.0f,anchor))<1e-5f);
+        const Centre deeper=ZoomAt(zoomed,2.0f,8.0f,anchor*0.5f,anchor);
+        CHECK(std::abs(ImageAt(deeper.x,8.0f,anchor*0.5f)-ImageAt(zoomed.x,2.0f,anchor*0.5f))<1e-5f);
+    }
+    // ...back to the centre at Fit, and never off the picture.
+    const Centre back=ZoomAt(Centre{0.9f,0.1f},4.0f,1.0f,0.2f,0.2f);
+    CHECK_EQ(0.5f,back.x);CHECK_EQ(0.5f,back.y);
+    const Centre edge=ZoomAt(Centre{1.0f,1.0f},4.0f,8.0f,0.0f,0.0f);
+    CHECK(edge.x>=0.0f&&edge.x<=1.0f&&edge.y>=0.0f&&edge.y<=1.0f);
+    // A pan moves the picture with the pointer: what was under it stays under it.
+    const Centre start{0.5f,0.5f};
+    const Centre panned=Pan(start,4.0f,0.05f,-0.02f);
+    CHECK(std::abs(ImageAt(panned.x,4.0f,0.45f)-ImageAt(start.x,4.0f,0.40f))<1e-5f);
+    CHECK(std::abs(ImageAt(panned.y,4.0f,0.28f)-ImageAt(start.y,4.0f,0.30f))<1e-5f);
+    // It stops at the picture's edge, and does nothing at Fit.
+    const Centre wall=Pan(start,2.0f,-5.0f,5.0f);
+    CHECK_EQ(1.0f,wall.x);CHECK_EQ(0.0f,wall.y);
+    CHECK_EQ(0.5f,Pan(start,1.0f,0.3f,0.3f).x);
+}
+
+void compare_loupe_and_one_to_one_placement_test()
+{
+    // Two circles side by side above the pointer, inside the view.
+    auto placement=compare_loupe::Place(POINT{500,400},1000,600,80,8);
+    CHECK_EQ(placement.left.y,placement.right.y);
+    CHECK(placement.left.y<400);
+    CHECK_EQ(LONG(80*2+8),placement.right.x-placement.left.x);
+    CHECK(placement.left.x-80>=0&&placement.right.x+80<=1000);
+    // Near the top they drop below the pointer; near an edge they slide inward.
+    placement=compare_loupe::Place(POINT{990,30},1000,600,80,8);
+    CHECK(placement.left.y>30);
+    CHECK_EQ(LONG(1000-80),placement.right.x);
+    placement=compare_loupe::Place(POINT{5,590},1000,600,80,8);
+    CHECK_EQ(LONG(80),placement.left.x);CHECK(placement.left.y+80<=600);
+    // At least 4 screen pixels per texel, and always twice the view's own zoom.
+    CHECK_EQ(4.0f,compare_loupe::Magnification(0.4f));
+    CHECK_EQ(16.0f,compare_loupe::Magnification(8.0f));
+    CHECK_EQ(32.0f,compare_loupe::Magnification(50.0f));
+
+    // View > 1:1 pixels makes the render window the output's size, centred and
+    // cropped by the area; Fit and Fill keep what they always did.
+    using compare_view::Fit;
+    RECT r=compare_view::RenderRect(1600,900,16.0/9.0,Fit::Pixels,3840,2160);
+    CHECK_EQ(3840L,r.right-r.left);CHECK_EQ(2160L,r.bottom-r.top);CHECK_EQ(LONG((1600-3840)/2),r.left);
+    r=compare_view::RenderRect(1600,900,16.0/9.0,Fit::Pixels,1280,720);
+    CHECK_EQ(160L,r.left);CHECK_EQ(90L,r.top);CHECK_EQ(1280L,r.right-r.left);
+    r=compare_view::RenderRect(1600,1000,16.0/9.0,Fit::Fit,1280,720);
+    CHECK_EQ(1600L,r.right-r.left);CHECK_EQ(900L,r.bottom-r.top);CHECK_EQ(50L,r.top);
+    r=compare_view::RenderRect(1600,1000,16.0/9.0,Fit::Fill,1280,720);
+    CHECK_EQ(1000L,r.bottom-r.top);CHECK_EQ(1778L,r.right-r.left);
+    // No output yet: 1:1 is Fit.
+    const RECT fitted=compare_view::RenderRect(1600,1000,16.0/9.0,Fit::Fit,0,0);
+    r=compare_view::RenderRect(1600,1000,16.0/9.0,Fit::Pixels,0,0);
+    CHECK(EqualRect(&r,&fitted)!=FALSE);
+    // The tags go in the corners of the part of the render window the area shows. Fit
+    // shows all of it; Fill and a 1:1 view larger than the area are cropped by it. These
+    // are the screenshots' geometry: a 1900x815 area, a 16:9 picture.
+    RECT v=compare_view::VisibleRect(compare_view::RenderRect(1900,815,16.0/9.0,Fit::Fit,960,540),1900,815);
+    CHECK_EQ(0L,v.left);CHECK_EQ(0L,v.top);CHECK_EQ(1449L,v.right);CHECK_EQ(815L,v.bottom);
+    const RECT filled=compare_view::RenderRect(1900,815,16.0/9.0,Fit::Fill,960,540);
+    CHECK_EQ(1900L,filled.right-filled.left);CHECK_EQ(1069L,filled.bottom-filled.top);CHECK_EQ(-127L,filled.top);
+    v=compare_view::VisibleRect(filled,1900,815);
+    CHECK_EQ(0L,v.left);CHECK_EQ(127L,v.top);CHECK_EQ(1900L,v.right);CHECK_EQ(942L,v.bottom);
+    // 1:1 of a 4K output in a 1600x900 area: cropped on all four sides, centred.
+    v=compare_view::VisibleRect(compare_view::RenderRect(1600,900,16.0/9.0,Fit::Pixels,3840,2160),1600,900);
+    CHECK_EQ(1120L,v.left);CHECK_EQ(630L,v.top);CHECK_EQ(2720L,v.right);CHECK_EQ(1530L,v.bottom);
+    // 1:1 of a smaller output sits inside the area and shows all of itself.
+    v=compare_view::VisibleRect(compare_view::RenderRect(1600,900,16.0/9.0,Fit::Pixels,1280,720),1600,900);
+    CHECK_EQ(0L,v.left);CHECK_EQ(0L,v.top);CHECK_EQ(1280L,v.right);CHECK_EQ(720L,v.bottom);
+    // A window entirely outside the area shows nothing, as an empty rectangle.
+    v=compare_view::VisibleRect(RECT{2000,0,2400,300},1900,815);
+    CHECK(v.right<=v.left);
+    // The compositor clamps the rectangle to the backbuffer it draws, and takes the whole
+    // backbuffer for an empty one (never set, or a resize the swap chain has not reached).
+    RECT t=compare_view::VisibleInTarget(RECT{},1449,815);
+    CHECK_EQ(0L,t.left);CHECK_EQ(0L,t.top);CHECK_EQ(1449L,t.right);CHECK_EQ(815L,t.bottom);
+    t=compare_view::VisibleInTarget(RECT{0,127,1900,942},1900,1069);
+    CHECK_EQ(127L,t.top);CHECK_EQ(942L,t.bottom);CHECK_EQ(1900L,t.right);
+    t=compare_view::VisibleInTarget(RECT{0,127,1900,942},1449,815);
+    CHECK_EQ(127L,t.top);CHECK_EQ(815L,t.bottom);CHECK_EQ(1449L,t.right);
+    t=compare_view::VisibleInTarget(RECT{0,900,1900,1000},1449,815);
+    CHECK_EQ(0L,t.top);CHECK_EQ(815L,t.bottom);
+    // Every comparison starts with none: the whole backbuffer.
+    CHECK(ComparisonSettings{}.visible.right==0&&ComparisonSettings{}.visible.bottom==0);
+    // The loupe needs the original, so the neural view uploads one while it is up.
+    ComparisonSettings comparison;
+    CHECK(!ComparisonReadsReference(comparison));
+    comparison.loupe=true;
+    CHECK(ComparisonReadsReference(comparison));CHECK(ComparisonNeedsCompositor(comparison));
+}
+
+// A 24-bit bottom-up BMP of `width` x `height` whose left half is black and right
+// half white: the smallest file WIC decodes without an encoder of our own.
+static void write_half_white_bmp(const std::filesystem::path& path, uint32_t width, uint32_t height)
+{
+    const uint32_t stride = (width * 3 + 3) & ~3u;
+    std::vector<uint8_t> file(54 + size_t(stride) * height, 0);
+    const auto put32 = [&](size_t at, uint32_t value) { for (int shift = 0; shift < 32; shift += 8) file[at + size_t(shift / 8)] = uint8_t(value >> shift); };
+    file[0] = 'B'; file[1] = 'M'; put32(2, uint32_t(file.size())); put32(10, 54);
+    put32(14, 40); put32(18, width); put32(22, height); file[26] = 1; file[28] = 24; put32(34, uint32_t(stride) * height);
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+            for (int channel = 0; channel < 3; ++channel)
+                file[54 + size_t(y) * stride + size_t(x) * 3 + size_t(channel)] = x >= width / 2 ? 255 : 0;
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(file.data()), std::streamsize(file.size()));
+}
+
+// The spatial mask: what happens to the image before it reaches the GPU, and how the
+// player remembers which mask belongs to which source.
+void compare_mask_shrinks_feathers_and_is_remembered_per_source_test()
+{
+    using namespace compare_mask;
+    // Kept at most kMaxSide on a side, box-averaged by a whole factor.
+    Gray wide;wide.width=5000;wide.height=4;wide.pixels.assign(size_t(5000)*4,0);
+    for(uint32_t y=0;y<4;++y)for(uint32_t x=0;x<5000;++x)wide.pixels[size_t(y)*5000+x]=x%2?200:100;
+    const Gray kept=Shrink(wide);
+    CHECK_EQ(2500u,kept.width);CHECK_EQ(2u,kept.height);CHECK_EQ(150,int(kept.pixels[0]));
+    CHECK_EQ(3u,Shrink(Gray{3,1,{1,2,3}}).width);
+    CHECK(Shrink(Gray{3,1,{1}}).pixels.empty());
+    // The feather softens a hard edge over about its radius, symmetrically, and
+    // leaves flat regions exactly as they were.
+    Gray edge;edge.width=64;edge.height=8;edge.pixels.resize(size_t(64)*8);
+    for(uint32_t y=0;y<8;++y)for(uint32_t x=0;x<64;++x)edge.pixels[size_t(y)*64+x]=x<32?0:255;
+    Gray soft=edge;Feather(soft,0);CHECK(soft.pixels==edge.pixels);
+    Feather(soft,12);
+    const auto at=[&](uint32_t x){return int(soft.pixels[size_t(4)*64+x]);};
+    CHECK_EQ(0,at(2));CHECK_EQ(255,at(61));
+    CHECK(at(31)>40&&at(31)<215);
+    CHECK(std::abs(at(31)+at(32)-255)<=2);
+    for(uint32_t x=1;x<64;++x)CHECK(at(x)>=at(x-1));
+    CHECK(at(26)>0&&at(37)<255);  // it reaches out several pixels either side
+    // The radius is chosen in frame pixels and applied in mask pixels.
+    CHECK_EQ(4,MaskRadius(8,960,1920));CHECK_EQ(16,MaskRadius(8,3840,1920));
+    CHECK_EQ(0,MaskRadius(0,960,1920));CHECK_EQ(8,MaskRadius(8,960,0));
+    // A remembered record round-trips; a malformed one is refused; a hand-edited
+    // feather is snapped onto the offered choices.
+    const Record record{41,16,true,L"C:\\masks\\face|left.png"};
+    const auto parsed=Parse(Format(record));
+    CHECK(parsed.has_value());if(parsed)CHECK(*parsed==record);
+    CHECK(!Parse(L"").has_value());CHECK(!Parse(L"1|8|2|x.png").has_value());CHECK(!Parse(L"a|8|0|x.png").has_value());
+    CHECK(!Parse(L"1|8|0|").has_value());CHECK(!Parse(L"1|8|0").has_value());
+    const auto snapped=Parse(L"3|20|0|m.png");
+    CHECK(snapped.has_value());if(snapped)CHECK_EQ(16,snapped->feather);
+    const auto huge=Parse(L"3|99999|0|m.png");
+    CHECK(huge.has_value());if(huge)CHECK_EQ(64,huge->feather);
+    // At most kMaxRemembered survive, the newest.
+    std::map<std::wstring,Record> records;
+    for(uint64_t index=0;index<kMaxRemembered+3;++index)records[L"k"+std::to_wstring(index)]=Record{index+1,8,false,L"m.png"};
+    const auto evicted=Evict(records);
+    CHECK_EQ(size_t{3},evicted.size());
+    CHECK(std::find(evicted.begin(),evicted.end(),L"k0")!=evicted.end());
+    CHECK(std::find(evicted.begin(),evicted.end(),L"k34")==evicted.end());
+    CHECK(Evict(std::map<std::wstring,Record>{}).empty());
+    // A source's key ignores case, as Windows paths do, and is 16 hex digits.
+    CHECK(SourceKey(L"file:C:\\Videos\\A.mp4")==SourceKey(L"file:c:\\videos\\a.MP4"));
+    CHECK(SourceKey(L"file:C:\\Videos\\A.mp4")!=SourceKey(L"file:C:\\Videos\\B.mp4"));
+    CHECK_EQ(size_t{16},SourceKey(L"x").size());
+    // A mask is read through WIC as grey; its brightness is the mask.
+    const HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+    const auto bmp=process_temp_path(L"compare-mask-test.bmp");
+    write_half_white_bmp(bmp,8,4);
+    Gray loaded;
+    CHECK(SUCCEEDED(compare_image::LoadGray(bmp,loaded)));
+    CHECK_EQ(8u,loaded.width);CHECK_EQ(4u,loaded.height);
+    if(loaded.pixels.size()==32){CHECK_EQ(0,int(loaded.pixels[0]));CHECK_EQ(255,int(loaded.pixels[7]));CHECK_EQ(255,int(loaded.pixels[31]));}
+    Gray missing;
+    CHECK(FAILED(compare_image::LoadGray(bmp.parent_path()/L"no-such-mask.png",missing)));
+    CHECK(missing.pixels.empty());
+    std::error_code ignored;std::filesystem::remove(bmp,ignored);
+    if(SUCCEEDED(com))CoUninitialize();
+    // The mask blends back to the original, so it needs the reference and the compositor.
+    ComparisonSettings comparison;comparison.mask=true;
+    CHECK(ComparisonReadsReference(comparison));CHECK(ComparisonNeedsCompositor(comparison));
+}
+
+// A saved comparison carries its provenance in a footer, and is written as a PNG
+// through WIC without ever leaving half a file under the chosen name.
+void compare_saved_image_carries_its_provenance_test()
+{
+    compare_provenance::Facts facts;
+    facts.application=L"DLSS 5 Video Player 9.9.9";facts.source=L"Trailer";facts.timecode=L"00:01:02:03";facts.frame=1863;
+    facts.view=L"Split 50%";facts.settings=L"sha256:0123456789abcdef";facts.runtime=L"6.5.3";facts.saved=L"2026-09-23 12:00:00";
+    const auto lines=compare_provenance::FooterLines(facts);
+    CHECK_EQ(size_t{3},lines.size());
+    if(lines.size()==3){
+        CHECK(lines[0].find(L"9.9.9")!=std::wstring::npos&&lines[0].find(L"Trailer")!=std::wstring::npos);
+        CHECK(lines[1].find(L"00:01:02:03")!=std::wstring::npos&&lines[1].find(L"frame 1863")!=std::wstring::npos&&lines[1].find(L"Split 50%")!=std::wstring::npos);
+        CHECK(lines[2].find(L"sha256:0123456789abcdef")!=std::wstring::npos&&lines[2].find(L"Runtime 6.5.3")!=std::wstring::npos&&lines[2].find(L"2026-09-23")!=std::wstring::npos);
+    }
+    CHECK(compare_provenance::SuggestedName(L"A: \"b\"/c?",L"00:01:02:03")==L"A- -b--c- 00-01-02-03 comparison.png");
+    CHECK(compare_provenance::SuggestedName(L"",L"x")==L"comparison x comparison.png");
+    CHECK(compare_provenance::SuggestedName(std::wstring(300,L'a'),L"t").size()==124);
+
+    const HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+    const auto png=process_temp_path(L"compare-save-test.png");
+    std::error_code ignored;std::filesystem::remove(png,ignored);
+    // 5x2 BGR, rows padded to 16 bytes: the left pixel black, the right one white.
+    constexpr UINT width=5,height=2,stride=16;
+    std::vector<uint8_t> bgr(size_t(stride)*height,0);
+    for(UINT y=0;y<height;++y)for(int channel=0;channel<3;++channel)bgr[size_t(y)*stride+4*3+size_t(channel)]=255;
+    CHECK(SUCCEEDED(compare_image::SavePngBgr(png,bgr.data(),width,height,stride)));
+    CHECK(std::filesystem::exists(png));
+    // Published through atomic_file: nothing but the PNG is left beside it.
+    size_t beside=0;
+    for(const auto& entry:std::filesystem::directory_iterator(png.parent_path()))
+        if(entry.path().filename().wstring().rfind(png.filename().wstring(),0)==0)++beside;
+    CHECK_EQ(size_t{1},beside);
+    compare_mask::Gray back;
+    CHECK(SUCCEEDED(compare_image::LoadGray(png,back)));
+    CHECK_EQ(width,back.width);CHECK_EQ(height,back.height);
+    if(back.pixels.size()==10){CHECK_EQ(0,int(back.pixels[0]));CHECK_EQ(255,int(back.pixels[4]));CHECK_EQ(255,int(back.pixels[9]));}
+    // Refused before anything is written; a directory that is not there leaves nothing.
+    CHECK(FAILED(compare_image::SavePngBgr(png,bgr.data(),width,height,width*3u-1u)));
+    const auto nowhere=png.parent_path()/L"no-such-directory"/L"x.png";
+    CHECK(FAILED(compare_image::SavePngBgr(nowhere,bgr.data(),width,height,stride)));
+    CHECK(!std::filesystem::exists(nowhere.parent_path()));
+    std::filesystem::remove(png,ignored);
+    if(SUCCEEDED(com))CoUninitialize();
+    CHECK(app_menu::CommandForPlayerKey('S',true,true)==app_menu::IDM_SAVE_COMPARISON_IMAGE);
+}
+
+// Side by side and 2x2 put one frame of the pair in every pane; zoom, pan and the loupe
+// work in the pane under the pointer.
+void compare_panes_locate_the_point_under_the_pointer_test()
+{
+    using compare_view::Layout;
+    auto at=compare_view::Locate(Layout::SideBySide,0.25f,0.5f);
+    CHECK_EQ(0,at.pane);CHECK(at.inside);CHECK(std::abs(at.x-0.5f)<1e-6f);CHECK(std::abs(at.y-0.5f)<1e-6f);
+    at=compare_view::Locate(Layout::SideBySide,0.75f,0.3f);
+    CHECK_EQ(1,at.pane);CHECK(at.inside);CHECK(std::abs(at.y-0.1f)<1e-6f);
+    // Side by side's pictures are letterboxed: the bars are in no picture.
+    CHECK(!compare_view::Locate(Layout::SideBySide,0.25f,0.1f).inside);
+    CHECK(!compare_view::Locate(Layout::SideBySide,0.75f,0.9f).inside);
+    at=compare_view::Locate(Layout::Quad,0.75f,0.75f);
+    CHECK_EQ(3,at.pane);CHECK(std::abs(at.x-0.5f)<1e-6f);CHECK(std::abs(at.y-0.5f)<1e-6f);
+    CHECK_EQ(2,compare_view::Locate(Layout::Quad,0.1f,0.9f).pane);
+    at=compare_view::Locate(Layout::Single,0.3f,0.7f);
+    CHECK_EQ(0,at.pane);CHECK_EQ(0.3f,at.x);CHECK_EQ(0.7f,at.y);CHECK(at.inside);
+    CHECK_EQ(1.0f,compare_view::PaneWidthShare(Layout::Single));
+    CHECK_EQ(0.5f,compare_view::PaneWidthShare(Layout::Quad));
+    // The fourth pane's Mix is one of the offered values.
+    CHECK_EQ(0.5f,compare_settings::LoadSecondMix(0.55f));
+    CHECK_EQ(2.0f,compare_settings::LoadSecondMix(9.0f));
+    CHECK_EQ(compare_settings::kDefaultSecondMix,compare_settings::LoadSecondMix(std::numeric_limits<float>::quiet_NaN()));
+    // Every command in the menu bar has an id of its own. The second-Mix block once sat
+    // at 449-453, over Safe mode, Clear cache and the receipt at 450-452, and the block
+    // is routed first, so those three rows would have set the fourth pane's Mix.
+    {
+        const Localizer localizer;
+        const HMENU bar=app_menu::CreateMenuBar(localizer,true);
+        std::vector<UINT> ids;
+        const std::function<void(HMENU)> walk=[&](HMENU menu){
+            for(int index=0;index<GetMenuItemCount(menu);++index){
+                MENUITEMINFOW item{sizeof(item)};item.fMask=MIIM_ID|MIIM_SUBMENU|MIIM_FTYPE;
+                if(!GetMenuItemInfoW(menu,UINT(index),TRUE,&item))continue;
+                if(item.hSubMenu){walk(item.hSubMenu);continue;}
+                if(!(item.fType&MFT_SEPARATOR)&&item.wID)ids.push_back(item.wID);
+            }
+        };
+        if(bar)walk(bar);
+        std::sort(ids.begin(),ids.end());
+        CHECK(!ids.empty());
+        CHECK(std::adjacent_find(ids.begin(),ids.end())==ids.end());
+        // Compare HDR at SDR is built with the menu, not appended by the player.
+        CHECK(std::binary_search(ids.begin(),ids.end(),app_menu::IDM_COMPARE_HDR_AT_SDR));
+        CHECK(app_menu::FindMenuContainingCommand(bar,app_menu::IDM_COMPARE_HDR_AT_SDR)==
+              app_menu::FindMenuContainingCommand(bar,app_menu::IDM_COMPARE_LOUPE));
+        for(UINT index=0;index<app_menu::IDM_COMPARE_SECOND_MIX_COUNT;++index)
+            for(const UINT other:{app_menu::IDM_ADVANCED_SAFE_MODE,app_menu::IDM_CLEAR_NEURAL_CACHE,app_menu::IDM_OPEN_RENDER_RECEIPT,app_menu::IDM_CHECK_FOR_UPDATES})
+                CHECK(app_menu::IDM_COMPARE_SECOND_MIX_FIRST+index!=other);
+        // The RTX VSR rows are built with the menu, in the Compare popup.
+        for(UINT index=0;index<app_menu::IDM_COMPARE_VSR_QUALITY_COUNT;++index)
+            CHECK(std::binary_search(ids.begin(),ids.end(),app_menu::IDM_COMPARE_VSR_QUALITY_FIRST+index));
+        CHECK(app_menu::FindMenuContainingCommand(bar,app_menu::IDM_COMPARE_VSR)==app_menu::FindMenuContainingCommand(bar,app_menu::IDM_COMPARE_QUAD));
+        CHECK(app_menu::FindMenuContainingCommand(bar,app_menu::IDM_COMPARE_AGAINST_VSR)==app_menu::FindMenuContainingCommand(bar,app_menu::IDM_COMPARE_QUAD));
+        if(bar)DestroyMenu(bar);
+    }
+    ComparisonSettings comparison;
+    for(const ComparisonMode mode:{ComparisonMode::SideBySide,ComparisonMode::Quad}){
+        comparison.mode=mode;CHECK(ComparisonNeedsCompositor(comparison));CHECK(ComparisonReadsReference(comparison));
+    }
+}
+
+// P2.5: which history slot the temporal stability pass reads and writes. The pass
+// itself needs a GPU; this is the part that decides whether it may blend at all,
+// and getting it wrong ghosts a frame across a cut or a seek.
+void temporal_stability_blends_only_across_a_continuous_history_test()
+{
+    using namespace temporal_stability;
+    CHECK(!BlendFor(TemporalStability::Off).has_value());
+    float previousWeight=0.0f;
+    for(const auto level:{TemporalStability::Low,TemporalStability::Medium,TemporalStability::High}){
+        const auto blend=BlendFor(level);
+        CHECK(blend.has_value());
+        if(!blend)continue;
+        // Each rung keeps more history, never all of it, and every rung trusts the
+        // same pixels: strength is not a licence to blend where the source moved.
+        CHECK(blend->historyWeight>previousWeight&&blend->historyWeight<1.0f);
+        CHECK(blend->trustLow==kTrustLow&&blend->trustHigh==kTrustHigh&&kTrustLow<kTrustHigh);
+        previousWeight=blend->historyWeight;
+        CHECK(ParseTemporalStability(TemporalStabilityName(level))==level);
+    }
+    CHECK(!ParseTemporalStability("Medium").has_value());
+
+    const auto frame=[](uint64_t number,HistoryReset reset=HistoryReset::None,uint64_t job=7,uint32_t source=1){
+        return FrameIdentity{number,int64_t(number)*333333,source,0,job,reset};
+    };
+    History history;
+    // Nothing held: the first frame is a copy, whatever its identity says.
+    Plan plan=PlanFrame(history,frame(10),false);
+    CHECK(plan.step==Step::Reset&&!plan.blend);
+    history=Commit(history,plan,frame(10));
+    CHECK(history.valid&&!history.hasBase);
+    const uint32_t first=history.current;
+    // The first frame again - the receipt gate resubmits it - stays a copy, in place.
+    plan=PlanFrame(history,frame(10),false);
+    CHECK(plan.step==Step::Reset&&!plan.blend&&plan.write==first);
+    history=Commit(history,plan,frame(10));
+    // Its successor blends against it and writes the other slot.
+    plan=PlanFrame(history,frame(11),false);
+    CHECK(plan.step==Step::Advance&&plan.blend&&plan.read==first&&plan.write==(first^1u));
+    history=Commit(history,plan,frame(11));
+    CHECK(history.hasBase&&history.current==(first^1u));
+    // A resubmit of 11 blends against 10 again - not against its own first attempt.
+    plan=PlanFrame(history,frame(11),false);
+    CHECK(plan.step==Step::Repeat&&plan.blend&&plan.read==first&&plan.write==(first^1u));
+    history=Commit(history,plan,frame(11));
+    CHECK(history.hasBase);
+    plan=PlanFrame(history,frame(12),false);
+    CHECK(plan.step==Step::Advance&&plan.read==(first^1u));
+    history=Commit(history,plan,frame(12));
+    // A scene cut, a declared reset or a recreated feature starts over.
+    CHECK(PlanFrame(history,frame(13,HistoryReset::Cut),false).step==Step::Reset);
+    CHECK(PlanFrame(history,frame(13),true).step==Step::Reset);
+    // So does anything that is not the direct successor in the same stream.
+    CHECK(PlanFrame(history,frame(14),false).step==Step::Reset);
+    CHECK(PlanFrame(history,frame(11),false).step==Step::Reset);
+    CHECK(PlanFrame(history,frame(13,HistoryReset::None,8),false).step==Step::Reset);
+    CHECK(PlanFrame(history,frame(13,HistoryReset::None,7,2),false).step==Step::Reset);
+    CHECK(PlanFrame(history,frame(13),false).step==Step::Advance);
+    // A reset writes away from the slot it leaves, and leaves no base behind.
+    plan=PlanFrame(history,frame(13,HistoryReset::Seek),false);
+    CHECK(plan.write==(history.current^1u));
+    history=Commit(history,plan,frame(13,HistoryReset::Seek));
+    CHECK(!history.hasBase);
+}
+
+// The pass's own program, compiled from the text the renderer compiles, with its
+// entry points and flags - the one check of it a machine without a GPU can make.
+void temporal_stability_shader_compiles_test()
+{
+    const auto compiles=[](const char* entry,const char* target){
+        Microsoft::WRL::ComPtr<ID3DBlob> code,errors;
+        const HRESULT hr=D3DCompile(kTemporalStabilityHlsl,sizeof(kTemporalStabilityHlsl)-1,"stability",nullptr,nullptr,
+                                    entry,target,D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
+        if(FAILED(hr)&&errors)std::cerr<<static_cast<const char*>(errors->GetBufferPointer())<<'\n';
+        return SUCCEEDED(hr)&&code&&code->GetBufferSize()>0;
+    };
+    CHECK(compiles("VS","vs_5_1"));
+    CHECK(compiles("PSTemporalStability","ps_5_1"));
+}
+
+// The blue-noise map the present and the capture dither against. Each property is
+// one the dither's correctness rests on: every threshold level equally often (so a
+// constant input comes out at its true mean), a zero-mean offset, and blue noise -
+// low spatial frequencies nearly empty - which is the reason for a map at all.
+void blue_noise_dither_map_is_balanced_and_blue_test()
+{
+    std::array<uint32_t,256> counts{};
+    double sum=0.0;
+    for(uint32_t y=0;y<64;++y)
+        for(uint32_t x=0;x<64;++x){
+            ++counts[dither::BlueNoiseRank(x,y)];
+            sum+=dither::BlueNoiseOffset(x,y);
+        }
+    for(const uint32_t count:counts)CHECK_EQ(16u,count);
+    CHECK(std::abs(sum)<1e-3);
+    // Tiled: the map repeats every 64 pixels in both axes.
+    CHECK_EQ(dither::BlueNoiseRank(3,5),dither::BlueNoiseRank(67,69));
+    // Averaged over 4x4 blocks, blue noise nearly cancels; white noise of the same
+    // range keeps a standard deviation of about 0.072 (0.289/sqrt(16)). The map
+    // measures 0.034; a map that lost its spectrum would sit near the white figure.
+    double sumSq=0.0;
+    for(uint32_t by=0;by<16;++by)
+        for(uint32_t bx=0;bx<16;++bx){
+            double block=0.0;
+            for(uint32_t y=0;y<4;++y)for(uint32_t x=0;x<4;++x)block+=dither::BlueNoiseOffset(bx*4+x,by*4+y);
+            block/=16.0;sumSq+=block*block;
+        }
+    CHECK(std::sqrt(sumSq/256.0)<0.045);
+}
+
+// What the dither buys: round-to-nearest turns every value between two codes into
+// one of them, so a smooth ramp becomes flat bands; the dithered store keeps the
+// value as the proportion of the two codes, so the tile's mean is the input.
+void blue_noise_dither_preserves_the_mean_a_rounded_store_loses_test()
+{
+    for(int step=0;step<=40;++step){
+        const float code=40.0f+float(step)/40.0f;   // 40.000 .. 41.000 in 1/40 steps
+        const float value=code/255.0f;
+        double dithered=0.0;
+        for(uint32_t y=0;y<64;++y)for(uint32_t x=0;x<64;++x)dithered+=dither::DitheredCode(value,x,y);
+        dithered/=4096.0;
+        // Exact to the map's 256 threshold levels.
+        CHECK(std::abs(dithered-double(code))<1.0/256.0+1e-4);
+        // Only the two neighbouring codes ever appear.
+        for(uint32_t y=0;y<64;++y)for(uint32_t x=0;x<64;++x){
+            const uint32_t out=dither::DitheredCode(value,x,y);
+            CHECK(out==40u||out==41u);
+        }
+    }
+    // Black and white stay exactly black and white: the offset is under half a code.
+    for(uint32_t y=0;y<64;++y)for(uint32_t x=0;x<64;++x){
+        CHECK_EQ(0u,dither::DitheredCode(0.0f,x,y));
+        CHECK_EQ(255u,dither::DitheredCode(1.0f,x,y));
+    }
+    // The HDR backbuffer (R10G10B10A2) takes the same map at its own 10-bit code, and
+    // keeps the mean in the same way between two neighbouring 10-bit codes.
+    for(int step=0;step<=8;++step){
+        const float code=512.0f+float(step)/8.0f;
+        double dithered=0.0;
+        for(uint32_t y=0;y<64;++y)for(uint32_t x=0;x<64;++x){
+            const uint32_t out=dither::DitheredCode(code/1023.0f,x,y,1023);
+            CHECK(out==512u||out==513u);
+            dithered+=out;
+        }
+        CHECK(std::abs(dithered/4096.0-double(code))<1.0/256.0+1e-3);
+    }
+}
+
+// The capture's ordered map: the classic 8x8 Bayer matrix, every level once a
+// tile, and - like the blue-noise map - a store that keeps the input's mean.
+void bayer_capture_dither_map_is_the_classic_matrix_test()
+{
+    const std::array<uint32_t,8> firstRow{0,32,8,40,2,34,10,42};
+    const std::array<uint32_t,8> secondRow{48,16,56,24,50,18,58,26};
+    for(uint32_t x=0;x<8;++x){
+        CHECK_EQ(firstRow[x],dither::Bayer8Rank(x,0));
+        CHECK_EQ(secondRow[x],dither::Bayer8Rank(x,1));
+    }
+    std::array<uint32_t,64> counts{};
+    for(uint32_t y=0;y<8;++y)for(uint32_t x=0;x<8;++x)++counts[dither::Bayer8Rank(x,y)];
+    for(const uint32_t count:counts)CHECK_EQ(1u,count);
+    CHECK_EQ(dither::Bayer8Rank(3,5),dither::Bayer8Rank(11,13));
+    for(int step=0;step<=16;++step){
+        const float code=100.0f+float(step)/16.0f;
+        double mean=0.0;
+        for(uint32_t y=0;y<8;++y)for(uint32_t x=0;x<8;++x)
+            mean+=dither::DitheredCode(code/255.0f,x,y,255,dither::DitherMap::Bayer8);
+        CHECK(std::abs(mean/64.0-double(code))<1.0/64.0+1e-4);
+    }
+}
+
+// The map reaches the shader through a macro pasted into the program text, not a
+// second copy. fxc stores a `static const uint` array as an immediate constant
+// buffer of float4 rows with the value in .x, so the compiled scaled present must
+// carry the header's 1024 words in that layout, in order - a table the paste lost or
+// truncated would not be found. The dithered captures compile, and each is a
+// different program from the plain capture it stands in for, which stays as it was.
+void blue_noise_dither_reaches_the_present_and_capture_programs_test()
+{
+    std::string rows;
+    for(const uint32_t word:dither::kBlueNoiseWords){
+        char row[16]{};std::memcpy(row,&word,sizeof(word));rows.append(row,sizeof(row));
+    }
+    // Both compositors, the SDR one and the HDR backbuffer's, carry the map.
+    for(const bool hdrOutput:{false,true}){
+        const std::string program=program_bytes("PSPresentScaled",hdrOutput);
+        CHECK(!program.empty());
+        CHECK(program.find(rows)!=std::string::npos);
+    }
+    const std::array<std::pair<const char*,const char*>,3> pairs{{
+        {"PSPresent","PSCaptureDithered"},{"PSCaptureLuma","PSCaptureLumaDithered"},
+        {"PSCaptureChroma","PSCaptureChromaDithered"}}};
+    for(const auto& [plainEntry,ditheredEntry]:pairs){
+        Microsoft::WRL::ComPtr<ID3DBlob> plain,dithered;
+        CHECK(D3D12RendererTestAccess::CompilePresentProgram(plainEntry,plain));
+        CHECK(D3D12RendererTestAccess::CompilePresentProgram(ditheredEntry,dithered));
+        if(plain&&dithered)
+            CHECK(std::string(static_cast<const char*>(plain->GetBufferPointer()),plain->GetBufferSize())!=
+                  std::string(static_cast<const char*>(dithered->GetBufferPointer()),dithered->GetBufferSize()));
+    }
+}
+
+// The deband pre-pass on its own terms: a one-code step in a smooth ramp - the band a
+// compressed source leaves - is averaged away, a real edge is kept, black stays black,
+// and the pattern is fixed, so the same pixel always draws the same numbers.
+void deband_pre_pass_smooths_bands_and_keeps_edges_test()
+{
+    // Bands: 40 columns at code 100, then 40 at 101, repeating, on a 0..1 scale.
+    const auto banded = [](int x, int) { return (100.0f + float((x / 40) % 2)) / 255.0f; };
+    // Near a band edge the pass lands between the two codes; the plain frame cannot.
+    uint32_t between = 0, total = 0;
+    for (int y = 20; y < 60; ++y)
+        for (int x = 30; x < 50; ++x) {
+            const float code = deband::DebandPixel(banded, x, y) * 255.0f;
+            CHECK(code > 99.4f && code < 101.6f);
+            if (code > 100.15f && code < 100.85f) ++between;
+            ++total;
+        }
+    CHECK(between * 4 > total);
+    // A real edge - twenty codes - is far past the threshold and survives, up to grain.
+    const auto edge = [](int x, int) { return (x < 200 ? 60.0f : 80.0f) / 255.0f; };
+    for (int y = 0; y < 40; ++y) {
+        CHECK(std::abs(deband::DebandPixel(edge, 199, y) * 255.0f - 60.0f) < 0.6f);
+        CHECK(std::abs(deband::DebandPixel(edge, 200, y) * 255.0f - 80.0f) < 0.6f);
+    }
+    // Grain is scaled by the value itself, so black is left exactly black.
+    const auto black = [](int, int) { return 0.0f; };
+    for (int x = 0; x < 64; ++x) CHECK_EQ(0.0f, deband::DebandPixel(black, x, 7));
+    // A fixed per-pixel pattern: the same pixel draws the same numbers every frame,
+    // and different pixels different ones.
+    CHECK_EQ(deband::Random(10, 20, 0), deband::Random(10, 20, 0));
+    CHECK(deband::Random(10, 20, 0) != deband::Random(11, 20, 0));
+    CHECK(deband::Random(10, 20, 0) != deband::Random(10, 20, 1));
+    for (uint32_t k = 0; k < 3; ++k)
+        for (uint32_t x = 0; x < 50; ++x) {
+            const float r = deband::Random(x, 3, k);
+            CHECK(r >= 0.0f && r < 1.0f);
+        }
+}
+
+// The deband program compiles from the shared text as its own entry point, leaves
+// PSConvert alone, and carries the header's parameters: fxc folds threshold/1000 and
+// grain/1000 into immediates, so a paste that lost them would not contain either.
+void deband_pre_pass_reaches_the_conversion_program_test()
+{
+    Microsoft::WRL::ComPtr<ID3DBlob> plain,debanded;
+    CHECK(D3D12RendererTestAccess::CompilePresentProgram("PSConvert",plain));
+    CHECK(D3D12RendererTestAccess::CompilePresentProgram("PSConvertDebanded",debanded));
+    if(!plain||!debanded)return;
+    const std::string plainProgram(static_cast<const char*>(plain->GetBufferPointer()),plain->GetBufferSize());
+    const std::string program(static_cast<const char*>(debanded->GetBufferPointer()),debanded->GetBufferSize());
+    CHECK(program!=plainProgram);
+    const auto contains=[&](float value){
+        char bytes[sizeof(float)];std::memcpy(bytes,&value,sizeof(value));
+        return program.find(std::string(bytes,sizeof(bytes)))!=std::string::npos;
+    };
+    CHECK(contains(deband::kThreshold/1000.0f));
+    CHECK(contains(deband::kGrain/1000.0f));
+}
+
+// P1.28. A child created with bInheritHandles=TRUE and no handle list takes
+// every inheritable handle alive at that instant. A seek during an export
+// spawned the playback ffmpeg holding the export probe's stdout, so the probe's
+// drain waited for that child to die and the cancel joined it on the UI
+// thread. Every CreateProcessW in the shipped sources either inherits nothing
+// or names what it inherits (InheritedHandles, or the attribute directly).
+void every_child_spawn_names_the_handles_it_inherits_test()
+{
+    const std::filesystem::path sources = DLSS_TEST_SOURCE_DIR;
+    const auto trim = [](std::string text) {
+        const auto first = text.find_first_not_of(" \t\r\n");
+        const auto last = text.find_last_not_of(" \t\r\n");
+        return first == std::string::npos ? std::string() : text.substr(first, last - first + 1);
+    };
+    size_t spawns = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(sources)) {
+        const auto extension = entry.path().extension();
+        if (extension != L".cpp" && extension != L".h") continue;
+        std::ifstream in(entry.path(), std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        size_t previous = 0;
+        for (size_t at = text.find("CreateProcessW("); at != std::string::npos;
+             at = text.find("CreateProcessW(", at + 1)) {
+            // A comment's example is not a call.
+            const size_t lineStart = text.rfind('\n', at) == std::string::npos ? 0 : text.rfind('\n', at) + 1;
+            if (trim(text.substr(lineStart, at - lineStart)).rfind("//", 0) == 0) continue;
+            // The ten arguments, split at the top level of the call's parentheses.
+            std::vector<std::string> arguments(1);
+            int depth = 0;
+            size_t end = at + std::strlen("CreateProcessW(");
+            for (; end < text.size(); ++end) {
+                const char c = text[end];
+                if (c == '(') ++depth;
+                else if (c == ')') { if (depth == 0) break; --depth; }
+                else if (c == ',' && depth == 0) { arguments.emplace_back(); continue; }
+                arguments.back() += c;
+            }
+            ++spawns;
+            const std::string where = entry.path().filename().string() + " at byte " + std::to_string(at);
+            CHECK_EQ(size_t{10}, arguments.size());
+            if (arguments.size() != 10) { std::cerr << "  unparsed: " << where << '\n'; continue; }
+            const std::string inherit = trim(arguments[4]);
+            const std::string window = text.substr(std::max(previous, at > 4000 ? at - 4000 : size_t{0}), end - std::max(previous, at > 4000 ? at - 4000 : size_t{0}));
+            const bool listed = window.find("InheritedHandles") != std::string::npos ||
+                                window.find("PROC_THREAD_ATTRIBUTE_HANDLE_LIST") != std::string::npos;
+            const bool extended = window.find("EXTENDED_STARTUPINFO_PRESENT") != std::string::npos ||
+                                  arguments[5].find("CreationFlags()") != std::string::npos;
+            const bool ok = inherit == "FALSE" || (listed && extended);
+            if (!ok) std::cerr << "  inherits without a handle list: " << where << '\n';
+            CHECK(ok);
+            previous = at;
+        }
+    }
+    // Decoder probe and child, audio probe and child, subtitles, the export
+    // tools, the neural helper, yt-dlp and the crash reporter's relaunch.
+    CHECK(spawns >= 10);
+}
+
+// P1.33. A local HLS or concat playlist - demuxed by content, whatever it is
+// named - opened with every protocol ffmpeg has. Every local input reaches
+// files only; a URL, a pipe, a lavfi graph and an input that already has a
+// whitelist are left as they are.
+void local_inputs_reach_files_only_test()
+{
+    using media_tools::GuardLocalInputs;
+    using media_tools::LocalInputOptions;
+    CHECK(LocalInputOptions(L"C:\\media\\list.m3u8") == L"-protocol_whitelist file,crypto,data ");
+    CHECK(LocalInputOptions(L"clip.mp4") == L"-protocol_whitelist file,crypto,data ");
+    CHECK(LocalInputOptions(L"https://rr1.googlevideo.com/videoplayback").empty());
+    CHECK(LocalInputOptions(L"HTTP://example.invalid/a.m3u8").empty());
+
+    const std::vector<std::wstring> arguments{
+        L"-v", L"error", L"-i", L"C:/media/a.mkv", L"-itsoffset", L"1", L"-i", L"https://example.invalid/b",
+        L"-f", L"lavfi", L"-i", L"testsrc2", L"-f", L"rawvideo", L"-i", L"pipe:0",
+        L"-protocol_whitelist", L"file", L"-i", L"C:/media/c.mkv", L"-i", L"C:/media/d.mkv", L"out.mkv"};
+    const std::vector<std::wstring> expected{
+        L"-v", L"error", L"-protocol_whitelist", L"file,crypto,data", L"-i", L"C:/media/a.mkv",
+        L"-itsoffset", L"1", L"-i", L"https://example.invalid/b",
+        L"-f", L"lavfi", L"-i", L"testsrc2", L"-f", L"rawvideo", L"-i", L"pipe:0",
+        L"-protocol_whitelist", L"file", L"-i", L"C:/media/c.mkv",
+        L"-protocol_whitelist", L"file,crypto,data", L"-i", L"C:/media/d.mkv", L"out.mkv"};
+    CHECK(GuardLocalInputs(arguments) == expected);
+    CHECK(GuardLocalInputs({L"-version"}) == std::vector<std::wstring>{L"-version"});
+}
+
+// P1.27. A YouTube open, seek or reload builds its renderer while the
+// candidate decoder reads ahead, then swaps the candidate in. Swap stopped both
+// queues discarding what they held, after the child's frame count had taken
+// those frames, so playback resumed up to four frames on. The frame after a
+// swap is the next one, with its own number and time.
+void video_decoder_swap_keeps_the_frames_the_candidate_read_ahead_test()
+{
+    MediaFixture fixture;
+    auto live=VideoDecoderTestAccess::Create(fixture.directory);
+    auto candidate=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(candidate->Open(L"seekreuse",MediaSourceKind::LocalFile));
+    // Long enough for the queue to fill, as it does while a renderer is built.
+    Sleep(400);
+    live->Swap(*candidate);
+    for(uint32_t expected=0;expected<6;++expected){
+        const VideoFrame frame=read_one_frame(*live);
+        CHECK_EQ(expected,stamped_frame_index(frame));
+        CHECK_EQ(uint64_t{expected},frame.frameNumber);
+    }
+    candidate->Close();
+    live->Close();
+}
+
+void video_decoder_forward_seek_reuses_child_and_delivers_the_same_frame_as_a_restart_test()
+{
+    MediaFixture fixture;
+    const auto expectedTimestamp=[](int64_t frameIndex){
+        return static_cast<int64_t>((static_cast<double>(frameIndex)/30.0)*10000000.0);
+    };
+    // A short forward hop: the child stays, and the frames before the target
+    // are dropped without the caller ever seeing them.
+    auto reused=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(reused->Open(L"seekreuse",MediaSourceKind::LocalFile));
+    CHECK_EQ(uint32_t{0},stamped_frame_index(read_one_frame(*reused)));
+    CHECK(reused->SeekSeconds(0.1));
+    CHECK(reused->LastSeekTiming().reusedChild);
+    const VideoFrame afterReuse=read_one_frame(*reused);
+
+    // The same target reached by rewinding, which can only be served by a
+    // restarted child.
+    auto restarted=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(restarted->Open(L"seekreuse",MediaSourceKind::LocalFile));
+    CHECK(restarted->SeekSeconds(2.0));
+    CHECK(restarted->SeekSeconds(0.1));
+    CHECK(!restarted->LastSeekTiming().reusedChild);
+    const VideoFrame afterRestart=read_one_frame(*restarted);
+
+    CHECK_EQ(uint32_t{3},stamped_frame_index(afterRestart));
+    CHECK(afterReuse.bgra==afterRestart.bgra);
+    CHECK_EQ(afterRestart.timestamp100ns,afterReuse.timestamp100ns);
+    CHECK_EQ(expectedTimestamp(3),afterReuse.timestamp100ns);
+    CHECK_EQ(afterRestart.frameNumber,afterReuse.frameNumber);
+    CHECK_EQ(uint64_t{3},afterReuse.frameNumber);
+    CHECK_EQ(afterRestart.discontinuity,afterReuse.discontinuity);
+
+    // Frame stepping is the smallest forward seek there is: every step keeps the
+    // child and walks exactly one frame.
+    for(int64_t step=4;step<9;++step){
+        CHECK(reused->SeekSeconds(static_cast<double>(step)/30.0));
+        CHECK(reused->LastSeekTiming().reusedChild);
+        const VideoFrame stepped=read_one_frame(*reused);
+        CHECK_EQ(static_cast<uint32_t>(step),stamped_frame_index(stepped));
+        CHECK_EQ(expectedTimestamp(step),stepped.timestamp100ns);
+        CHECK_EQ(static_cast<uint64_t>(step),stepped.frameNumber);
+    }
+
+    // Rewinding cannot be served by a running child.
+    CHECK(reused->SeekSeconds(0.1));
+    CHECK(!reused->LastSeekTiming().reusedChild);
+    CHECK_EQ(uint32_t{3},stamped_frame_index(read_one_frame(*reused)));
+
+    // A hop far enough that decoding to it costs more than a fresh child does.
+    CHECK(reused->SeekSeconds(20.0));
+    CHECK(!reused->LastSeekTiming().reusedChild);
+    const VideoFrame afterLongSeek=read_one_frame(*reused);
+    CHECK_EQ(uint32_t{600},stamped_frame_index(afterLongSeek));
+    CHECK_EQ(expectedTimestamp(600),afterLongSeek.timestamp100ns);
+}
+
+// ReadNextBlocking moved each queued frame over the caller's VideoFrame and
+// freed the buffer it held, so the read path never found one to reuse and
+// allocated and zero-filled a whole frame for every frame played - 5.5 to
+// 31.6 MB each on the player's main path. The caller's buffer now goes back to
+// the pool, and after the queue has filled no read allocates again.
+void video_decoder_blocking_reads_recycle_the_callers_buffer_test()
+{
+    MediaFixture fixture;
+    constexpr int kFrames=240;
+    auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(decoder->Open(L"seekreuse_recycle",MediaSourceKind::LocalFile));
+    VideoFrame frame;
+    for(int index=0;index<kFrames;++index){
+        CHECK(decoder->ReadNextBlocking(frame)==VideoReadResult::FrameReady);
+        CHECK_EQ(static_cast<uint32_t>(index),stamped_frame_index(frame));
+    }
+    const uint64_t blockingFills=decoder->FrameBufferFills();
+    std::cout<<"  blocking reads: "<<kFrames<<" frames, "<<blockingFills<<" buffer fills\n";
+    // The queue (4), the frame being filled and the caller's own: what the
+    // ring needs before its first buffer comes back. Everything after is reuse.
+    CHECK(blockingFills<=8);
+
+    // The same through ReadNextAvailable, which SynchronizedPlayback uses, fed
+    // a buffer of the right size each time the way its pool does.
+    auto available=VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(available->Open(L"seekreuse_recycle",MediaSourceKind::LocalFile));
+    VideoFrame spare;
+    for(int index=0;index<kFrames;){
+        VideoFrame next;next.bgra=std::move(spare.bgra);
+        const VideoReadResult result=available->ReadNextAvailable(next);
+        if(result==VideoReadResult::NotReady){
+            spare.bgra=std::move(next.bgra);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));continue;
+        }
+        CHECK(result==VideoReadResult::FrameReady);
+        if(result!=VideoReadResult::FrameReady)break;
+        CHECK_EQ(static_cast<uint32_t>(index),stamped_frame_index(next));
+        spare.bgra=std::move(next.bgra);++index;
+    }
+    const uint64_t availableFills=available->FrameBufferFills();
+    std::cout<<"  available reads: "<<kFrames<<" frames, "<<availableFills<<" buffer fills\n";
+    CHECK(availableFills<=8);
+}
+
+void video_decoder_resume_failures_are_bounded_and_leak_free_for_local_and_network_startup_test()
+{
+    struct Case {
+        VideoDecoder::FailureStage stage;
+        MediaSourceKind sourceKind;
+        std::wstring_view path;
+    };
+    const std::array cases{
+        Case{VideoDecoder::FailureStage::ProbeResume,MediaSourceKind::LocalFile,
+             LR"(C:\missing\local-probe-resume.mp4)"},
+        Case{VideoDecoder::FailureStage::ProbeResume,MediaSourceKind::YouTube,
+             L"https://media.invalid/network-probe-resume"},
+        Case{VideoDecoder::FailureStage::DecodeResume,MediaSourceKind::LocalFile,
+             LR"(C:\missing\local-decode-resume.mp4)"},
+        Case{VideoDecoder::FailureStage::DecodeResume,MediaSourceKind::YouTube,
+             L"https://media.invalid/network-decode-resume"},
+    };
+    MediaFixture fixture;
+    const size_t beforeProbe=count_named_processes(L"ffprobe.exe");
+    const size_t beforeFfmpeg=count_named_processes(L"ffmpeg.exe");
+    // The first failed local open initializes process-wide Media Foundation
+    // state before its fallback rejects the missing file. Warm that one-time
+    // state before measuring per-attempt handle ownership.
+    {
+        auto warmup=VideoDecoderTestAccess::Create(
+            fixture.directory,std::chrono::milliseconds{250},
+            std::chrono::milliseconds{120},VideoDecoder::FailureStage::ProbeResume);
+        const auto started=std::chrono::steady_clock::now();
+        CHECK(!warmup->Open(LR"(C:\missing\resume-warmup.mp4)",MediaSourceKind::LocalFile));
+        CHECK(std::chrono::steady_clock::now()-started<std::chrono::seconds{1});
+    }
+    CHECK(wait_for_named_process_count(L"ffprobe.exe",beforeProbe,
+                                       kChildExitWait));
+    CHECK(wait_for_named_process_count(L"ffmpeg.exe",beforeFfmpeg,
+                                       kChildExitWait));
+    DWORD beforeHandles=0,afterHandles=0;
+    CHECK(GetProcessHandleCount(GetCurrentProcess(),&beforeHandles)!=FALSE);
+
+    for(int repetition=0;repetition<4;++repetition){
+        for(const Case& test:cases){
+            auto decoder=VideoDecoderTestAccess::Create(
+                fixture.directory,std::chrono::milliseconds{250},
+                std::chrono::milliseconds{120},test.stage);
+            const auto started=std::chrono::steady_clock::now();
+            CHECK(!decoder->Open(std::wstring(test.path),test.sourceKind));
+            CHECK(std::chrono::steady_clock::now()-started<std::chrono::seconds{1});
+            decoder.reset();
+            CHECK(wait_for_named_process_count(L"ffprobe.exe",beforeProbe,
+                                               kChildExitWait));
+            CHECK(wait_for_named_process_count(L"ffmpeg.exe",beforeFfmpeg,
+                                               kChildExitWait));
+        }
+    }
+    CHECK(GetProcessHandleCount(GetCurrentProcess(),&afterHandles)!=FALSE);
+    CHECK(afterHandles<=beforeHandles+2);
+}
+
+void youtube_audio_held_pipe_stop_destroy_and_failure_fallback_are_bounded_test()
+{
+    MediaFixture fixture;const size_t beforeProcesses=count_named_processes(L"ffmpeg.exe");
+    const DWORD beforeHandles=handle_count_after_warm_up([&]{
+        auto audio=AudioPlayerTestAccess::Create(fixture.directory,true,true);
+        CHECK(audio->Start(L"https://media.invalid/audiohold",7.5,AudioStartState::Paused));audio->Stop();
+        CHECK(wait_for_named_process_count(L"ffmpeg.exe",beforeProcesses,kChildExitWait));
+    });
+    DWORD afterHandles=0;
+    for(int cycle=0;cycle<8;++cycle){
+        auto audio=AudioPlayerTestAccess::Create(fixture.directory,cycle%2==0,cycle%3==0);
+        CHECK(audio->Start(L"https://media.invalid/audiohold",7.5,AudioStartState::Paused));CHECK(audio->Paused());CHECK_EQ(7.5,AudioPlayerTestAccess::SeekBase(*audio));CHECK_EQ(uint64_t{0},AudioPlayerTestAccess::SubmittedBuffers(*audio));
+        const auto started=std::chrono::steady_clock::now();if(cycle%2==0)audio->Stop();else audio.reset();CHECK(std::chrono::steady_clock::now()-started<std::chrono::seconds{1});
+        CHECK(wait_for_named_process_count(L"ffmpeg.exe",beforeProcesses,kChildExitWait));
+    }
+    CHECK(GetProcessHandleCount(GetCurrentProcess(),&afterHandles)!=FALSE);CHECK(afterHandles<=beforeHandles+2);
+}
+
+void youtube_audio_failed_waits_and_query_retire_reader_without_termination_or_leaks_test()
+{
+    MediaFixture fixture;
+    const size_t beforeProcesses=count_named_processes(L"ffmpeg.exe");
+    const DWORD beforeHandles=handle_count_after_warm_up([&]{
+        auto audio=AudioPlayerTestAccess::Create(fixture.directory,true,true,true,true,true,true);
+        CHECK(audio->Start(L"https://media.invalid/audiohold",3.0,AudioStartState::Paused));audio->Stop();
+        CHECK(wait_for_named_process_count(L"ffmpeg.exe",beforeProcesses,kChildExitWait));
+    });
+    for(int cycle=0;cycle<12;++cycle){
+        auto audio=AudioPlayerTestAccess::Create(fixture.directory,true,true,true,true,true,true);
+        CHECK(audio->Start(L"https://media.invalid/audiohold",3.0,AudioStartState::Paused));
+        const auto started=std::chrono::steady_clock::now();
+        if(cycle%3==0){
+            CHECK(audio->Start(L"https://media.invalid/audiohold",4.0,AudioStartState::Paused));
+            audio->Stop();
+        }else if(cycle%3==1){audio->Stop();}else{audio.reset();}
+        CHECK(std::chrono::steady_clock::now()-started<std::chrono::seconds{1});
+        CHECK(wait_for_named_process_count(L"ffmpeg.exe",beforeProcesses,kChildExitWait));
+    }
+    const auto handlesDeadline=std::chrono::steady_clock::now()+std::chrono::seconds{1};
+    DWORD afterHandles=0;
+    do{
+        CHECK(GetProcessHandleCount(GetCurrentProcess(),&afterHandles)!=FALSE);
+        if(afterHandles<=beforeHandles+2)break;
+        Sleep(5);
+    }while(std::chrono::steady_clock::now()<handlesDeadline);
+    CHECK(afterHandles<=beforeHandles+2);
+}
+
+void youtube_prepared_audio_starts_silent_and_handoff_has_no_overlap_test()
+{
+    MediaFixture fixture;auto prepared=AudioPlayerTestAccess::Create(fixture.directory);
+    CHECK(prepared->Start(L"https://media.invalid/audiotrickle",12.25,AudioStartState::Paused));CHECK(prepared->Paused());CHECK_EQ(12.25,AudioPlayerTestAccess::SeekBase(*prepared));Sleep(60);CHECK_EQ(uint64_t{0},AudioPlayerTestAccess::SubmittedBuffers(*prepared));
+    bool oldAudible=true,newAudible=false;std::vector<int> order;
+    CommitPreparedAudioHandoff(
+        [&]{CHECK(oldAudible);CHECK(!newAudible);CHECK(prepared->Paused());order.push_back(1);},
+        [&]{CHECK(oldAudible);CHECK(!newAudible);CHECK(prepared->Paused());order.push_back(2);return true;},
+        [&]{CHECK(oldAudible);CHECK(!newAudible);CHECK(prepared->Paused());oldAudible=false;order.push_back(3);},
+        [&]{CHECK(!oldAudible);prepared->Pause(false);newAudible=true;order.push_back(4);});
+    CHECK_EQ(std::vector<int>({2,1,3,4}),order);CHECK(!prepared->Paused());
+    prepared->Stop();
+
+    auto cancelled=AudioPlayerTestAccess::Create(fixture.directory);CHECK(cancelled->Start(L"https://media.invalid/audiohold",4.0,AudioStartState::Paused));CHECK_EQ(uint64_t{0},AudioPlayerTestAccess::SubmittedBuffers(*cancelled));cancelled.reset();
+}
+
+void youtube_prepared_handoff_shows_candidate_and_retires_every_old_owner_before_activation_test()
+{
+    enum Event {
+        ShowCandidate=1,
+        InstallCandidate,
+        RetireOldAudio,
+        RetireOldDecoder,
+        RetireOldRenderer,
+        RetireOldWindow,
+        EstablishClocks,
+        ActivatePreparedAudio,
+    };
+    std::vector<int> order;
+    std::array<int,4> retireCounts{};
+    const std::array<int,4> expectedRetireCounts{1,1,1,1};
+    bool candidateInstalled=false,candidateVisible=false,preparedAudioPaused=true;
+
+    CommitPreparedAudioHandoff(
+        [&]{
+            CHECK(preparedAudioPaused);
+            CHECK(candidateVisible);
+            candidateInstalled=true;
+            order.push_back(InstallCandidate);
+        },
+        [&]{
+            CHECK(!candidateInstalled);
+            CHECK(preparedAudioPaused);
+            candidateVisible=true;
+            order.push_back(ShowCandidate);
+            return true;
+        },
+        [&]{
+            CHECK(candidateVisible);
+            CHECK(preparedAudioPaused);
+            ++retireCounts[0];order.push_back(RetireOldAudio);
+            ++retireCounts[1];order.push_back(RetireOldDecoder);
+            ++retireCounts[2];order.push_back(RetireOldRenderer);
+            ++retireCounts[3];order.push_back(RetireOldWindow);
+        },
+        [&]{
+            CHECK(candidateVisible);
+            CHECK_EQ(expectedRetireCounts,retireCounts);
+            order.push_back(EstablishClocks);
+            preparedAudioPaused=false;
+            order.push_back(ActivatePreparedAudio);
+        });
+
+    CHECK_EQ(std::vector<int>({ShowCandidate,InstallCandidate,RetireOldAudio,
+              RetireOldDecoder,RetireOldRenderer,RetireOldWindow,
+              EstablishClocks,ActivatePreparedAudio}),order);
+    CHECK(!preparedAudioPaused);
+    CHECK_EQ(expectedRetireCounts,retireCounts);
+}
+
+void youtube_prepared_handoff_sizes_and_shows_real_candidate_before_owned_retirement_test()
+{
+    enum Event {Visible=1,Install,RetireAudio,RetireDecoder,RetireRenderer,RetireWindow,Activate};
+    struct OwnedSentinel {
+        std::vector<int>* order{};
+        int event{};
+        int* destroyCount{};
+        HWND* candidateWindow{};
+        int* hiddenAtDestruction{};
+        ~OwnedSentinel(){
+            if(!destroyCount)return;
+            if(!candidateWindow||!IsWindowVisible(*candidateWindow))++*hiddenAtDestruction;
+            ++*destroyCount;
+            order->push_back(event);
+        }
+    };
+
+    HWND host=CreateWindowExW(WS_EX_TOOLWINDOW,L"STATIC",L"handoff-host",
+        WS_POPUP|WS_VISIBLE,-32000,-32000,640,360,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    HWND viewport=CreateWindowExW(0,L"STATIC",L"handoff-viewport",
+        WS_CHILD|WS_VISIBLE,0,0,640,360,host,nullptr,GetModuleHandleW(nullptr),nullptr);
+    HWND activeWindow=CreateWindowExW(0,L"STATIC",L"old-render-window",
+        WS_CHILD|WS_VISIBLE,0,0,640,360,viewport,nullptr,GetModuleHandleW(nullptr),nullptr);
+    HWND preparedWindow=CreateWindowExW(0,L"STATIC",L"prepared-render-window",
+        WS_CHILD,0,0,100,100,viewport,nullptr,GetModuleHandleW(nullptr),nullptr);
+    CHECK(host!=nullptr);CHECK(viewport!=nullptr);CHECK(activeWindow!=nullptr);CHECK(preparedWindow!=nullptr);
+    CHECK(!IsWindowVisible(preparedWindow));
+
+    std::vector<int> order;
+    std::array<int,3> destroyCounts{};
+    const std::array<int,3> expectedDestroyCounts{1,1,1};
+    int hiddenAtDestruction=0;
+    auto owner=[&](int index,int event){
+        auto value=std::make_unique<OwnedSentinel>();
+        value->order=&order;value->event=event;
+        value->destroyCount=&destroyCounts[static_cast<size_t>(index)];
+        value->candidateWindow=&activeWindow;value->hiddenAtDestruction=&hiddenAtDestruction;
+        return value;
+    };
+    auto preparedOwner=[] {return std::make_unique<OwnedSentinel>();};
+    auto activeAudio=owner(0,RetireAudio),activeDecoder=owner(1,RetireDecoder),activeRenderer=owner(2,RetireRenderer);
+    auto preparedAudio=preparedOwner(),preparedDecoder=preparedOwner(),preparedRenderer=preparedOwner();
+    std::unique_ptr<OwnedSentinel> retiringAudio,retiringDecoder,retiringRenderer;
+    HWND retiringWindow=nullptr;
+
+    CommitPreparedAudioHandoff(
+        [&]{
+            retiringAudio=std::move(activeAudio);activeAudio=std::move(preparedAudio);
+            retiringDecoder=std::move(activeDecoder);activeDecoder=std::move(preparedDecoder);
+            retiringRenderer=std::move(activeRenderer);activeRenderer=std::move(preparedRenderer);
+            retiringWindow=activeWindow;activeWindow=preparedWindow;preparedWindow=nullptr;
+            order.push_back(Install);
+        },
+        [&]{
+            const bool shown=ShowPreparedRenderWindow(viewport,preparedWindow);
+            CHECK(shown);
+            RECT candidateBounds{};CHECK(GetWindowRect(preparedWindow,&candidateBounds)!=FALSE);
+            CHECK_EQ(LONG{640},candidateBounds.right-candidateBounds.left);
+            CHECK_EQ(LONG{360},candidateBounds.bottom-candidateBounds.top);
+            CHECK(IsWindowVisible(preparedWindow));
+            CHECK_EQ(preparedWindow,GetWindow(viewport,GW_CHILD));
+            order.push_back(Visible);
+            return shown;
+        },
+        [&]{
+            retiringAudio.reset();retiringDecoder.reset();retiringRenderer.reset();
+            CHECK(DestroyWindow(retiringWindow)!=FALSE);retiringWindow=nullptr;order.push_back(RetireWindow);
+        },
+        [&]{
+            CHECK_EQ(expectedDestroyCounts,destroyCounts);
+            CHECK_EQ(0,hiddenAtDestruction);
+            CHECK(IsWindowVisible(activeWindow));
+            order.push_back(Activate);
+        });
+
+    const std::vector<int> expected{Visible,Install,RetireAudio,RetireDecoder,
+                                    RetireRenderer,RetireWindow,Activate};
+    CHECK_EQ(expected,order);
+    if(host)DestroyWindow(host);
+}
+
+void youtube_prepared_window_api_failures_are_reported_before_commit_test()
+{
+    const HWND fakeViewport=reinterpret_cast<HWND>(uintptr_t{1});
+    const HWND fakeWindow=reinterpret_cast<HWND>(uintptr_t{2});
+    int getClientRectCalls=0,setWindowPosCalls=0;
+    CHECK(!ShowPreparedRenderWindowWithOperations(
+        fakeViewport,fakeWindow,
+        [](HWND){return TRUE;},
+        [&](HWND,RECT*){++getClientRectCalls;return FALSE;},
+        [&](HWND,HWND,int,int,int,int,UINT){++setWindowPosCalls;return TRUE;},
+        [](HWND){return TRUE;}));
+    CHECK_EQ(1,getClientRectCalls);CHECK_EQ(0,setWindowPosCalls);
+
+    getClientRectCalls=0;setWindowPosCalls=0;
+    CHECK(!ShowPreparedRenderWindowWithOperations(
+        fakeViewport,fakeWindow,
+        [](HWND){return TRUE;},
+        [&](HWND,RECT* bounds){++getClientRectCalls;*bounds=RECT{0,0,640,360};return TRUE;},
+        [&](HWND,HWND,int,int,int,int,UINT){++setWindowPosCalls;return FALSE;},
+        [](HWND){return TRUE;}));
+    CHECK_EQ(1,getClientRectCalls);CHECK_EQ(1,setWindowPosCalls);
+
+    CHECK(!ShowPreparedRenderWindowWithOperations(
+        fakeViewport,fakeWindow,
+        [](HWND){return TRUE;},
+        [](HWND,RECT* bounds){*bounds=RECT{0,0,640,360};return TRUE;},
+        [](HWND,HWND,int,int,int,int,UINT){return TRUE;},
+        [](HWND){return FALSE;}));
+}
+
+void youtube_destroyed_window_and_visibility_failure_leave_active_state_unchanged_test()
+{
+    D3D12RendererTestAccess::ResetRetainedRenderers();
+    HWND host=CreateWindowExW(WS_EX_TOOLWINDOW,L"STATIC",L"visibility-host",
+        WS_POPUP|WS_VISIBLE,-32000,-32000,640,360,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    HWND viewport=CreateWindowExW(0,L"STATIC",L"visibility-viewport",
+        WS_CHILD|WS_VISIBLE,0,0,640,360,host,nullptr,GetModuleHandleW(nullptr),nullptr);
+    HWND destroyed=CreateWindowExW(0,L"STATIC",L"destroyed-candidate",
+        WS_CHILD,0,0,100,100,viewport,nullptr,GetModuleHandleW(nullptr),nullptr);
+    CHECK(host!=nullptr);CHECK(viewport!=nullptr);CHECK(destroyed!=nullptr);
+    CHECK(DestroyWindow(destroyed)!=FALSE);
+    CHECK(!ShowPreparedRenderWindow(viewport,destroyed));
+    CHECK(!ShowPreparedRenderWindow(nullptr,destroyed));
+
+    struct Candidate{
+        explicit Candidate(bool& destroyed):destroyed(destroyed),renderer(MakeD3D12Renderer()){}
+        ~Candidate(){destroyed=true;}
+        bool& destroyed;
+        D3D12RendererOwner renderer;
+    };
+    struct Active{int decoder{10};int audio{20};int renderer{30};bool playing{true};bool operator==(const Active&)const=default;};
+    Active active;const Active before=active;bool candidateDestroyed=false,preparedAudioPaused=true;
+    int candidateWaits=0;auto candidateResourcesDestroyed=std::make_shared<int>(0);
+    std::vector<int> order;
+    const bool committed=ExecuteNetworkCandidateTransaction<Candidate>(
+        [&]{
+            auto candidate=std::make_unique<Candidate>(candidateDestroyed);
+            D3D12RendererTestAccess::ConfigureWait(
+                *candidate->renderer,d3d12_renderer_detail::FenceWaitResult::TimedOut,candidateWaits);
+            D3D12RendererTestAccess::OwnSentinel(
+                *candidate->renderer,std::make_unique<RendererOwnedSentinel>(candidateResourcesDestroyed));
+            return candidate;
+        },
+        [](Candidate&){return true;},
+        [&](std::unique_ptr<Candidate>){
+            return CommitPreparedAudioHandoff(
+                [&]{order.push_back(2);active={11,21,31,false};},
+                [&]{order.push_back(1);return ShowPreparedRenderWindow(viewport,destroyed);},
+                [&]{order.push_back(3);},
+                [&]{order.push_back(4);preparedAudioPaused=false;});
+        });
+    CHECK(!committed);CHECK_EQ(std::vector<int>({1}),order);
+    CHECK_EQ(before,active);CHECK(preparedAudioPaused);CHECK(candidateDestroyed);
+    CHECK_EQ(1,candidateWaits);CHECK_EQ(0,*candidateResourcesDestroyed);
+    if(host)DestroyWindow(host);
+}
+
+void youtube_candidate_render_failure_releases_window_handle_and_prepared_processes_test()
+{
+    struct ActivePlayback {
+        int decoder{10};
+        int audio{20};
+        int renderer{30};
+        int quality{2};
+        bool playing{true};
+        int64_t history{170000000};
+        bool operator==(const ActivePlayback&) const=default;
+    };
+    struct Candidate {
+        Candidate(HWND window,HANDLE handle,bool renderFirst,bool* destroyed)
+            : window(window),handle(handle),renderFirst(renderFirst),destroyed(destroyed) {}
+        Candidate(const Candidate&)=delete;
+        Candidate& operator=(const Candidate&)=delete;
+        HWND window{};
+        HANDLE handle{};
+        bool renderFirst{};
+        bool* destroyed{};
+        ~Candidate(){
+            if(handle)CloseHandle(handle);
+            if(window)DestroyWindow(window);
+            if(destroyed)*destroyed=true;
+        }
+    };
+
+    MediaFixture fixture;
+    const size_t beforeProcesses=count_named_processes(L"ffmpeg.exe");
+    const DWORD beforeHandles=handle_count_after_warm_up([&]{
+        auto decoder=VideoDecoderTestAccess::Create(fixture.directory);
+        auto audio=AudioPlayerTestAccess::Create(fixture.directory);
+        CHECK(decoder->Open(L"https://media.invalid/hold",MediaSourceKind::YouTube));
+        CHECK(audio->Start(L"https://media.invalid/audiohold",9.0,AudioStartState::Paused));
+        HWND window=CreateWindowExW(0,L"STATIC",L"warm-up",0,0,0,1,1,HWND_MESSAGE,nullptr,GetModuleHandleW(nullptr),nullptr);
+        CHECK(window!=nullptr);
+        if(window)DestroyWindow(window);
+        audio.reset();decoder.reset();
+        CHECK(wait_for_named_process_count(L"ffmpeg.exe",beforeProcesses,kChildExitWait));
+    });
+    DWORD afterHandles=0;
+    auto preparedDecoder=VideoDecoderTestAccess::Create(fixture.directory);
+    auto preparedAudio=AudioPlayerTestAccess::Create(fixture.directory);
+    CHECK(preparedDecoder->Open(L"https://media.invalid/hold",MediaSourceKind::YouTube));
+    CHECK(preparedAudio->Start(L"https://media.invalid/audiohold",9.0,AudioStartState::Paused));
+    CHECK(wait_for_named_process_count(L"ffmpeg.exe",beforeProcesses+2,
+                                       kChildExitWait));
+
+    ActivePlayback active;
+    const ActivePlayback before=active;
+    HWND candidateWindow=nullptr;
+    bool candidateDestroyed=false;
+    bool commitCalled=false;
+    const bool committed=ExecuteNetworkCandidateTransaction<Candidate>(
+        [&]{
+            candidateWindow=CreateWindowExW(0,L"STATIC",L"candidate",0,0,0,1,1,
+                                             HWND_MESSAGE,nullptr,GetModuleHandleW(nullptr),nullptr);
+            HANDLE event=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+            CHECK(candidateWindow!=nullptr);CHECK(event!=nullptr);
+            return std::make_unique<Candidate>(candidateWindow,event,false,&candidateDestroyed);
+        },
+        [&](Candidate& candidate){return candidate.renderFirst;},
+        [&](std::unique_ptr<Candidate>){
+            commitCalled=true;active={11,21,31,3,false,90000000};
+            preparedAudio.reset();preparedDecoder.reset();
+        });
+    CHECK(!committed);
+    CHECK(!commitCalled);
+    CHECK_EQ(before,active);
+    CHECK(candidateDestroyed);
+    CHECK(candidateWindow!=nullptr);
+    CHECK(!IsWindow(candidateWindow));
+
+    preparedAudio.reset();
+    preparedDecoder.reset();
+    CHECK(wait_for_named_process_count(L"ffmpeg.exe",beforeProcesses,
+                                       kChildExitWait));
+    const auto handlesDeadline=std::chrono::steady_clock::now()+std::chrono::seconds{1};
+    do{
+        CHECK(GetProcessHandleCount(GetCurrentProcess(),&afterHandles)!=FALSE);
+        if(afterHandles<=beforeHandles+2)break;
+        Sleep(5);
+    }while(std::chrono::steady_clock::now()<handlesDeadline);
+    CHECK(afterHandles<=beforeHandles+2);
+}
+
+bool wait_for_file(const std::filesystem::path& path, std::chrono::milliseconds limit)
+{
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    std::error_code error;
+    do {
+        if (std::filesystem::exists(path, error)) return !error;
+        if (error) return false;
+        Sleep(10);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+void youtube_resolver_success_uses_beside_app_helpers_and_exact_child_arguments_test()
+{
+    ResolverFixture fixture;
+    auto resolver = YouTubeResolverTestAccess::Create(fixture.directory);
+    const ResolveResult result = resolver->Resolve(
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ&list=PL123&success", {});
+
+    CHECK(result.ok);
+    CHECK_EQ(ResolveError::None, result.error);
+    CHECK_EQ(std::wstring(L"https://r1.googlevideo.com/videoplayback?id=success"),
+             result.mediaUrl);
+    CHECK_EQ(std::wstring(L"https://r1.googlevideo.com/videoplayback?id=success-audio"),
+             result.audioUrl);
+    CHECK_EQ(167.0, result.durationSeconds);
+    CHECK(result.detail.empty());
+}
+
+// P1.6: yt-dlp's stderr shared stdout's pipe, and the parser accepts only the
+// metadata and URL lines, so one Python warning turned a good run into
+// "invalid output" - here 2000 of them would also have overrun stdout's cap.
+// stderr now has its own pipe, is drained alongside, and is logged bounded.
+void youtube_resolver_keeps_stderr_out_of_the_answer_and_logs_it_test()
+{
+    ResolverFixture fixture;
+    auto resolver = YouTubeResolverTestAccess::Create(fixture.directory, std::chrono::seconds{10});
+    const ResolveResult result = resolver->Resolve(
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ&stderrnoise", {});
+    CHECK(result.ok);
+    CHECK_EQ(std::wstring(L"https://r1.googlevideo.com/videoplayback?id=noisy"), result.mediaUrl);
+    CHECK_EQ(std::wstring(L"https://r1.googlevideo.com/videoplayback?id=noisy-audio"), result.audioUrl);
+    const std::string& logged = YouTubeResolverTestAccess::LastStderrSummary(*resolver);
+    CHECK(logged.starts_with("WARNING: [youtube] a Python warning, line 0 ??? noise | "
+                             "WARNING: [youtube] a Python warning, line 1 "));
+    CHECK(logged.find(" more bytes)") != std::string::npos);
+    CHECK(logged.size() < 4096 + 4096 / 2 + 64);
+
+    CHECK_EQ(std::string("a | b | c?"), SummarizeResolverStderr("a\r\nb\n\nc\xff\n", 9));
+    CHECK_EQ(std::string("x ... (5 more bytes)"), SummarizeResolverStderr("x", 6));
+    CHECK(SummarizeResolverStderr("\r\n", 2).empty());
+    CHECK(SummarizeResolverStderr({}, 0).empty());
+
+    // A quiet run leaves nothing to log.
+    const ResolveResult quiet = resolver->Resolve(
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ&success", {});
+    CHECK(quiet.ok);
+    CHECK(YouTubeResolverTestAccess::LastStderrSummary(*resolver).empty());
+}
+
+void youtube_resolver_waits_until_both_selected_streams_are_available_test()
+{
+    ResolverFixture fixture;
+    auto resolver = YouTubeResolverTestAccess::Create(fixture.directory, std::chrono::seconds{5});
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto ready = now + 2;
+    const auto url = L"https://youtu.be/dQw4w9WgXcQ?availability_" + std::to_wstring(now + 1) +
+        L"_" + std::to_wstring(ready);
+    const auto result = resolver->Resolve(url, {});
+    CHECK(result.ok);
+    CHECK(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count() >= ready);
+}
+
+void youtube_resolver_availability_wait_is_cancellable_and_deadline_bounded_test()
+{
+    ResolverFixture fixture;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto url = L"https://youtu.be/dQw4w9WgXcQ?availability_" + std::to_wstring(now + 10) + L"_0";
+    auto bounded = YouTubeResolverTestAccess::Create(fixture.directory, std::chrono::milliseconds{150});
+    CHECK_EQ(ResolveError::TimedOut, bounded->Resolve(url, {}).error);
+    const auto marker = fixture.directory / L"availability-ready.marker";
+    std::filesystem::remove(marker);
+    for (const bool explicitCancel : {false, true}) {
+        auto resolver = YouTubeResolverTestAccess::Create(fixture.directory, std::chrono::seconds{5});
+        const auto beforeHelpers = count_named_processes(L"yt-dlp.exe");
+        ResolveResult result;
+        std::jthread worker([&](std::stop_token stop) { result = resolver->Resolve(url, stop); });
+        CHECK(wait_for_file(marker, std::chrono::seconds{2}));
+        // The extractor has exited: cancellation must still interrupt the
+        // resolver's availability wait, independently of its child-process loop.
+        const auto childDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (count_named_processes(L"yt-dlp.exe") != beforeHelpers &&
+               std::chrono::steady_clock::now() < childDeadline) Sleep(10);
+        CHECK_EQ(beforeHelpers, count_named_processes(L"yt-dlp.exe"));
+        if (explicitCancel) resolver->Cancel(); else worker.request_stop();
+        worker.join();
+        CHECK_EQ(ResolveError::Cancelled, result.error);
+        CHECK(result.mediaUrl.empty());
+        CHECK(result.audioUrl.empty());
+        std::filesystem::remove(marker);
+    }
+}
+
+void youtube_resolver_waits_for_fractional_stream_availability_test()
+{
+    ResolverFixture fixture;
+    auto resolver = YouTubeResolverTestAccess::Create(fixture.directory, std::chrono::seconds{5});
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto ready = now + 1;
+    const auto result = resolver->Resolve(
+        L"https://youtu.be/dQw4w9WgXcQ?availability_0_" + std::to_wstring(ready) + L"_fraction", {});
+    CHECK(result.ok);
+    CHECK(std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count()
+          >= static_cast<double>(ready) + 0.5);
+}
+
+void resolver_output_validates_stream_availability_metadata_test()
+{
+    for (const auto suffix : {";video_available_at=1788425759;audio_available_at=1788425760",
+                               ";video_available_at=1788425759.5;audio_available_at=1788425760.25",
+                               ";video_available_at=0;audio_available_at=0"}) {
+        CHECK(ParseResolverOutput(std::string("duration=167;live_status=not_live") + suffix +
+            "\nhttps://v.googlevideo.com/video\n", 0).ok);
+    }
+    for (const auto suffix : {";video_available_at=-1;audio_available_at=0",
+                               ";video_available_at=nan;audio_available_at=0",
+                               ";video_available_at=inf;audio_available_at=0",
+                               ";video_available_at=253402300800;audio_available_at=0",
+                               ";video_available_at=18446744073709551616;audio_available_at=0",
+                               ";video_available_at=1;audio_available_at=",
+                               ";video_available_at=1;audio_available_at=0;extra=1",
+                               ";video_available_at=1", ";audio_available_at=1"}) {
+        CHECK_EQ(ResolveError::InvalidOutput, ParseResolverOutput(
+            std::string("duration=167;live_status=not_live") + suffix +
+            "\nhttps://v.googlevideo.com/video\n", 0).error);
+    }
+    CHECK_EQ(int64_t{1788425761}, ParseResolverOutput(
+        "duration=167;live_status=not_live;video_available_at=1788425759.5;audio_available_at=1788425760.25"
+        "\nhttps://v.googlevideo.com/video\n", 0).availableAtUnixSeconds);
+}
+
+void youtube_resolver_requires_duration_metadata_before_acquisition_test()
+{
+    ResolverFixture fixture;
+    auto resolver = YouTubeResolverTestAccess::Create(fixture.directory);
+    for (const auto url : {L"https://youtu.be/dQw4w9WgXcQ?missingduration",
+                           L"https://youtu.be/dQw4w9WgXcQ?unknownduration",
+                           L"https://youtu.be/dQw4w9WgXcQ?liveduration"}) {
+        const auto result = resolver->Resolve(url, {});
+        CHECK(!result.ok);
+        CHECK_EQ(ResolveError::InvalidOutput, result.error);
+        CHECK(result.mediaUrl.empty());
+        CHECK(result.audioUrl.empty());
+        CHECK_EQ(0.0, result.durationSeconds);
+        CHECK(result.detail.find(L"http") == std::wstring::npos);
+    }
+}
+
+void youtube_resolver_reports_missing_and_unstartable_helpers_without_sensitive_data_test()
+{
+    const std::filesystem::path missingDirectory =
+        process_temp_path(L"PolicyTests-resolver-missing");
+    std::error_code error;
+    std::filesystem::remove_all(missingDirectory, error);
+    auto missingResolver = YouTubeResolverTestAccess::Create(missingDirectory);
+    const ResolveResult missing = missingResolver->Resolve(
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ&secret_missing", {});
+    CHECK(!missing.ok);
+    CHECK_EQ(ResolveError::HelperMissing, missing.error);
+    CHECK(missing.mediaUrl.empty());
+    CHECK(missing.detail.find(L"secret_missing") == std::wstring::npos);
+
+    ResolverFixture corruptFixture(false);
+    auto corruptResolver = YouTubeResolverTestAccess::Create(corruptFixture.directory);
+    const ResolveResult corrupt = corruptResolver->Resolve(
+        L"https://youtube.com/watch?v=dQw4w9WgXcQ&secret_start", {});
+    CHECK(!corrupt.ok);
+    CHECK_EQ(ResolveError::StartFailed, corrupt.error);
+    CHECK(corrupt.mediaUrl.empty());
+    CHECK(corrupt.detail.find(L"secret_start") == std::wstring::npos);
+}
+
+void youtube_resolver_maps_nonzero_exit_and_output_overflow_precisely_test()
+{
+    ResolverFixture fixture;
+    auto resolver = YouTubeResolverTestAccess::Create(fixture.directory);
+
+    const ResolveResult nonzero = resolver->Resolve(
+        L"https://youtu.be/dQw4w9WgXcQ?nonzero", {});
+    CHECK(!nonzero.ok);
+    CHECK_EQ(ResolveError::ExtractionFailed, nonzero.error);
+    CHECK(nonzero.mediaUrl.empty());
+
+    const ResolveResult exactCaptureLimit = resolver->Resolve(
+        L"https://youtu.be/dQw4w9WgXcQ?cap64", {});
+    CHECK(!exactCaptureLimit.ok);
+    CHECK_EQ(ResolveError::InvalidOutput, exactCaptureLimit.error);
+
+    const ResolveResult overflow = resolver->Resolve(
+        L"https://youtu.be/dQw4w9WgXcQ?cap64plus", {});
+    CHECK(!overflow.ok);
+    CHECK_EQ(ResolveError::OutputTooLarge, overflow.error);
+    CHECK(overflow.mediaUrl.empty());
+    CHECK(overflow.detail.find(L"https") == std::wstring::npos);
+}
+
+void youtube_resolver_honors_stop_token_and_explicit_cancel_with_bounded_wait_test()
+{
+    ResolverFixture fixture;
+    auto resolver = YouTubeResolverTestAccess::Create(
+        fixture.directory, std::chrono::seconds{5});
+
+    ResolveResult stopped;
+    const auto stopStarted = std::chrono::steady_clock::now();
+    std::jthread stopWorker([&](std::stop_token token) {
+        stopped = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", token);
+    });
+    Sleep(75);
+    stopWorker.request_stop();
+    stopWorker.join();
+    const auto stopElapsed = std::chrono::steady_clock::now() - stopStarted;
+    CHECK_EQ(ResolveError::Cancelled, stopped.error);
+    CHECK(stopElapsed < std::chrono::seconds{2});
+
+    ResolveResult cancelled;
+    const auto cancelStarted = std::chrono::steady_clock::now();
+    std::thread cancelWorker([&] {
+        cancelled = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", {});
+    });
+    Sleep(75);
+    resolver->Cancel();
+    cancelWorker.join();
+    const auto cancelElapsed = std::chrono::steady_clock::now() - cancelStarted;
+    CHECK_EQ(ResolveError::Cancelled, cancelled.error);
+    CHECK(cancelElapsed < std::chrono::seconds{2});
+
+    resolver->Cancel();
+    const ResolveResult afterCancel = resolver->Resolve(
+        L"https://youtu.be/dQw4w9WgXcQ?success", {});
+    CHECK(afterCancel.ok);
+}
+
+void youtube_resolver_times_out_and_kills_its_descendant_job_tree_test()
+{
+    ResolverFixture fixture;
+    const std::wstring suffix = std::to_wstring(GetCurrentProcessId());
+    const std::filesystem::path marker = std::filesystem::temp_directory_path() /
+        (L"PolicyTests-resolver-descendant-" + suffix + L".pid");
+    remove_file_if_present(marker);
+
+    auto resolver = YouTubeResolverTestAccess::Create(
+        fixture.directory, std::chrono::milliseconds{350});
+    const auto started = std::chrono::steady_clock::now();
+    const ResolveResult result = resolver->Resolve(
+        L"https://youtu.be/dQw4w9WgXcQ?descendant_" + suffix, {});
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    CHECK(!result.ok);
+    CHECK_EQ(ResolveError::TimedOut, result.error);
+    CHECK(elapsed < std::chrono::seconds{2});
+    const bool markerExists = wait_for_file(marker, std::chrono::milliseconds{250});
+    CHECK(markerExists);
+    if (!markerExists) return;
+
+    const std::string pidText = read_binary_file(marker);
+    CHECK(!pidText.empty());
+    if (pidText.empty()) return;
+    const DWORD descendantPid = static_cast<DWORD>(std::stoul(pidText));
+    HANDLE descendant = OpenProcess(SYNCHRONIZE, FALSE, descendantPid);
+    if (descendant) {
+        CHECK_EQ(static_cast<DWORD>(WAIT_OBJECT_0), WaitForSingleObject(descendant, 1000));
+        CloseHandle(descendant);
+    }
+    remove_file_if_present(marker);
+}
+
+void youtube_resolver_repeated_runs_leave_process_handle_count_stable_test()
+{
+    ResolverFixture fixture;
+    auto resolver = YouTubeResolverTestAccess::Create(fixture.directory);
+    const DWORD before = handle_count_after_warm_up([&] {
+        CHECK(resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?success", {}).ok);
+    });
+    DWORD after = 0;
+    for (int run = 0; run < 20; ++run) {
+        const ResolveResult result = resolver->Resolve(
+            L"https://youtu.be/dQw4w9WgXcQ?success", {});
+        CHECK(result.ok);
+    }
+    CHECK(GetProcessHandleCount(GetCurrentProcess(), &after) != FALSE);
+    CHECK(after <= before + 2);
+}
+
+int run_fake_media_child(int argc,wchar_t* argv[])
+{
+    const std::wstring name=current_test_executable().filename().wstring();std::wstring all;
+    for(int index=1;index<argc;++index){all+=L" ";all+=argv[index];}
+    if(_wcsicmp(name.c_str(),L"ffprobe.exe")==0){
+        if(all.find(L"durationtag_")!=std::wstring::npos){
+            std::cout << "width=2\nheight=2\navg_frame_rate=30/1\nr_frame_rate=30/1\n";
+            std::cout << (all.find(L"durationtag_mp4")!=std::wstring::npos ? "duration=1.25\n" : "duration=N/A\n");
+            if(all.find(L"stream_tags=DURATION")!=std::wstring::npos){
+                std::string_view tag = "N/A";
+                if(all.find(L"durationtag_valid")!=std::wstring::npos)tag="00:00:01.000000000";
+                else if(all.find(L"durationtag_fractional")!=std::wstring::npos)tag="01:02:03.250000000";
+                else if(all.find(L"durationtag_badminute")!=std::wstring::npos)tag="00:60:01.0";
+                else if(all.find(L"durationtag_badsecond")!=std::wstring::npos)tag="00:00:60.0";
+                else if(all.find(L"durationtag_negative")!=std::wstring::npos)tag="00:00:-1.0";
+                else if(all.find(L"durationtag_nonfinite")!=std::wstring::npos)tag="00:00:nan";
+                else if(all.find(L"durationtag_trailing")!=std::wstring::npos)tag="00:00:01.0junk";
+                else if(all.find(L"durationtag_overflow")!=std::wstring::npos)tag="999999999999999999999999999999:00:01.0";
+                else if(all.find(L"durationtag_zero")!=std::wstring::npos)tag="00:00:00.000000000";
+                std::cout << "TAG:DURATION=" << tag << '\n';
+            }
+            std::cout << "duration=3.000\n" << std::flush;
+            return 0;
+        }
+        if(all.find(L"holdprobe")!=std::wstring::npos){Sleep(INFINITE);return 0;}
+        // ffprobe prints a colour entry only when -show_entries asked for it, and this
+        // stub does the same: a scenario below whose colour decision comes out right is
+        // therefore proof that the decoder requested the four entries in the SAME
+        // invocation that produced the geometry, which is the one ffprobe child an open
+        // is allowed to spend.
+        const bool colorAsked=all.find(L"color_space")!=std::wstring::npos&&
+                              all.find(L"color_range")!=std::wstring::npos&&
+                              all.find(L"color_primaries")!=std::wstring::npos&&
+                              all.find(L"color_transfer")!=std::wstring::npos;
+        const auto color=[&](const char* space,const char* range,const char* primaries,
+                             const char* transfer){
+            if(!colorAsked)return std::string{};
+            return std::string("color_space=")+space+"\ncolor_range="+range+
+                   "\ncolor_primaries="+primaries+"\ncolor_transfer="+transfer+"\n";
+        };
+        const auto geometry=[](unsigned w,unsigned h,const char* dar,const char* duration="30"){
+            return "width="+std::to_string(w)+"\nheight="+std::to_string(h)+
+                   "\ndisplay_aspect_ratio="+dar+
+                   "\nsample_aspect_ratio=1:1\navg_frame_rate=30/1\nr_frame_rate=30/1\nduration="+
+                   duration+"\n";
+        };
+        // largeburst and drainexit are sequential opens whose subject is the frame
+        // queue, so they declare BT.709 limited range: the frames they are about have
+        // to be the NV12 ones, and only a declared description gets those.
+        // Spacing scenarios for ConstantFrameRate(). The packet probe is a
+        // second ffprobe invocation, so serving it from the same stub is what
+        // proves the decoder actually asks for the timestamps rather than
+        // trusting the two rates it already has.
+        if(all.find(L"vfrspacing_")!=std::wstring::npos){
+            const bool capture=all.find(L"vfrspacing_capture")!=std::wstring::npos;
+            const bool nopackets=all.find(L"vfrspacing_nopackets")!=std::wstring::npos;
+            if(all.find(L"packet=pts_time")!=std::wstring::npos){
+                if(nopackets){std::cout<<std::flush;return 0;}
+                // A B-frame film: packets listed in decode order (0,3,1,2,6,4,5,...
+                // periods), as many as the -read_intervals count asked for.
+                if(all.find(L"vfrspacing_bframes")!=std::wstring::npos){
+                    size_t count=0;
+                    const size_t at=all.find(L"%+#");
+                    if(at!=std::wstring::npos)try{count=std::stoul(all.substr(at+3));}catch(...){}
+                    std::vector<int> order{0};
+                    for(int anchor=3;order.size()<count;anchor+=3){order.push_back(anchor);order.push_back(anchor-2);order.push_back(anchor-1);}
+                    order.resize(count);
+                    for(const int shown:order)std::cout<<"pts_time="<<std::to_string(double(shown)/24.0)<<'\n';
+                    std::cout<<std::flush;return 0;
+                }
+                double now=0.0;
+                for(int index=0;index<120;++index){
+                    std::cout<<"pts_time="<<std::to_string(now)<<'\n';
+                    now+=capture?((index%7==0)?3.0/60.0:1.0/60.0):(1.0/24.0);
+                }
+                std::cout<<std::flush;return 0;
+            }
+            std::cout<<"width=640\nheight=360\ndisplay_aspect_ratio=16:9\nsample_aspect_ratio=1:1\n"
+                     <<(capture?"avg_frame_rate=60/1\nr_frame_rate=60/1\n"
+                               :"avg_frame_rate=23/1\nr_frame_rate=24/1\n")
+                     <<"duration=5\n"<<color("bt709","tv","bt709","bt709")<<std::flush;
+            return 0;
+        }
+        // A track that starts after the container: the MKV with video at
+        // 0.0 s and audio at 0.5 s that played its audio early (P1.25).
+        if(all.find(L"lateaudio_")!=std::wstring::npos){
+            if(all.find(L"stream_disposition")==std::wstring::npos)return 0;
+            std::cout<<"[STREAM]\nindex=1\ncodec_name=aac\nchannels=2\nsample_rate=48000\n"
+                     <<(all.find(L"lateaudio_unknown")!=std::wstring::npos?"start_time=N/A\n":"start_time=1.500000\n")
+                     <<"DISPOSITION:default=1\n[/STREAM]\n[FORMAT]\nstart_time=1.000000\n[/FORMAT]\n"<<std::flush;
+            return 0;
+        }
+        // Audio track enumeration. Two English tracks with the commentary
+        // listed first and flagged default, which is the disc-rip layout that
+        // made the old first-stream rule play the wrong one.
+        if(all.find(L"trackpick_")!=std::wstring::npos){
+            if(all.find(L"stream_disposition")==std::wstring::npos)return 0;
+            const auto stream=[](int index,const char* codec,int channels,const char* language,
+                                 const char* title,int isDefault,int comment){
+                std::string text="[STREAM]\nindex="+std::to_string(index)+"\ncodec_name="+codec+
+                                 "\nchannels="+std::to_string(channels)+"\nsample_rate=48000\n";
+                if(*language)text+=std::string("TAG:language=")+language+"\n";
+                if(*title)text+=std::string("TAG:title=")+title+"\n";
+                text+="DISPOSITION:default="+std::to_string(isDefault)+
+                      "\nDISPOSITION:comment="+std::to_string(comment)+
+                      "\nDISPOSITION:visual_impaired=0\nDISPOSITION:descriptions=0"
+                      "\nDISPOSITION:hearing_impaired=0\n[/STREAM]\n";
+                return text;
+            };
+            std::cout<<stream(1,"ac3",6,"eng","Director's Commentary",1,1)
+                     <<stream(2,"ac3",6,"eng","",0,0)<<std::flush;
+            return 0;
+        }
+        if(all.find(L"largeburst")!=std::wstring::npos){
+            std::cout<<geometry(1024,1024,"1:1")<<color("bt709","tv","bt709","bt709")<<std::flush;return 0;
+        }
+        if(all.find(L"stderrcase_probefails")!=std::wstring::npos){
+            std::cerr<<"probefails: No such file or directory (probe-marker)\n"<<std::flush;return 1;
+        }
+        if(all.find(L"stderrcase_diesend")!=std::wstring::npos){std::cout<<geometry(2,2,"1:1","0.1")<<std::flush;return 0;}
+        if(all.find(L"stderrcase_chatty")!=std::wstring::npos){std::cout<<geometry(2,2,"1:1","0.166667")<<std::flush;return 0;}
+        // A browser-recorded WebM: no duration anywhere.
+        if(all.find(L"noduration")!=std::wstring::npos){
+            std::cout<<"width=2\nheight=2\ndisplay_aspect_ratio=1:1\nsample_aspect_ratio=1:1\navg_frame_rate=30/1\nr_frame_rate=30/1\nduration=N/A\n"<<std::flush;return 0;
+        }
+        // Declared geometry at and past the ceilings a header is held to.
+        if(all.find(L"geomcap_")!=std::wstring::npos){
+            if(all.find(L"geomcap_huge")!=std::wstring::npos)std::cout<<geometry(20000,20000,"1:1");
+            else if(all.find(L"geomcap_pixels")!=std::wstring::npos)std::cout<<geometry(16384,8704,"32:17");
+            else if(all.find(L"geomcap_8k")!=std::wstring::npos)std::cout<<geometry(8192,4320,"256:135");
+            else if(all.find(L"geomcap_photo")!=std::wstring::npos)
+                std::cout<<"width=16320\nheight=12240\nformat_name=image2\ndisplay_aspect_ratio=4:3\n";
+            std::cout<<std::flush;return 0;
+        }
+        if(all.find(L"drainexit")!=std::wstring::npos){
+            std::cout<<geometry(1920,1080,"16:9","0.034")<<color("bt709","tv","bt709","bt709")<<std::flush;return 0;
+        }
+        if(all.find(L"partialend")!=std::wstring::npos){
+            std::cout<<geometry(2,2,"1:1","0.067")<<std::flush;return 0;
+        }
+        // Stored 4x2 with a display matrix, printed the way ffprobe prints it and only
+        // when -show_entries asked for it in the same invocation as the geometry.
+        // turned_quarter and turned_fallback are the -display_rotation 90 matrix,
+        // turned_half the 180 one.
+        if(all.find(L"turned_")!=std::wstring::npos){
+            std::cout<<geometry(4,2,"2:1")<<color("bt709","tv","bt709","bt709");
+            if(all.find(L"stream_side_data=displaymatrix")!=std::wstring::npos){
+                std::cout<<"displaymatrix=\n";
+                if(all.find(L"turned_half")!=std::wstring::npos)
+                    std::cout<<"00000000:       -65536           0           0\n"
+                               "00000001:            0      -65536           0\n";
+                else
+                    std::cout<<"00000000:            0      -65536           0\n"
+                               "00000001:        65536           0           0\n";
+                std::cout<<"00000002:            0           0  1073741824\n\n";
+            }
+            std::cout<<std::flush;return 0;
+        }
+        // Even geometry AND a declared colour description the GPU conversion implements:
+        // OpenSequential can pick NV12 here.
+        if(all.find(L"nv12geom")!=std::wstring::npos){
+            std::cout<<geometry(4,2,"2:1")<<color("bt709","tv","bt709","bt709")<<std::flush;return 0;
+        }
+        // Even geometry, nothing declared. NV12 would hand the shader a frame whose
+        // matrix and range it would have to guess, so OpenSequential must stay BGRA.
+        if(all.find(L"colortag_none")!=std::wstring::npos){
+            std::cout<<geometry(4,2,"2:1")<<color("unknown","unknown","unknown","unknown")<<std::flush;return 0;
+        }
+        // Even geometry, BT.601 full range - a description the conversion does have
+        // coefficients for, so NV12 is allowed and the shader is specialised for it.
+        // Printed colour-first, because ffprobe emits entries in its own order and the
+        // decoder's parse composes the description only once all four are in hand.
+        if(all.find(L"colortag_bt601full")!=std::wstring::npos){
+            std::cout<<color("bt470bg","pc","bt470bg","smpte170m")<<geometry(4,2,"2:1")<<std::flush;return 0;
+        }
+        // Even geometry, fully declared, and declared as something the conversion has no
+        // coefficients for. Declared-but-unhandled refuses exactly like undeclared.
+        if(all.find(L"colortag_bt2020")!=std::wstring::npos){
+            std::cout<<color("bt2020nc","tv","bt2020","smpte2084")<<geometry(4,2,"2:1")<<std::flush;return 0;
+        }
+        // HDR sources for the tone map. The side-data probe is a second ffprobe
+        // call; each scenario answers it with the static metadata it names.
+        if(all.find(L"hdrsrc_")!=std::wstring::npos){
+            if(all.find(L"frame_side_data")!=std::wstring::npos){
+                if(all.find(L"hdrsrc_pqmeta")!=std::wstring::npos)std::cout<<"max_luminance=40000000/10000\nmax_content=1000\n";
+                else if(all.find(L"hdrsrc_pqmastering")!=std::wstring::npos)std::cout<<"max_luminance=40000000/10000\nmax_content=0\n";
+                std::cout<<std::flush;return 0;
+            }
+            const char* transfer=all.find(L"hdrsrc_hlg")!=std::wstring::npos?"arib-std-b67":"smpte2084";
+            const char* matrix=all.find(L"hdrsrc_pq709")!=std::wstring::npos?"bt709":
+                               all.find(L"hdrsrc_pqnomatrix")!=std::wstring::npos?"unknown":"bt2020nc";
+            std::cout<<color(matrix,"tv","bt2020",transfer)<<geometry(4,2,"2:1")<<std::flush;return 0;
+        }
+        if(all.find(L"colortag_hlg")!=std::wstring::npos){
+            std::cout<<color("bt2020nc","tv","bt2020","arib-std-b67")<<geometry(4,2,"2:1")<<std::flush;return 0;
+        }
+        // Odd geometry: NV12's half-resolution UV plane needs even dimensions, so
+        // OpenSequential must stay BGRA here even though it prefers NV12 - and the
+        // colour description is the one the conversion likes best, so only the geometry
+        // can be what refused it.
+        if(all.find(L"oddgeom")!=std::wstring::npos){
+            std::cout<<geometry(3,3,"1:1")<<color("bt709","tv","bt709","bt709")<<std::flush;return 0;
+        }
+        std::cout<<"width=2\nheight=2\ndisplay_aspect_ratio=1:1\nsample_aspect_ratio=1:1\navg_frame_rate=30/1\nr_frame_rate=30/1\nduration=30\n"<<std::flush;return 0;
+    }
+    if(_wcsicmp(name.c_str(),L"ffmpeg.exe")!=0)return 94;
+    // The decode command line, for a test that asserts what the decoder asked
+    // ffmpeg to do rather than what this fake produced.
+    if(const std::wstring argsMarker=read_environment_variable(L"DLSS_VIDEO_TEST_ARGS_MARKER");!argsMarker.empty()){
+        std::string narrow;for(const wchar_t character:all)narrow.push_back(character<0x80?static_cast<char>(character):'?');
+        std::ofstream out(argsMarker,std::ios::binary|std::ios::app);out<<narrow<<"\n";
+    }
+    // The audio child failing after flooding stderr: 256 KiB, four times the
+    // pipe, so a parent that did not drain as it went would leave this child
+    // blocked in WriteFile for good. The last line names the input, which is
+    // how the test finds its own line in a shared log.
+    if(all.find(L"audiostderr_")!=std::wstring::npos){
+        const HANDLE error=GetStdHandle(STD_ERROR_HANDLE);
+        std::string flood(1024,'x');flood.back()='\n';
+        for(int block=0;block<256;++block){DWORD written=0;if(!WriteFile(error,flood.data(),DWORD(flood.size()),&written,nullptr))return 5;}
+        std::string last="[fake ffmpeg] decode failed:";
+        for(const wchar_t character:all)last.push_back(character<0x80?static_cast<char>(character):'?');
+        last+="\n";
+        DWORD written=0;WriteFile(error,last.data(),DWORD(last.size()),&written,nullptr);
+        return 3;
+    }
+    // Mirrors FrameBytes(layout,w,h): OpenSequential's NV12 request shows up here as
+    // `-pix_fmt nv12` on the command line, and the raw frame this fake child writes
+    // has to match it exactly or the decoder's frameBytes-sized reads never complete.
+    const bool nv12Requested=all.find(L"-pix_fmt nv12")!=std::wstring::npos;
+    // And the decoder's own HDR tone map asks for P010: two bytes a sample, the
+    // chroma plane at half resolution, three bytes a pixel.
+    const bool p010Requested=all.find(L"-pix_fmt p010le")!=std::wstring::npos;
+    const auto rawFrameBytes=[nv12Requested,p010Requested](size_t w,size_t h){
+        return nv12Requested?w*h*3u/2u:p010Requested?w*h*3u:w*h*4u;
+    };
+    // Frames of the upright shape: 2x4 for the quarter turns, 4x2 for the half
+    // turn. turned_fallback refuses both hardware paths, as a codec neither
+    // decodes would.
+    if(all.find(L"turned_")!=std::wstring::npos){
+        if(all.find(L"turned_fallback")!=std::wstring::npos&&all.find(L"-hwaccel")!=std::wstring::npos)return 7;
+        const bool half=all.find(L"turned_half")!=std::wstring::npos;
+        const std::vector<char> frame(half?rawFrameBytes(4,2):rawFrameBytes(2,4),'t');
+        std::cout.write(frame.data(),static_cast<std::streamsize>(frame.size()));std::cout.flush();return 0;
+    }
+    if(all.find(L"nv12geom")!=std::wstring::npos){
+        const std::vector<char> frame(rawFrameBytes(4,2),'n');
+        std::cout.write(frame.data(),static_cast<std::streamsize>(frame.size()));std::cout.flush();return 0;
+    }
+    if(all.find(L"hdrsrc_")!=std::wstring::npos){
+        const std::vector<char> frame(rawFrameBytes(4,2),'h');
+        std::cout.write(frame.data(),static_cast<std::streamsize>(frame.size()));std::cout.flush();return 0;
+    }
+    // Every colortag_ scenario shares nv12geom's 4x2 geometry; only the declared
+    // colour differs, so the layout each one ends up with is attributable to that
+    // alone.
+    if(all.find(L"colortag_")!=std::wstring::npos){
+        const std::vector<char> frame(rawFrameBytes(4,2),'c');
+        std::cout.write(frame.data(),static_cast<std::streamsize>(frame.size()));std::cout.flush();return 0;
+    }
+    if(all.find(L"oddgeom")!=std::wstring::npos){
+        const std::vector<char> frame(rawFrameBytes(3,3),'o');
+        std::cout.write(frame.data(),static_cast<std::streamsize>(frame.size()));std::cout.flush();return 0;
+    }
+    if(all.find(L"hardwarefallback")!=std::wstring::npos){
+        const std::wstring marker=read_environment_variable(L"DLSS_VIDEO_TEST_ACCEL_MARKER");
+        const bool cuda=all.find(L"-hwaccel cuda")!=std::wstring::npos;
+        const bool d3d11=all.find(L"-hwaccel d3d11va")!=std::wstring::npos;
+        const bool delayedExit=all.find(L"hardwarefallbackdelayedexit")!=std::wstring::npos;
+        if(!marker.empty()){std::ofstream out(marker,std::ios::binary|std::ios::app);out<<(cuda?"cuda\n":d3d11?"d3d11va\n":"software\n");}
+        if(cuda||d3d11){if(delayedExit){CloseHandle(GetStdHandle(STD_OUTPUT_HANDLE));Sleep(75);}return 7;}
+        std::cout.write("1234567890abcdef",16);std::cout.flush();return 0;
+    }
+    if(all.find(L"seekreuse")!=std::wstring::npos){
+        // 2x2 BGRA at 30fps, every frame stamped with its absolute source index
+        // so a caller can tell exactly which frame it was handed. Writes go
+        // through the handle: the CRT's text mode would rewrite 0x0A bytes.
+        double seekSeconds=0.0;
+        const size_t at=all.find(L"-ss ");
+        if(at!=std::wstring::npos)try{seekSeconds=std::stod(all.substr(at+4));}catch(...){}
+        uint32_t index=static_cast<uint32_t>(std::llround(seekSeconds*30.0));
+        const HANDLE out=GetStdHandle(STD_OUTPUT_HANDLE);
+        for(int emitted=0;emitted<3000;++emitted,++index){
+            unsigned char frame[16];
+            for(int byte=0;byte<4;++byte)frame[byte]=static_cast<unsigned char>((index>>(8*byte))&0xFFu);
+            for(int byte=4;byte<16;++byte)frame[byte]=static_cast<unsigned char>(index&0xFFu);
+            DWORD written=0;
+            if(!WriteFile(out,frame,sizeof(frame),&written,nullptr)||written!=sizeof(frame))return 0;
+        }
+        Sleep(INFINITE);return 0;
+    }
+    if(all.find(L"largeburst")!=std::wstring::npos){
+        const std::wstring marker=read_environment_variable(L"DLSS_VIDEO_TEST_FRAME_MARKER");
+        const std::vector<char> frame(rawFrameBytes(1024,1024),'x');
+        for(int index=0;index<20;++index){
+            std::cout.write(frame.data(),static_cast<std::streamsize>(frame.size()));std::cout.flush();
+            if(!marker.empty()){std::ofstream out(marker,std::ios::binary|std::ios::app);out.put('x');}
+        }
+        Sleep(INFINITE);return 0;
+    }
+    if(all.find(L"drainexit")!=std::wstring::npos){
+        const std::wstring marker=read_environment_variable(L"DLSS_VIDEO_TEST_ACCEL_MARKER");
+        if(!marker.empty()){
+            const bool cuda=all.find(L"-hwaccel cuda")!=std::wstring::npos;
+            const bool d3d11=all.find(L"-hwaccel d3d11va")!=std::wstring::npos;
+            std::ofstream out(marker,std::ios::binary|std::ios::app);
+            out<<(cuda?"cuda\n":d3d11?"d3d11va\n":"software\n");
+        }
+        const std::vector<char> frame(rawFrameBytes(1920,1080),'z');
+        std::cout.write(frame.data(),static_cast<std::streamsize>(frame.size()));
+        std::cout.flush();return 0;
+    }
+    // stderr scenarios. Hardware paths refuse at once, so the software child is
+    // the one whose ending is judged. diesmid/diesend write three 2x2 frames
+    // and exit 1 with a reason on stderr - in the middle of a 30 s file and
+    // right at the end of a 0.1 s one. chatty writes far more stderr than a
+    // pipe holds before its frames: nothing may stall on it.
+    if(all.find(L"stderrcase_")!=std::wstring::npos){
+        if(all.find(L"-hwaccel")!=std::wstring::npos){std::cerr<<"hwaccel unavailable in this test\n";return 7;}
+        const HANDLE out=GetStdHandle(STD_OUTPUT_HANDLE);
+        const auto frames=[&](int count){
+            for(int index=0;index<count;++index){
+                unsigned char frame[16]{};frame[0]=static_cast<unsigned char>(index);
+                DWORD written=0;if(!WriteFile(out,frame,sizeof(frame),&written,nullptr))return;
+            }
+        };
+        if(all.find(L"stderrcase_chatty")!=std::wstring::npos){
+            const std::string noise(1024,'n');
+            for(int index=0;index<256;++index)std::cerr<<noise<<'\n';
+            std::cerr<<"chatty-last-line\n"<<std::flush;
+            frames(5);return 0;
+        }
+        frames(3);
+        std::cerr<<"stream 0: Invalid data found when processing input (stderr-marker)\n"<<std::flush;
+        return 1;
+    }
+    if(all.find(L"exit")!=std::wstring::npos)return 7;
+    if(all.find(L"partialend")!=std::wstring::npos){std::cout.write("1234567890abcdef1234567890abcdef12345678",40);std::cout.flush();return 0;}
+    if(all.find(L"stallmid")!=std::wstring::npos){std::cout.write("1234",4);std::cout.flush();Sleep(INFINITE);return 0;}
+    if(all.find(L"trickle")!=std::wstring::npos){std::cout.write("12345678",8);std::cout.flush();Sleep(35);std::cout.write("abcdefgh",8);std::cout.flush();return 0;}
+    Sleep(INFINITE);return 0;
+}
+
+int run_fake_resolver_child(int argc, wchar_t* argv[])
+{
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--resolver-descendant") {
+        write_binary_file(argv[2], std::to_string(GetCurrentProcessId()));
+        Sleep(INFINITE);
+        return 0;
+    }
+    const std::wstring_view requestedUrl = argc > 1 ? std::wstring_view(argv[argc - 1]) : L"";
+    const bool noCacheDir = argc > 2 && std::wstring_view(argv[2]) == L"--no-cache-dir";
+    const bool noPluginDirs = argc > 3 && std::wstring_view(argv[3]) == L"--no-plugin-dirs";
+    if (requestedUrl.find(L"ytcacheaudit") != std::wstring_view::npos && !noCacheDir) {
+        const std::wstring xdgCache = read_environment_variable(L"XDG_CACHE_HOME");
+        if (!xdgCache.empty()) {
+            write_binary_file(std::filesystem::path(xdgCache) / L"yt-dlp-default.marker",
+                              "default-cache-write");
+        }
+    }
+    if (requestedUrl.find(L"pluginaudit") != std::wstring_view::npos && !noPluginDirs) {
+        const std::wstring xdgConfig = read_environment_variable(L"XDG_CONFIG_HOME");
+        if (!xdgConfig.empty()) {
+            const std::filesystem::path pluginDirectory =
+                std::filesystem::path(xdgConfig) / L"yt-dlp" / L"plugins";
+            const std::filesystem::path pluginSource = pluginDirectory / L"exec-on-import.plugin";
+            std::error_code pluginError;
+            if (std::filesystem::is_regular_file(pluginSource, pluginError) && !pluginError) {
+                write_binary_file(pluginDirectory / L"default-plugin-executed.marker",
+                                  "default-plugin-executed");
+            }
+        }
+    }
+    if (argc != 18 || std::wstring_view(argv[1]) != L"--no-config" ||
+        std::wstring_view(argv[2]) != L"--no-cache-dir" ||
+        std::wstring_view(argv[3]) != L"--no-plugin-dirs" ||
+        std::wstring_view(argv[4]) != L"--no-playlist" ||
+        std::wstring_view(argv[5]) != L"--no-warnings" ||
+        std::wstring_view(argv[6]) != L"--js-runtimes" ||
+        !std::wstring_view(argv[7]).starts_with(L"deno:") ||
+        std::wstring_view(argv[8]) != L"-f" ||
+        std::wstring_view(argv[9]) != YouTubeFormatSelector(YouTubeSourceQuality::Auto) ||
+        std::wstring_view(argv[10]) != L"--format-sort-force" ||
+        std::wstring_view(argv[11]) != L"-S" ||
+        std::wstring_view(argv[12]) != L"height,vbr,abr" ||
+        std::wstring_view(argv[13]) != L"--get-url" ||
+        std::wstring_view(argv[14]) != L"--print" ||
+        std::wstring_view(argv[15]) != L"duration=%(duration)s;live_status=%(live_status)s;video_available_at=%(requested_formats.0.available_at,available_at|0)s;audio_available_at=%(requested_formats.1.available_at|0)s;selected_height=%(height)s;video_kbps=%(requested_formats.0.vbr,vbr,tbr|0)s;age_limit=%(age_limit)s" ||
+        std::wstring_view(argv[16]) != L"--") {
+        return 91;
+    }
+    const std::filesystem::path expectedDeno =
+        current_test_executable().parent_path() / L"deno.exe";
+    std::error_code equivalentError;
+    if (!std::filesystem::equivalent(
+            std::filesystem::path(std::wstring(std::wstring_view(argv[7]).substr(5))),
+            expectedDeno, equivalentError) || equivalentError) {
+        return 92;
+    }
+
+    const std::wstring_view url = argv[17];
+    if (url.find(L"stderrnoise") != std::wstring_view::npos) {
+        // What a Python interpreter prints around a run that works: warnings
+        // on stderr, far more of them than stdout's whole cap, with the real
+        // answer on stdout in between.
+        for (int line = 0; line < 2000; ++line) {
+            std::cerr << "WARNING: [youtube] a Python warning, line " << line << " \xE2\x80\x94 noise\r\n";
+            if (line == 1000) {
+                std::cout << "duration=167;live_status=not_live\n"
+                             "https://r1.googlevideo.com/videoplayback?id=noisy\n"
+                             "https://r1.googlevideo.com/videoplayback?id=noisy-audio\n" << std::flush;
+            }
+        }
+        std::cerr << std::flush;
+        return 0;
+    }
+    if (url.find(L"availability_") != std::wstring_view::npos) {
+        const auto times = url.substr(url.find(L"availability_") + 13);
+        const auto separator = times.find(L'_');
+        const std::wstring video(times.substr(0, separator));
+        std::wstring audio(times.substr(separator + 1));
+        if (audio.ends_with(L"_fraction")) audio.replace(audio.size() - 9, 9, L".5");
+        std::cout << "duration=167;live_status=not_live;video_available_at=";
+        for (const wchar_t character : video) std::cout.put(static_cast<char>(character));
+        std::cout << ";audio_available_at=";
+        for (const wchar_t character : audio) std::cout.put(static_cast<char>(character));
+        std::cout << "\nhttps://r1.googlevideo.com/videoplayback?id=availability\n" << std::flush;
+        write_binary_file(current_test_executable().parent_path() / L"availability-ready.marker", "ready");
+        return 0;
+    }
+    if (url.find(L"missingduration") != std::wstring_view::npos) {
+        std::cout << "https://r1.googlevideo.com/videoplayback?id=duration-missing\n" << std::flush;
+        return 0;
+    }
+    if (url.find(L"unknownduration") != std::wstring_view::npos) {
+        std::cout << "duration=NA;live_status=not_live\n"
+                     "https://r1.googlevideo.com/videoplayback?id=duration-unknown\n" << std::flush;
+        return 0;
+    }
+    if (url.find(L"liveduration") != std::wstring_view::npos) {
+        std::cout << "duration=167;live_status=is_live\n"
+                     "https://r1.googlevideo.com/videoplayback?id=duration-live\n" << std::flush;
+        return 0;
+    }
+    if (url.find(L"envcapture") != std::wstring_view::npos) {
+        const std::filesystem::path expectedCache =
+            current_test_executable().parent_path() / L"youtube-helper-cache";
+        const std::wstring received = read_environment_variable(L"DENO_DIR");
+        std::error_code cacheEquivalentError;
+        if (received.empty() ||
+            !std::filesystem::equivalent(std::filesystem::path(received), expectedCache,
+                                         cacheEquivalentError) || cacheEquivalentError) {
+            return 95;
+        }
+        write_binary_file(expectedCache / L"resolver-envcapture.marker", "package-local");
+        std::cout << "duration=167;live_status=not_live\n"
+                     "https://r1.googlevideo.com/videoplayback?id=envcapture\n" << std::flush;
+        return 0;
+    }
+    if (url.find(L"success") != std::wstring_view::npos) {
+        std::cout << "duration=167;live_status=not_live\n"
+                     "https://r1.googlevideo.com/videoplayback?id=success\n"
+                     "https://r1.googlevideo.com/videoplayback?id=success-audio\n" << std::flush;
+        return 0;
+    }
+    if (url.find(L"uismoke") != std::wstring_view::npos) {
+        write_binary_file(current_test_executable().parent_path()/L"ui-helper-launch.marker","launched");
+        std::cout << "duration=167;live_status=not_live\n"
+                     "https://r1.googlevideo.com/videoplayback?id=uismoke\n" << std::flush;
+        return 0;
+    }
+    if (url.find(L"nonzero") != std::wstring_view::npos) return 7;
+    if (url.find(L"cap64plus") != std::wstring_view::npos) {
+        std::cout << std::string(64 * 1024 + 1, 'x') << std::flush;
+        Sleep(INFINITE);
+        return 0;
+    }
+    if (url.find(L"cap64") != std::wstring_view::npos) {
+        std::cout << std::string(64 * 1024, 'x') << std::flush;
+        return 0;
+    }
+    const size_t descendant = url.find(L"descendant_");
+    if (descendant != std::wstring_view::npos) {
+        const std::wstring suffix(url.substr(descendant + 11));
+        const std::filesystem::path marker = std::filesystem::temp_directory_path() /
+            (L"PolicyTests-resolver-descendant-" + suffix + L".pid");
+        const std::filesystem::path executable = current_test_executable();
+        std::wstring command = QuoteWindowsArgument(executable.wstring()) +
+            L" --resolver-descendant " + QuoteWindowsArgument(marker.wstring());
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+                            CREATE_NO_WINDOW, nullptr, executable.parent_path().c_str(),
+                            &startup, &process)) {
+            return 93;
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        Sleep(INFINITE);
+        return 0;
+    }
+    Sleep(INFINITE);
+    return 0;
+}
+
+// Only this process's own children count. Counting every ffmpeg.exe on the machine
+// made the leak checks depend on what the rest of the suite was doing: the real
+// ffmpeg that CachedExportTests and NeuralPrerenderTests run appears and exits
+// under a different test binary, moving the baseline mid-test and failing a
+// decoder that leaked nothing. Every helper these fixtures spawn is a direct
+// child, so the parent id is the exact scope the checks always meant.
+size_t count_named_processes(std::wstring_view executableName)
+{
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    CHECK(snapshot != INVALID_HANDLE_VALUE);
+    if (snapshot == INVALID_HANDLE_VALUE) return 0;
+    const DWORD self = GetCurrentProcessId();
+    PROCESSENTRY32W entry{sizeof(entry)};
+    size_t count = 0;
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ParentProcessID != self) continue;
+            if (CompareStringOrdinal(entry.szExeFile, -1, executableName.data(),
+                                     static_cast<int>(executableName.size()), TRUE) == CSTR_EQUAL) {
+                ++count;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CHECK(CloseHandle(snapshot) != FALSE);
+    return count;
+}
+
+bool wait_for_named_process_count(std::wstring_view executableName, size_t expected,
+                                  std::chrono::milliseconds limit)
+{
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    do {
+        if (count_named_processes(executableName) == expected) return true;
+        Sleep(10);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return count_named_processes(executableName) == expected;
+}
+
+// The two reparse points the refusal is tested with need no privilege, unlike
+// the symbolic links this used to attempt: NTFS lets any writer stamp a file
+// with a non-Microsoft reparse tag, and a directory junction is the reparse
+// point Windows hands out without SeCreateSymbolicLinkPrivilege. The resolver
+// reads only the reparse attribute, never the tag, so either stands in for a
+// symbolic link exactly - and unlike one, they exist on every runner.
+bool set_reparse_point(HANDLE handle, const void* data, size_t bytes)
+{
+    DWORD returned = 0;
+    return DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, const_cast<void*>(data),
+                           static_cast<DWORD>(bytes), nullptr, 0, &returned, nullptr) != FALSE;
+}
+
+bool create_reparse_file(const std::filesystem::path& path)
+{
+    const HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    REPARSE_GUID_DATA_BUFFER data{};
+    data.ReparseTag = 0x42;
+    data.ReparseGuid = GUID{0x8f2c5a1e, 0x4d3b, 0x4c7a, {0x9e, 0x11, 0x20, 0x26, 0x09, 0x16, 0x00, 0x01}};
+    const bool set = set_reparse_point(handle, &data, REPARSE_GUID_DATA_BUFFER_HEADER_SIZE);
+    CloseHandle(handle);
+    return set;
+}
+
+bool create_junction(const std::filesystem::path& link, const std::filesystem::path& target)
+{
+    if (!CreateDirectoryW(link.c_str(), nullptr)) return false;
+    const HANDLE handle = CreateFileW(link.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+                                      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    // ntifs.h's REPARSE_DATA_BUFFER for IO_REPARSE_TAG_MOUNT_POINT; the SDK
+    // does not declare it. The path buffer holds the NT-form substitute name,
+    // its terminator, an empty print name and its terminator.
+    struct MountPoint {
+        ULONG tag;
+        USHORT dataLength, reserved, substituteOffset, substituteLength, printOffset, printLength;
+        wchar_t path[1];
+    };
+    const std::wstring substitute = L"\\??\\" + target.wstring();
+    const size_t substituteBytes = substitute.size() * sizeof(wchar_t);
+    std::vector<char> buffer(offsetof(MountPoint, path) + substituteBytes + 2 * sizeof(wchar_t));
+    auto* data = reinterpret_cast<MountPoint*>(buffer.data());
+    data->tag = IO_REPARSE_TAG_MOUNT_POINT;
+    data->dataLength = static_cast<USHORT>(buffer.size() - offsetof(MountPoint, substituteOffset));
+    data->substituteLength = static_cast<USHORT>(substituteBytes);
+    data->printOffset = static_cast<USHORT>(substituteBytes + sizeof(wchar_t));
+    memcpy(data->path, substitute.data(), substituteBytes);
+    const bool set = set_reparse_point(handle, buffer.data(), buffer.size());
+    CloseHandle(handle);
+    return set;
+}
+
+void youtube_resolver_rejects_reparse_points_and_nonregular_helpers_before_execution_test()
+{
+    ResolverFixture fixture;
+    const std::filesystem::path outsideDirectory = fixture.directory.parent_path() /
+        (L"PolicyTests-YouTubeResolver-outside-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    std::filesystem::remove_all(outsideDirectory, error);
+    error.clear();
+    std::filesystem::create_directories(outsideDirectory, error);
+    CHECK(!error);
+
+    // A helper that is a reparse point is refused before anything is spawned:
+    // HelperMissing is the verification's own answer, StartFailed would mean
+    // the launch was attempted.
+    std::filesystem::remove(fixture.directory / L"yt-dlp.exe", error);
+    CHECK(!error);
+    CHECK(create_reparse_file(fixture.directory / L"yt-dlp.exe"));
+    auto reparseResolver = YouTubeResolverTestAccess::Create(fixture.directory);
+    CHECK_EQ(ResolveError::HelperMissing,
+             reparseResolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?success", {}).error);
+
+    std::filesystem::remove(fixture.directory / L"yt-dlp.exe", error);
+    error.clear();
+    std::filesystem::create_directory(fixture.directory / L"yt-dlp.exe", error);
+    CHECK(!error);
+    auto directoryResolver = YouTubeResolverTestAccess::Create(fixture.directory);
+    CHECK_EQ(ResolveError::HelperMissing,
+             directoryResolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?success", {}).error);
+
+    std::filesystem::remove_all(fixture.directory / L"yt-dlp.exe", error);
+    CHECK(!error);
+    CHECK(CopyFileW(current_test_executable().c_str(),
+                    (fixture.directory / L"yt-dlp.exe").c_str(), FALSE) != FALSE);
+    std::filesystem::remove(fixture.directory / L"deno.exe", error);
+    CHECK(!error);
+    error.clear();
+    std::filesystem::create_directory(fixture.directory / L"deno.exe", error);
+    CHECK(!error);
+    auto denoDirectoryResolver = YouTubeResolverTestAccess::Create(fixture.directory);
+    CHECK_EQ(ResolveError::HelperMissing,
+             denoDirectoryResolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?success", {}).error);
+
+    // The package-local cache directory is refused when it is a junction to
+    // anywhere, so a redirected cache cannot make the helper load from outside.
+    std::filesystem::remove_all(fixture.directory / L"deno.exe", error);
+    CHECK(!error);
+    write_binary_file(fixture.directory / L"deno.exe", "test-only placeholder");
+    const std::filesystem::path cacheLink = fixture.directory / L"youtube-helper-cache";
+    CHECK(create_junction(cacheLink, outsideDirectory));
+    auto cacheLinkResolver = YouTubeResolverTestAccess::Create(fixture.directory);
+    CHECK_EQ(ResolveError::HelperMissing,
+             cacheLinkResolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?success", {}).error);
+    CHECK(RemoveDirectoryW(cacheLink.c_str()) != FALSE);
+    std::filesystem::remove_all(outsideDirectory, error);
+    CHECK(!error);
+}
+
+void youtube_resolver_holds_verified_helpers_against_replacement_until_completion_test()
+{
+    ResolverFixture fixture;
+    const size_t beforeProcesses = count_named_processes(L"yt-dlp.exe");
+    auto resolver = YouTubeResolverTestAccess::Create(
+        fixture.directory, std::chrono::seconds{5});
+    ResolveResult result;
+    std::thread worker([&] {
+        result = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", {});
+    });
+    CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses + 1,
+                                       kChildExitWait));
+
+    const std::filesystem::path replacement = fixture.directory / L"replacement-deno.exe";
+    write_binary_file(replacement, "replacement");
+    SetLastError(ERROR_SUCCESS);
+    const BOOL replaced = MoveFileExW(replacement.c_str(),
+                                      (fixture.directory / L"deno.exe").c_str(),
+                                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    CHECK(replaced == FALSE);
+    const DWORD replacementError = GetLastError();
+    CHECK(replacementError == ERROR_SHARING_VIOLATION ||
+          replacementError == ERROR_ACCESS_DENIED);
+
+    resolver->Cancel();
+    worker.join();
+    CHECK_EQ(ResolveError::Cancelled, result.error);
+    remove_file_if_present(replacement);
+}
+
+void youtube_resolver_forces_package_local_deno_cache_over_parent_override_test()
+{
+    ResolverFixture fixture;
+    const std::filesystem::path callerCache = fixture.directory.parent_path() /
+        (L"PolicyTests-caller-deno-cache-" + std::to_wstring(GetCurrentProcessId()) +
+         L"-" + std::to_wstring(GetTickCount64()));
+    std::error_code error;
+    std::filesystem::create_directories(callerCache, error);
+    CHECK(!error);
+    const std::filesystem::path callerXdgCache = fixture.directory.parent_path() /
+        (L"PolicyTests-caller-xdg-cache-" + std::to_wstring(GetCurrentProcessId()) +
+         L"-" + std::to_wstring(GetTickCount64()));
+    std::filesystem::create_directories(callerXdgCache, error);
+    CHECK(!error);
+    const ScopedEnvironmentVariable inheritedOverride(L"DENO_DIR", callerCache.wstring());
+    const ScopedEnvironmentVariable inheritedXdgCache(L"XDG_CACHE_HOME", callerXdgCache.wstring());
+
+    const std::filesystem::path packageCache = fixture.directory / L"youtube-helper-cache";
+    const std::filesystem::path packageMarker = packageCache / L"resolver-envcapture.marker";
+    const std::filesystem::path callerMarker = callerCache / L"resolver-envcapture.marker";
+    const std::filesystem::path callerXdgMarker = callerXdgCache / L"yt-dlp-default.marker";
+    const size_t beforeProcesses = count_named_processes(L"yt-dlp.exe");
+    auto resolver = YouTubeResolverTestAccess::Create(fixture.directory);
+    const ResolveResult result = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?envcapture-ytcacheaudit", {});
+
+    CHECK(result.ok);
+    CHECK(std::filesystem::is_directory(packageCache, error));
+    CHECK(!error);
+    CHECK_EQ(std::string("package-local"), read_binary_file(packageMarker));
+    CHECK(!std::filesystem::exists(callerMarker, error));
+    CHECK(!error);
+    CHECK(!std::filesystem::exists(callerXdgMarker, error));
+    CHECK(!error);
+    CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses,
+                                       kChildExitWait));
+
+    std::filesystem::remove_all(callerCache, error);
+    CHECK(!error);
+    std::filesystem::remove_all(callerXdgCache, error);
+    CHECK(!error);
+}
+
+void youtube_resolver_disables_default_plugin_execution_from_inherited_config_test()
+{
+    ResolverFixture fixture;
+    const std::filesystem::path callerConfig = fixture.directory.parent_path() /
+        (L"PolicyTests-caller-xdg-config-" + std::to_wstring(GetCurrentProcessId()) +
+         L"-" + std::to_wstring(GetTickCount64()));
+    const std::filesystem::path pluginDirectory = callerConfig / L"yt-dlp" / L"plugins";
+    const std::filesystem::path pluginSource = pluginDirectory / L"exec-on-import.plugin";
+    const std::filesystem::path executionMarker =
+        pluginDirectory / L"default-plugin-executed.marker";
+    std::error_code error;
+    std::filesystem::create_directories(pluginDirectory, error);
+    CHECK(!error);
+    write_binary_file(pluginSource, "executable-default-plugin");
+    const ScopedEnvironmentVariable inheritedXdgConfig(L"XDG_CONFIG_HOME",
+                                                        callerConfig.wstring());
+    const size_t beforeProcesses = count_named_processes(L"yt-dlp.exe");
+    auto resolver = YouTubeResolverTestAccess::Create(fixture.directory);
+
+    const ResolveResult result = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?success-pluginaudit", {});
+
+    CHECK(result.ok);
+    CHECK(std::filesystem::is_regular_file(pluginSource, error));
+    CHECK(!error);
+    CHECK(!std::filesystem::exists(executionMarker, error));
+    CHECK(!error);
+    CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses,
+                                       kChildExitWait));
+    std::filesystem::remove_all(callerConfig, error);
+    CHECK(!error);
+}
+
+void youtube_resolver_serializes_queued_resolve_and_cancel_does_not_poison_reuse_test()
+{
+    ResolverFixture fixture;
+    auto resolver = YouTubeResolverTestAccess::Create(
+        fixture.directory, std::chrono::seconds{5});
+    ResolveResult active;
+    ResolveResult queued;
+    std::atomic<bool> queuedFinished{false};
+    std::thread activeThread([&] {
+        active = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", {});
+    });
+    Sleep(75);
+    std::thread queuedThread([&] {
+        queued = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?success", {});
+        queuedFinished = true;
+    });
+    Sleep(75);
+    CHECK(!queuedFinished.load());
+    resolver->Cancel();
+    activeThread.join();
+    queuedThread.join();
+
+    CHECK_EQ(ResolveError::Cancelled, active.error);
+    CHECK(queued.ok);
+    CHECK(queuedFinished.load());
+    CHECK(resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?success", {}).ok);
+}
+
+void youtube_resolver_queued_stop_token_cancels_before_launch_test()
+{
+    ResolverFixture fixture;
+    auto resolver = YouTubeResolverTestAccess::Create(
+        fixture.directory, std::chrono::seconds{5});
+    const size_t beforeProcesses = count_named_processes(L"yt-dlp.exe");
+    ResolveResult active;
+    ResolveResult queued;
+    std::thread activeThread([&] {
+        active = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", {});
+    });
+    Sleep(75);
+    std::stop_source queuedStop;
+    std::thread queuedThread([&] {
+        queued = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?success", queuedStop.get_token());
+    });
+    Sleep(75);
+    queuedStop.request_stop();
+    resolver->Cancel();
+    activeThread.join();
+    queuedThread.join();
+    CHECK_EQ(ResolveError::Cancelled, active.error);
+    CHECK_EQ(ResolveError::Cancelled, queued.error);
+    Sleep(50);
+    CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses,
+                                       kChildExitWait));
+}
+
+void youtube_resolver_injected_startup_and_drain_failures_cleanup_boundedly_test()
+{
+    ResolverFixture fixture;
+    struct Case {
+        YouTubeResolver::FailureStage stage;
+        ResolveError expected;
+    };
+    const std::array cases{
+        Case{YouTubeResolver::FailureStage::PipeHandlesOwned, ResolveError::StartFailed},
+        Case{YouTubeResolver::FailureStage::JobAssignment, ResolveError::StartFailed},
+        Case{YouTubeResolver::FailureStage::Resume, ResolveError::StartFailed},
+        Case{YouTubeResolver::FailureStage::PipeRead, ResolveError::ExtractionFailed},
+    };
+
+    for (const Case& test : cases) {
+        const size_t beforeProcesses = count_named_processes(L"yt-dlp.exe");
+        const DWORD beforeHandles = handle_count_after_warm_up([&] {
+            auto warmUp = YouTubeResolverTestAccess::Create(
+                fixture.directory, std::chrono::seconds{5}, test.stage);
+            CHECK_EQ(test.expected, warmUp->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", {}).error);
+            warmUp.reset();
+            CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses,
+                                               kChildExitWait));
+        });
+        DWORD afterHandles = 0;
+        auto resolver = YouTubeResolverTestAccess::Create(
+            fixture.directory, std::chrono::seconds{5}, test.stage);
+        const auto started = std::chrono::steady_clock::now();
+        const ResolveResult result = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", {});
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        CHECK_EQ(test.expected, result.error);
+        CHECK(result.detail.find(L"hang") == std::wstring::npos);
+        CHECK(result.detail.find(L"https") == std::wstring::npos);
+        CHECK(elapsed < std::chrono::seconds{2});
+        resolver.reset();
+        Sleep(25);
+        CHECK(GetProcessHandleCount(GetCurrentProcess(), &afterHandles) != FALSE);
+        CHECK(afterHandles <= beforeHandles + 2);
+        CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses,
+                                           kChildExitWait));
+    }
+}
+
+void youtube_resolver_repeated_owned_pipe_failures_cannot_hide_two_handle_leaks_test()
+{
+    ResolverFixture fixture;
+    constexpr int repetitions = 16;
+    const size_t beforeProcesses = count_named_processes(L"yt-dlp.exe");
+    const DWORD beforeHandles = handle_count_after_warm_up([&] {
+        auto warmUp = YouTubeResolverTestAccess::Create(
+            fixture.directory, std::chrono::seconds{5},
+            YouTubeResolver::FailureStage::PipeHandlesOwned);
+        CHECK_EQ(ResolveError::StartFailed, warmUp->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", {}).error);
+        warmUp.reset();
+        CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses,
+                                           kChildExitWait));
+    });
+    DWORD afterHandles = 0;
+
+    for (int repetition = 0; repetition < repetitions; ++repetition) {
+        auto resolver = YouTubeResolverTestAccess::Create(
+            fixture.directory, std::chrono::seconds{5},
+            YouTubeResolver::FailureStage::PipeHandlesOwned);
+        const auto started = std::chrono::steady_clock::now();
+        const ResolveResult result = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", {});
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        CHECK_EQ(ResolveError::StartFailed, result.error);
+        CHECK(elapsed < std::chrono::seconds{2});
+        resolver.reset();
+        CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses,
+                                           kChildExitWait));
+
+        size_t entries = 0;
+        std::error_code error;
+        for (std::filesystem::directory_iterator item(fixture.directory, error), end;
+             !error && item != end; item.increment(error)) {
+            ++entries;
+        }
+        CHECK(!error);
+        CHECK_EQ(size_t{3}, entries);
+    }
+
+    CHECK(GetProcessHandleCount(GetCurrentProcess(), &afterHandles) != FALSE);
+    CHECK(afterHandles <= beforeHandles + 2);
+}
+
+void youtube_resolver_repeated_timeout_cancel_overflow_cycles_are_leak_free_test()
+{
+    ResolverFixture fixture;
+    const size_t beforeProcesses = count_named_processes(L"yt-dlp.exe");
+
+    const auto timeOut = [&] {
+        auto timeoutResolver = YouTubeResolverTestAccess::Create(
+            fixture.directory, std::chrono::milliseconds{80});
+        CHECK_EQ(ResolveError::TimedOut,
+                 timeoutResolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", {}).error);
+    };
+    const auto cancel = [&] {
+        auto cancelResolver = YouTubeResolverTestAccess::Create(
+            fixture.directory, std::chrono::seconds{5});
+        ResolveResult cancelled;
+        std::thread worker([&] {
+            cancelled = cancelResolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?hang", {});
+        });
+        Sleep(30);
+        cancelResolver->Cancel();
+        worker.join();
+        CHECK_EQ(ResolveError::Cancelled, cancelled.error);
+    };
+    const auto overflow = [&] {
+        auto overflowResolver = YouTubeResolverTestAccess::Create(fixture.directory);
+        CHECK_EQ(ResolveError::OutputTooLarge,
+                 overflowResolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?cap64plus", {}).error);
+    };
+
+    const DWORD beforeTimeoutHandles = handle_count_after_warm_up(timeOut);
+    DWORD afterTimeoutHandles = 0;
+    for (int cycle = 0; cycle < 4; ++cycle) timeOut();
+    CHECK(GetProcessHandleCount(GetCurrentProcess(), &afterTimeoutHandles) != FALSE);
+    CHECK(afterTimeoutHandles <= beforeTimeoutHandles + 2);
+    CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses,
+                                       kChildExitWait));
+
+    const DWORD beforeCancelHandles = handle_count_after_warm_up(cancel);
+    DWORD afterCancelHandles = 0;
+    for (int cycle = 0; cycle < 4; ++cycle) cancel();
+    CHECK(GetProcessHandleCount(GetCurrentProcess(), &afterCancelHandles) != FALSE);
+    CHECK(afterCancelHandles <= beforeCancelHandles + 2);
+    CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses,
+                                       kChildExitWait));
+
+    const DWORD beforeOverflowHandles = handle_count_after_warm_up(overflow);
+    DWORD afterOverflowHandles = 0;
+    for (int cycle = 0; cycle < 4; ++cycle) overflow();
+    Sleep(50);
+    CHECK(GetProcessHandleCount(GetCurrentProcess(), &afterOverflowHandles) != FALSE);
+    CHECK(afterOverflowHandles <= beforeOverflowHandles + 2);
+    CHECK(wait_for_named_process_count(L"yt-dlp.exe", beforeProcesses,
+                                       kChildExitWait));
+}
+
+void ngx_same_device_overlapping_sessions_initialize_and_shutdown_once_test()
+{
+    ngx_session_detail::Registry sessions;
+    int device = 0;
+    int initCalls = 0;
+    int shutdownCalls = 0;
+
+    CHECK(sessions.Acquire(&device, [&] { ++initCalls; return true; }));
+    CHECK(sessions.Acquire(&device, [&] { ++initCalls; return true; }));
+    CHECK_EQ(1, initCalls);
+    CHECK_EQ(size_t{2}, sessions.LeaseCount(&device));
+
+    sessions.Release(&device, [&] { ++shutdownCalls; });
+    CHECK_EQ(0, shutdownCalls);
+    CHECK_EQ(size_t{1}, sessions.LeaseCount(&device));
+    CHECK(sessions.Acquire(&device, [&] { ++initCalls; return true; }));
+    CHECK_EQ(1, initCalls);
+    sessions.Release(&device, [&] { ++shutdownCalls; });
+    CHECK_EQ(0, shutdownCalls);
+    sessions.Release(&device, [&] { ++shutdownCalls; });
+    CHECK_EQ(1, shutdownCalls);
+    CHECK_EQ(size_t{0}, sessions.LeaseCount(&device));
+}
+
+void ngx_failed_initialization_never_acquires_a_session_test()
+{
+    ngx_session_detail::Registry sessions;
+    int device = 0;
+    int shutdownCalls = 0;
+
+    CHECK(!sessions.Acquire(&device, [] { return false; }));
+    CHECK_EQ(size_t{0}, sessions.LeaseCount(&device));
+    sessions.Release(&device, [&] { ++shutdownCalls; });
+    CHECK_EQ(0, shutdownCalls);
+}
+
+void ngx_failed_candidate_setup_releases_only_its_overlapping_lease_test()
+{
+    ngx_session_detail::Registry sessions;
+    int device = 0;
+    int initCalls = 0;
+    int shutdownCalls = 0;
+
+    CHECK(sessions.Acquire(&device, [&] { ++initCalls; return true; }));
+    CHECK(sessions.Acquire(&device, [&] { ++initCalls; return true; }));
+    sessions.Release(&device, [&] { ++shutdownCalls; });
+
+    CHECK_EQ(1, initCalls);
+    CHECK_EQ(0, shutdownCalls);
+    CHECK_EQ(size_t{1}, sessions.LeaseCount(&device));
+    sessions.Release(&device, [&] { ++shutdownCalls; });
+    CHECK_EQ(1, shutdownCalls);
+}
+
+void ngx_distinct_devices_own_independent_sessions_test()
+{
+    ngx_session_detail::Registry sessions;
+    int firstDevice = 0;
+    int secondDevice = 0;
+    int initCalls = 0;
+    int shutdownCalls = 0;
+
+    CHECK(sessions.Acquire(&firstDevice, [&] { ++initCalls; return true; }));
+    CHECK(sessions.Acquire(&secondDevice, [&] { ++initCalls; return true; }));
+    CHECK_EQ(2, initCalls);
+    sessions.Release(&firstDevice, [&] { ++shutdownCalls; });
+    CHECK_EQ(1, shutdownCalls);
+    CHECK_EQ(size_t{1}, sessions.LeaseCount(&secondDevice));
+    sessions.Release(&secondDevice, [&] { ++shutdownCalls; });
+    CHECK_EQ(2, shutdownCalls);
+}
+
+void ngx_create_failure_is_not_retried_until_explicit_reset_test()
+{
+    ngx_session_detail::FeatureCreateGate gate;
+    CHECK(gate.ShouldAttempt());
+    gate.RecordFailure();
+    CHECK(!gate.ShouldAttempt());
+    CHECK(!gate.ShouldAttempt());
+    gate.Reset();
+    CHECK(gate.ShouldAttempt());
+}
+
+void ngx_renderer_frame_state_prioritizes_explicit_rehook_after_create_failure_test()
+{
+    ngx_session_detail::FeatureCreateGate gate;
+    bool recreateRequested = false;
+    int createAttempts = 0;
+    const auto ensureFeature = [&] {
+        if (!gate.ShouldAttempt()) return false;
+        ++createAttempts;
+        gate.RecordFailure();
+        return false;
+    };
+    const auto recreateFeature = [&] {
+        gate.Reset();
+        ++createAttempts;
+        gate.RecordFailure();
+        return false;
+    };
+
+    const auto firstFailure = ngx_session_detail::PrepareFeatureForFrame(
+        true, false, 2, recreateRequested, ensureFeature, recreateFeature);
+    CHECK(firstFailure.selected);
+    CHECK_EQ(1, createAttempts);
+
+    const auto automaticNextFrame = ngx_session_detail::PrepareFeatureForFrame(
+        true, false, 3, recreateRequested, ensureFeature, recreateFeature);
+    CHECK(automaticNextFrame.selected);
+    CHECK_EQ(1, createAttempts);
+
+    recreateRequested = true;
+    const auto explicitRehook = ngx_session_detail::PrepareFeatureForFrame(
+        true, false, 4, recreateRequested, ensureFeature, recreateFeature);
+    CHECK(explicitRehook.selected);
+    CHECK(!recreateRequested);
+    CHECK_EQ(2, createAttempts);
+
+    ngx_session_detail::PrepareFeatureForFrame(
+        true, false, 5, recreateRequested, ensureFeature, recreateFeature);
+    CHECK_EQ(2, createAttempts);
+}
+
+// A live feature must never be released on a frame count. The offline job's
+// receipt gate re-presents one source frame until the neural add-on publishes a
+// fresh evaluation, so a timed release lands inside that gate and tears down
+// the worksets whose counter the gate is waiting for: that is the wedge issue 4
+// reported on an RTX 4070 Ti and issue 3 on an RTX PRO 6000. The old policy
+// released at present 60, which is exactly where a 120-present gate sits.
+void ngx_live_feature_is_never_released_on_a_frame_count_test()
+{
+    bool recreateRequested = false;
+    int creates = 0;
+    int releases = 0;
+    const auto ensureFeature = [&] { ++creates; return true; };
+    const auto recreateFeature = [&] { ++releases; return true; };
+
+    bool featureCreated = false;
+    for (uint64_t frame = 1; frame <= 400; ++frame) {
+        const auto setup = ngx_session_detail::PrepareFeatureForFrame(
+            true, featureCreated, frame, recreateRequested, ensureFeature, recreateFeature);
+        if (setup.selected) featureCreated = true;
+    }
+    CHECK_EQ(1, creates);
+    CHECK_EQ(0, releases);
+
+    // The explicit request is still the one way to obtain a hook-visible create,
+    // and it stays a single shot.
+    recreateRequested = true;
+    ngx_session_detail::PrepareFeatureForFrame(
+        true, featureCreated, 401, recreateRequested, ensureFeature, recreateFeature);
+    CHECK_EQ(1, releases);
+    ngx_session_detail::PrepareFeatureForFrame(
+        true, featureCreated, 402, recreateRequested, ensureFeature, recreateFeature);
+    CHECK_EQ(1, releases);
+}
+
+// A half-extracted package leaves a helper that is not a PE image. Windows
+// answers such a CreateProcessW with a modal hard-error dialog on the calling
+// thread and does not return until it is dismissed, which is exactly how a
+// worker thread stops forever with nothing in the log. Every spawn site wraps
+// itself in ScopedHardErrorSuppression so the call fails instead.
+void spawning_a_corrupt_helper_fails_closed_without_a_hard_error_dialog_test()
+{
+    const std::filesystem::path directory = std::filesystem::temp_directory_path() /
+        (L"PolicyTests-CorruptHelper-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+         std::to_wstring(GetTickCount64()));
+    std::error_code directoryError;
+    std::filesystem::create_directories(directory, directoryError);
+    CHECK(!directoryError);
+    const std::filesystem::path helper = directory / L"yt-dlp.exe";
+    write_binary_file(helper, "not a Windows executable");
+
+    std::wstring command = L"\"" + helper.wstring() + L"\"";
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    const DWORD modeBefore = GetThreadErrorMode();
+    const auto started = std::chrono::steady_clock::now();
+    BOOL created = FALSE;
+    DWORD error = 0;
+    {
+        const ScopedHardErrorSuppression noHardErrorDialog;
+        CHECK((GetThreadErrorMode() & SEM_FAILCRITICALERRORS) != 0);
+        created = CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, FALSE,
+                                 CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+        error = GetLastError();
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    CHECK(!created);
+    // 216 is what a non-PE stub reports here and what the suppressed dialog was
+    // about ("incompatibility with 64-bit versions of Windows"); a differently
+    // malformed image reports 193. Either way the call answers instead of hanging.
+    CHECK(error == DWORD{ERROR_EXE_MACHINE_TYPE_MISMATCH} || error == DWORD{ERROR_BAD_EXE_FORMAT});
+    // Unsuppressed, the call blocks on the dialog rather than returning at all.
+    CHECK(elapsed < std::chrono::seconds{5});
+    // The mode belongs to the scope, not to the thread from here on.
+    CHECK_EQ(modeBefore, GetThreadErrorMode());
+    if (created) { CloseHandle(process.hThread); CloseHandle(process.hProcess); }
+    std::filesystem::remove_all(directory, directoryError);
+}
+
+constexpr test_support::TestCase kResolverAvailabilityCases[] = {
+    TEST_CASE(youtube_resolver_waits_until_both_selected_streams_are_available_test),
+    TEST_CASE(youtube_resolver_availability_wait_is_cancellable_and_deadline_bounded_test),
+    TEST_CASE(youtube_resolver_waits_for_fractional_stream_availability_test),
+    TEST_CASE(resolver_output_validates_stream_availability_metadata_test),
+};
+
+// Live neural playback advances by decoding a PAIR, so discarding a late frame
+// costs what presenting one costs and falling behind is unrecoverable by
+// walking. These pin the two ways out: thin the presentation, or stop walking
+// and seek. Measured symptom the policy exists for, from the player's own
+// health line on an RTX 5090 at 2560x1440: a 119.88 fps source presented 0.31
+// fps with 203 frames discarded in 11.6 s.
+void playback_cadence_thins_presentation_before_it_seeks_test()
+{
+    using namespace playback_cadence;
+    constexpr double k120 = 1.0 / 119.88;   // 8.34 ms
+    constexpr double k60 = 1.0 / 59.9401;   // 16.68 ms
+
+    // On time: every pair is presented and the cadence stays where it is.
+    const auto onTime = Decide(0.0, k120, 1, 0);
+    CHECK(onTime.action == Action::Present);
+    CHECK_EQ(1u, onTime.stride);
+
+    // More than two frames late: the cadence widens. The frame in hand is still
+    // presented, because the stride in force for it was 1 - widening takes
+    // effect from the next one rather than skipping a beat already committed to.
+    const auto late = Decide(3.0 * k120, k120, 1, 0);
+    CHECK(late.action == Action::Present);
+    CHECK_EQ(2u, late.stride);
+
+    // At stride 2 the phase decides, which is what makes the result EVEN: one
+    // pair in two, so 119.88 fps becomes 59.94 fps of unbroken motion rather
+    // than a stutter.
+    CHECK(Decide(0.0, k120, 2, 0).action == Action::Present);
+    CHECK(Decide(0.0, k120, 2, 1).action == Action::Skip);
+    CHECK(Decide(0.0, k120, 2, 2).action == Action::Present);
+    CHECK(Decide(0.0, k120, 2, 3).action == Action::Skip);
+
+    // KEEPING UP narrows the cadence, one step at a time. Zero lateness is the
+    // case that matters and the one an earlier version got wrong: it asked for
+    // the pipeline to run EARLY before giving a frame back, and nothing that is
+    // merely keeping up ever runs early, so the stride ratcheted to its cap on
+    // one hiccup and stayed there - measured at 15 frames presented out of 120
+    // advanced every two seconds, which is a source being followed exactly and
+    // shown at an eighth of its rate.
+    CHECK_EQ(3u, Decide(0.0, k120, 4, 0).stride);
+    CHECK_EQ(3u, Decide(-1.0 * k120, k120, 4, 0).stride);
+    CHECK_EQ(3u, Decide(0.25 * k120, k120, 4, 0).stride);
+    // Inside the band it holds, which is what stops it oscillating between two
+    // cadences - more visible than the coarser one held steady.
+    CHECK_EQ(4u, Decide(1.0 * k120, k120, 4, 0).stride);
+    CHECK_EQ(4u, Decide(2.0 * k120, k120, 4, 0).stride);
+
+    // The floor and the ceiling.
+    CHECK_EQ(kMaxStride, Decide(5.0 * k120, k120, kMaxStride, 0).stride);
+    CHECK_EQ(1u, Decide(-5.0 * k120, k120, 1, 0).stride);
+    CHECK_EQ(1u, Decide(0.0, k120, 1, 0).stride);
+
+    // A second behind is past the point where walking is the cheaper way to
+    // arrive: a seek covers any distance for about half a second here, while
+    // walking costs a pair decode per frame - 120 of them for this one second.
+    // It outranks the stride entirely; the position is the thing that is wrong.
+    for (const uint32_t stride : {1u, 2u, kMaxStride}) {
+        // Not named `far`: windows.h still defines that as a macro.
+        const auto adrift = Decide(kReanchorSeconds, k120, stride, 0);
+        CHECK(adrift.action == Action::Reanchor);
+        CHECK_EQ(stride, adrift.stride);
+    }
+    CHECK(Decide(0.99 * kReanchorSeconds, k120, 1, 0).action != Action::Reanchor);
+
+    // 60 fps is the same policy with twice the room: two frames late there is
+    // 33 ms, where at 120 it is 17.
+    CHECK_EQ(2u, Decide(3.0 * k60, k60, 1, 0).stride);
+    CHECK(Decide(2.0 * k60, k60, 1, 0).action == Action::Present);
+    CHECK_EQ(3u, Decide(0.0, k60, 4, 0).stride);
+
+    // Degenerate inputs present rather than invent a cadence.
+    CHECK(Decide(0.0, 0.0, 4, 1).action == Action::Present);
+    CHECK_EQ(1u, Decide(0.0, 0.0, 4, 1).stride);
+    CHECK(Decide(std::numeric_limits<double>::quiet_NaN(), k120, 1, 0).action == Action::Present);
+}
+
+// The phase rule, run as a sequence rather than asserted a frame at a time,
+// because the way it failed was invisible frame by frame: a caller that reset
+// the phase whenever it presented satisfied every single-frame expectation and
+// still presented EVERY pair, because (0 % stride) is always 0. It shipped, and
+// the only trace was a health line reading stride=1in8 beside dropped=0.
+void playback_cadence_phase_presents_exactly_one_pair_in_stride_test()
+{
+    using namespace playback_cadence;
+    constexpr double k120 = 1.0 / 119.88;
+    for (const uint32_t stride : {1u, 2u, 3u, 5u, kMaxStride}) {
+        uint32_t phase = 0, presented = 0, skipped = 0, longestRun = 0, run = 0;
+        for (uint32_t frame = 0; frame < 240; ++frame) {
+            // One frame late: inside the hold band, so the cadence stays put
+            // and only the phase moves. Zero would NARROW it, which is correct
+            // behaviour and the wrong fixture for a phase test.
+            const auto decision = Decide(1.0 * k120, k120, stride, phase);
+            CHECK_EQ(stride, decision.stride);
+            if (decision.action == Action::Present) {
+                ++presented; longestRun = std::max(longestRun, run); run = 0;
+            } else {
+                ++skipped; ++run;
+            }
+            phase = NextPhase(phase, stride);
+        }
+        // Exactly one in `stride`, and the skips evenly spaced between them -
+        // an even cadence is the entire point, since 120 fps shown every other
+        // frame is smooth 60 while the same count shown in bursts is not.
+        CHECK_EQ(240u / stride, presented);
+        CHECK_EQ(240u - 240u / stride, skipped);
+        CHECK_EQ(stride - 1u, longestRun);
+    }
+}
+
+// Stride removes the presentation cost and nothing else: every pair is still
+// decoded. So a source whose frame interval is shorter than one pair's DECODE
+// can never be followed live, however coarse the cadence gets, and that is a
+// thing to say at attach time rather than let a viewer discover as a frozen
+// picture. Measured here: two concurrent 2560x1440 decoders sustain about
+// 139 fps each, so a pair costs roughly 7.2 ms.
+void playback_cadence_reports_a_rate_no_cadence_can_follow_test()
+{
+    using namespace playback_cadence;
+    constexpr double kPairDecode = 0.0072;
+    CHECK(CanFollowLive(1.0 / 59.9401, kPairDecode));   // 16.68 ms, comfortable
+    CHECK(CanFollowLive(1.0 / 119.88, kPairDecode));    // 8.34 ms, and only just
+    CHECK(!CanFollowLive(1.0 / 240.0, kPairDecode));    // 4.17 ms, never
+    // An unmeasured cost is not evidence that the source cannot be followed.
+    CHECK(CanFollowLive(1.0 / 119.88, 0.0));
+    CHECK(CanFollowLive(0.0, kPairDecode));
+    CHECK(CanFollowLive(1.0 / 119.88, std::numeric_limits<double>::infinity()));
+}
+
+// The flag that killed neural rendering, and that the whole suite stayed green
+// through. It is attractive - it is the only way SetMaximumFrameLatency does
+// anything, and it hands back an object a message loop can block on instead of
+// spinning a core. But the RenoDX add-on hooks this swapchain, and with the
+// flag set its inline NR path allocates a fresh workset per evaluation,
+// exhausts its pool in three frames, and logs "NR workset pool exhausted;
+// preserving game output" while every later frame passes through untouched:
+// frames=0/0, and "A frame was not produced by feature 18".
+//
+// Nothing else in the suite can see that, so this asserts the one property
+// directly. The player does not need the flag: its loop waits on a
+// high-resolution timer, which measured lower CPU than the swapchain object.
+void swapchain_never_asks_for_the_frame_latency_waitable_object_test()
+{
+    using d3d12_renderer_detail::SwapchainFlags;
+    for (const bool tearing : {false, true}) {
+        const UINT flags = SwapchainFlags(tearing);
+        CHECK((flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) == 0u);
+        // Tearing is the one flag this chain is allowed to carry, and it has to
+        // survive - it is what lets an unthrottled present reach the panel.
+        CHECK_EQ(tearing ? UINT(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) : 0u, flags);
+    }
+}
+
+// Six controls with measured tooltips are the right surface for someone who
+// knows what they do, and the wrong first contact - issue #1 is someone who
+// never reached them. Presets answer "what should I pick" once.
+//
+// Two properties matter more than the values themselves. A preset whose value
+// falls outside what LoadNeuralSettings clamps to would not survive a restart:
+// the user picks it, the ini is written, and the next launch reads back
+// something else and reports Custom. And the default preset has to BE the
+// shipped default, or a first run silently starts somewhere the screenshots
+// and the measurements were not taken.
+void neural_presets_round_trip_and_default_to_the_shipped_settings_test()
+{
+    // The project's rule is that a quality choice is an explicit ladder with
+    // its measured cost printed beside each rung. The ladder shipped without
+    // the costs, so a viewer could read what "Strong" changes and had no way
+    // to know whether it doubles the render.
+    // And the ladder itself says what it costs, where the viewer chooses.
+    // Four rungs whose cost is identical is exactly the case where the
+    // number has to be stated: without it, "Strong" reads as the expensive
+    // one and nobody picks it.
+    {
+        Localizer localizer;
+        const HMENU bar = app_menu::CreateMenuBar(localizer, true);
+        CHECK(bar != nullptr);
+        if (bar) {
+            std::vector<MenuEntry> entries;
+            collect_menu_entries(bar, entries);
+            const bool statesTheCost = std::ranges::any_of(entries, [](const MenuEntry& entry) {
+                return entry.text.find(L"same time") != std::wstring::npos &&
+                       entry.text.find(L"6.3") != std::wstring::npos;
+            });
+            CHECK(statesTheCost);
+            DestroyMenu(bar);
+        }
+    }
+    for (const auto& preset : neural_presets::kPresets) {
+        CHECK(!preset.cost.empty());
+        // A number or the word "same" - never an adjective. The tooltip this
+        // is modelled on quotes VMAF and encode time, not "a bit slower".
+        CHECK(preset.cost.find("measured") != std::string_view::npos);
+    }
+
+    using namespace neural_presets;
+    CHECK(kPresetCount >= 2);
+
+    // The recommended default is the settings the project actually measures.
+    CHECK(kPresets[kDefaultPresetIndex].settings == NeuralSettings{});
+    CHECK_EQ(size_t{0}, kDefaultPresetIndex);
+    CHECK(kPresets[kDefaultPresetIndex].label.find("recommended") != std::string_view::npos);
+
+    for (size_t index = 0; index < kPresetCount; ++index) {
+        const Preset& preset = kPresets[index];
+        CHECK(!preset.key.empty());
+        CHECK(!preset.label.empty());
+        CHECK(!preset.description.empty());
+
+        // Inside the ranges NeuralSettings.cpp clamps to on load. Outside them
+        // a preset cannot round-trip through the ini.
+        CHECK(preset.settings.intensity >= 0.0f && preset.settings.intensity <= kIntensityMax);
+        CHECK(preset.settings.localTone >= 0.0f && preset.settings.localTone <= 2.0f);
+        CHECK(preset.settings.localStructure >= 0.0f && preset.settings.localStructure <= 2.0f);
+        // Off or a value the runtime acts on - never one it renders as Off -
+        // so a preset is exactly what loading it back from the ini gives.
+        CHECK_EQ(skin_structure::Normalize(preset.settings.skinStructure), preset.settings.skinStructure);
+        CHECK(preset.settings.colorStrength >= 0.0f && preset.settings.colorStrength <= 1.0f);
+        CHECK(preset.settings.preset >= 0 && preset.settings.preset <= 3);
+        CHECK(preset.settings.style >= 0 && preset.settings.style <= 2);
+
+        // Recognised by both lookups, and by its own key.
+        CHECK_EQ(index, IndexOf(preset.settings));
+        CHECK_EQ(index, IndexOfKey(preset.key));
+    }
+
+    // Distinct keys, labels and settings: two presets that resolve to the same
+    // settings would make IndexOf ambiguous and the UI show the wrong one.
+    for (size_t a = 0; a < kPresetCount; ++a)
+        for (size_t b = a + 1; b < kPresetCount; ++b) {
+            CHECK(kPresets[a].key != kPresets[b].key);
+            CHECK(kPresets[a].label != kPresets[b].label);
+            CHECK(!(kPresets[a].settings == kPresets[b].settings));
+        }
+
+    // Editing a preset is the expected path, and lands on Custom rather than
+    // on a neighbouring preset.
+    NeuralSettings edited = kPresets[kDefaultPresetIndex].settings;
+    edited.intensity = 1.37f;
+    CHECK_EQ(kPresetCount, IndexOf(edited));
+    CHECK_EQ(kPresetCount, IndexOfKey("no-such-preset"));
+    CHECK_EQ(kPresetCount, IndexOfKey(""));
+}
+
+// The comparison reference conversion runs on every presented frame once the
+// viewer picks Blend, Split or Wipe, which a scalar double pass over 3.69 Mpx
+// cannot do inside a 16.68 ms budget. Speeding it up is only allowed if the
+// picture does not change, so this pins the output against an independent
+// transcription of the original scalar arithmetic - not against the optimised
+// code's own idea of what it should produce.
+void nv12_reference_conversion_is_bit_identical_to_the_scalar_original_test()
+{
+    // The arithmetic exactly as it was written inline in main.cpp, kept here
+    // as the thing the fast path has to agree with.
+    const auto scalar = [](const uint8_t* nv12, uint32_t width, uint32_t height,
+                           std::vector<uint8_t>& bgra) {
+        bgra.resize(size_t(width) * height * 4u);
+        const uint8_t* luma = nv12;
+        const uint8_t* chroma = nv12 + size_t(width) * height;
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* chromaRow = chroma + size_t(y / 2u) * width;
+            uint8_t* out = bgra.data() + size_t(y) * width * 4u;
+            for (uint32_t x = 0; x < width; ++x) {
+                const double luminance = (double(luma[size_t(y) * width + x]) - 16.0) / 219.0;
+                const double blueDiff = (double(chromaRow[(x & ~1u)]) - 128.0) / 224.0;
+                const double redDiff = (double(chromaRow[(x & ~1u) + 1u]) - 128.0) / 224.0;
+                const double red = luminance + 1.5748 * redDiff;
+                const double green = luminance - 0.1873 * blueDiff - 0.4681 * redDiff;
+                const double blue = luminance + 1.8556 * blueDiff;
+                const auto clamp8 = [](double value) {
+                    return uint8_t(std::lround(std::clamp(value, 0.0, 1.0) * 255.0));
+                };
+                out[size_t(x) * 4u + 0u] = clamp8(blue);
+                out[size_t(x) * 4u + 1u] = clamp8(green);
+                out[size_t(x) * 4u + 2u] = clamp8(red);
+                out[size_t(x) * 4u + 3u] = 255u;
+            }
+        }
+    };
+
+    // Wide enough to cross several parallel row bands, and the content walks
+    // the whole 0..255 range on all three planes so every table entry and both
+    // clamp arms are exercised - the out-of-gamut corners are where a
+    // fixed-point rewrite would have drifted.
+    constexpr uint32_t width = 64, height = 96;
+    std::vector<uint8_t> frame(size_t(width) * height + size_t(width) * height / 2u);
+    uint32_t state = 12345u;
+    for (auto& byte : frame) {
+        state = state * 1664525u + 1013904223u;
+        byte = uint8_t(state >> 24);
+    }
+
+    std::vector<uint8_t> expected, actual;
+    scalar(frame.data(), width, height, expected);
+    nv12::ToBgraBt709Limited(frame.data(), width, height, actual);
+    CHECK_EQ(expected.size(), actual.size());
+    CHECK(expected == actual);
+
+    // The extremes on their own, so a failure points at a value rather than at
+    // a pseudo-random offset.
+    for (const uint8_t fill : {uint8_t{0}, uint8_t{16}, uint8_t{128}, uint8_t{235}, uint8_t{255}}) {
+        std::vector<uint8_t> flat(frame.size(), fill);
+        scalar(flat.data(), width, height, expected);
+        nv12::ToBgraBt709Limited(flat.data(), width, height, actual);
+        CHECK(expected == actual);
+    }
+
+    // Refusals are part of the contract: odd geometry has no half-resolution
+    // chroma plane, and the caller relies on the buffer being left alone.
+    std::vector<uint8_t> untouched{1, 2, 3};
+    nv12::ToBgraBt709Limited(frame.data(), 63, 96, untouched);
+    CHECK_EQ(size_t{3}, untouched.size());
+    nv12::ToBgraBt709Limited(nullptr, width, height, untouched);
+    CHECK_EQ(size_t{3}, untouched.size());
+}
+
+// LookupRender verifies the full SHA-256 of the payload and both sidecars
+// before any of this runs, so the entry is known intact. The player then
+// ProbeMedia'd it and treated any failure as the entry being wrong - including
+// the probe not running at all, which MediaPipeline reports for something as
+// ordinary as the helper not resolving. Quarantine moves the entry to
+// staging/invalid-cache-*, and the sweep deletes any `invalid*` name
+// unconditionally on the next manager construction. An antivirus holding the
+// unsigned ffprobe.exe therefore destroyed hours of hash-verified GPU time as
+// the user opened each of their rendered videos.
+void a_probe_that_could_not_run_does_not_condemn_a_cached_render_test()
+{
+    using namespace cached_render;
+    const Evidence good{true, true, true, true};
+    CHECK(Judge(good) == Verdict::Serve);
+
+    // The probe ran and contradicted the manifest: the entry really is wrong.
+    Evidence wrongGeometry = good; wrongGeometry.geometryMatches = false;
+    CHECK(Judge(wrongGeometry) == Verdict::Discard);
+    Evidence wrongDuration = good; wrongDuration.durationMatches = false;
+    CHECK(Judge(wrongDuration) == Verdict::Discard);
+
+    // The probe could not run. Nothing was learned, so the entry is not served
+    // and not destroyed either.
+    Evidence noProbe = good; noProbe.probeRan = false;
+    CHECK(Judge(noProbe) == Verdict::Unverified);
+
+    // Not even when the probe-only fields are default-false, which is what they
+    // are whenever ProbeMedia fails closed - the case that caused the loss.
+    CHECK(Judge(Evidence{false, true, false, false}) == Verdict::Unverified);
+
+    // The manifest comparison needs no child process. A mismatch there
+    // condemns the entry whether or not the probe ran, so a stale entry is
+    // still retired while ffprobe is broken.
+    CHECK(Judge(Evidence{false, false, false, false}) == Verdict::Discard);
+    Evidence wrongManifest = good; wrongManifest.manifestMatches = false;
+    CHECK(Judge(wrongManifest) == Verdict::Discard);
+}
+
+// Two player instances shared cacheRoot/live. Enabling neural rendering in the
+// second ran remove_all over the first instance's finalized segments, and the
+// first kept reporting them covered because NeuralSegmentIndex is in-memory
+// arithmetic - so it seeked into "covered" ground and failed to open the file.
+// Both then wrote job1/neural-00000.mkv into the same directory, because the
+// run id is a per-process counter.
+//
+// Separately, m_cacheRoot is only assigned when a writable root was prepared.
+// Without one the path became the relative "live" and that same remove_all ran
+// against the process working directory - on a portable install on a read-only
+// share, which is the exact case the LocalAppData fallback exists for.
+void live_session_directory_is_per_process_and_never_relative_test()
+{
+    using live_session::SessionDirectory;
+    const std::filesystem::path root = L"D:\\cache\\v1";
+
+    // Named after the process, so one instance's removal cannot reach another's.
+    const auto mine = SessionDirectory(root, 4242);
+    const auto theirs = SessionDirectory(root, 9001);
+    CHECK(mine != theirs);
+    CHECK(mine.is_absolute());
+    CHECK_EQ(root / L"live" / L"pid4242", mine);
+
+    // Both still live under the root, so Clear and the size accounting can find
+    // them by walking one directory.
+    CHECK_EQ(root / L"live", mine.parent_path());
+    CHECK_EQ(root / L"live", theirs.parent_path());
+
+    // No root means no live directory - not a relative one. The caller has to
+    // read this as "no live session is possible"; anything else would put a
+    // recursive delete on the working directory.
+    CHECK(SessionDirectory({}, 4242).empty());
+    CHECK(!SessionDirectory({}, 4242).is_absolute());
+
+    // Same process, same answer: the directory is recomputed on every session
+    // and has to agree with the one the previous session removed.
+    CHECK_EQ(mine, SessionDirectory(root, 4242));
+}
+
+// The player runs on an audio master clock. When the reader thread ends - pipe
+// EOF, the ffmpeg child dying, waveOutWrite failing after a device change - the
+// queued buffers drain and waveOutGetPosition freezes, but hasAudioData stays
+// set until Stop(), so PositionSeconds kept returning the frozen value. The
+// presentation gate holds each frame until the clock reaches its due time, so
+// video stopped for the rest of the file: a 60 s video with a 10 s audio track
+// played 10.7 s and then showed nothing, with no error and no log line.
+void audio_clock_stops_being_the_master_once_it_stops_advancing_test()
+{
+    using namespace audio_clock;
+    StallState state;
+
+    // A clock that advances is a clock, however slowly. waveOutGetPosition
+    // quantizes to about 10 ms, so repeats between moves are normal and must
+    // not on their own condemn it.
+    CHECK(Usable(state, 1.000, 100.0, true));
+    CHECK(Usable(state, 1.000, 100.005, true));
+    CHECK(Usable(state, 1.010, 100.010, true));
+    CHECK(Usable(state, 1.010, 100.4, true));
+    CHECK(Usable(state, 1.020, 100.5, true));
+
+    // Standing still past the window is not.
+    CHECK(Usable(state, 1.020, 100.5 + kStallSeconds * 0.99, true));
+    CHECK(!Usable(state, 1.020, 100.5 + kStallSeconds, true));
+    CHECK(!Usable(state, 1.020, 200.0, true));
+
+    // Moving again restores it: the player already switches between the audio
+    // and steady clocks when audio starts and stops, and one underrun should
+    // not demote audio for the rest of a film.
+    CHECK(Usable(state, 1.030, 200.1, true));
+    CHECK(Usable(state, 1.030, 200.2, true));
+
+    // A paused clock standing still is correct, not stalled - and the window
+    // starts again from the resume rather than counting the pause against it.
+    StallState paused;
+    CHECK(Usable(paused, 5.0, 0.0, true));
+    for (double t = 0.0; t <= 60.0; t += 1.0) CHECK(Usable(paused, 5.0, t, false));
+    // Resumed at t=60 and still standing still: inside the window from the
+    // resume, not from whenever the clock last moved an hour of pause ago.
+    CHECK(Usable(paused, 5.0, 60.0 + kStallSeconds * 0.99, true));
+    CHECK(!Usable(paused, 5.0, 60.0 + kStallSeconds, true));
+
+    // A seek moves the position backwards. That is movement.
+    StallState seeking;
+    CHECK(Usable(seeking, 90.0, 0.0, true));
+    CHECK(!Usable(seeking, 90.0, kStallSeconds, true));
+    CHECK(Usable(seeking, 12.0, kStallSeconds, true));
+
+    // Reset is what Start and Seek use, and it must not leave the old
+    // stand-still time behind for the new session to inherit.
+    StallState reused;
+    CHECK(Usable(reused, 7.0, 500.0, true));
+    CHECK(!Usable(reused, 7.0, 500.0 + kStallSeconds, true));
+    Reset(reused);
+    CHECK(Usable(reused, 7.0, 500.0 + kStallSeconds, true));
+}
+
+// A stall used to hand the player -1, which fell back to its own steady
+// clock anchored at the last seek, and the audio clock was taken back with a
+// snap the moment audio moved again. After a 1 s YouTube underrun video ran
+// ahead and then stood still for a second. The clock now carries on from the
+// last position it handed out and slews back at no more than 5 %.
+void audio_clock_carries_through_a_stall_and_slews_back_instead_of_jumping_test()
+{
+    using namespace audio_clock;
+    StallState stall;
+    Continuity continuity;
+    const auto read = [&](double audio, double wall, bool playing = true) {
+        return Present(continuity, audio, Usable(stall, audio, wall, playing), wall, playing);
+    };
+
+    // Healthy: the audio position is handed through untouched, repeats and
+    // all, so nothing about ordinary playback changes.
+    for (int tick = 0; tick <= 100; ++tick) {
+        const double audio = 10.0 + std::floor(tick / 2) * 0.02;
+        CHECK_EQ(audio, read(audio, 100.0 + tick * 0.01));
+    }
+    CHECK(!continuity.bridging);
+
+    // An underrun: audio stands at 11.0 from wall 101.0. For the stall window
+    // it is still the clock, and video holds on it.
+    double last = read(11.0, 101.0);
+    CHECK_EQ(11.0, last);
+    double wall = 101.0;
+    for (; wall < 101.0 + kStallSeconds - 0.005; wall += 0.01) CHECK_EQ(11.0, read(11.0, wall));
+    // Declared stalled: carried on from where it was, at wall-clock rate,
+    // with no step at the moment it was declared.
+    last = 11.0;
+    for (; wall < 102.0; wall += 0.01) {
+        const double now = read(11.0, wall);
+        CHECK(now >= last);
+        CHECK(now - last <= 0.0101);
+        last = now;
+    }
+    CHECK(continuity.bridging);
+    CHECK(std::abs(last - (11.0 + (102.0 - 101.0 - kStallSeconds))) < 0.02);
+
+    // Audio resumes from where it stopped - behind the carried clock. The
+    // clock never runs backwards and never changes speed by more than 5 %,
+    // and it lands exactly on the audio once the gap is walked shut.
+    const double resumedAt = wall;
+    bool monotonic = true, gentle = true;
+    double audio = 11.0;
+    for (; wall < resumedAt + 20.0 && continuity.bridging; wall += 0.01) {
+        audio = 11.0 + (wall - resumedAt);
+        const double now = read(audio, wall);
+        if (now < last) monotonic = false;
+        const double rate = (now - last) / 0.01;
+        if (rate < 1.0 - kMaxSlewRate - 1e-6 || rate > 1.0 + kMaxSlewRate + 1e-6) gentle = false;
+        last = now;
+    }
+    CHECK(monotonic);
+    CHECK(gentle);
+    CHECK(!continuity.bridging);
+    CHECK_EQ(audio, last);
+    // About ten seconds to walk half a second shut at 5 %.
+    CHECK(wall - resumedAt > 8.0);
+    CHECK(wall - resumedAt < 12.0);
+    audio += 0.01; wall += 0.01;
+    CHECK_EQ(audio, read(audio, wall));
+
+    // A gap past kSnapSeconds is closed in one step: slewing three seconds
+    // would keep sound and picture apart for a minute.
+    StallState longStall;
+    Continuity longContinuity;
+    const auto readLong = [&](double position, double at) {
+        return Present(longContinuity, position, Usable(longStall, position, at, true), at, true);
+    };
+    CHECK_EQ(50.0, readLong(50.0, 0.0));
+    for (double at = 0.01; at < 3.5; at += 0.01) readLong(50.0, at);
+    CHECK(longContinuity.bridging);
+    CHECK_EQ(50.01, readLong(50.01, 3.5));
+    CHECK(!longContinuity.bridging);
+
+    // Audio that comes back AHEAD of the carried clock is chased up the same
+    // gentle way.
+    Continuity ahead;
+    CHECK_EQ(5.0, Present(ahead, 5.0, true, 0.0, true));
+    CHECK_EQ(5.1, Present(ahead, 5.0, false, 0.1, true));
+    const double chased = Present(ahead, 5.5, true, 0.2, true);
+    CHECK(std::abs(chased - (5.2 + kMaxSlewRate * 0.1)) < 1e-9);
+    CHECK(ahead.bridging);
+
+    // Paused, the carried clock stands still.
+    Continuity paused;
+    CHECK_EQ(7.0, Present(paused, 7.0, false, 0.0, true));
+    CHECK_EQ(7.0, Present(paused, 7.0, true, 30.0, false));
+
+    // The player does not read the clock while paused. Without PauseChanged
+    // the first read after a minute's pause - audio not yet moving again -
+    // counted the minute as a stall, and as a minute for the clock to carry.
+    StallState resumed;
+    Continuity resumedContinuity;
+    CHECK_EQ(20.0, Present(resumedContinuity, 20.0, Usable(resumed, 20.0, 0.0, true), 0.0, true));
+    PauseChanged(resumed, resumedContinuity, 0.01);
+    PauseChanged(resumed, resumedContinuity, 60.0);
+    CHECK(Usable(resumed, 20.0, 60.005, true));
+    CHECK_EQ(20.0, Present(resumedContinuity, 20.0, true, 60.005, true));
+    CHECK(!resumedContinuity.bridging);
+
+    // Reset is what Start and Stop use: the next reading is taken as it is.
+    Reset(continuity);
+    CHECK_EQ(3.0, Present(continuity, 3.0, true, 500.0, true));
+    CHECK(!continuity.bridging);
+}
+
+// A resident helper serves several jobs from one process. Whenever the next
+// job's geometry, fps, source layout, colour conversion or capture format
+// differs from the last, Initialize calls Release, which shuts the capture
+// worker down - and the worker then has to serve the new job. It did not: the
+// quit latch was never cleared, so the restarted thread exited after one copy
+// and left a joinable-but-finished thread that the Post after it declined to
+// replace. That Post notified nobody and the next Join waited forever, wedging
+// the helper on the third captured frame of the second job while it held the
+// D3D12 device and about a GiB of DLSS feature memory. There is no overall
+// timeout on the parent side, so the render never completed.
+void deferred_capture_serves_a_second_job_after_a_shutdown_test()
+{
+    struct View { int id{}; };
+    struct Copy {
+        void operator()(const View& view, std::vector<uint8_t>& pixels) const
+        {
+            pixels.assign(4, static_cast<uint8_t>(view.id));
+        }
+    };
+    using Worker = DeferredCaptureWorker<View, Copy>;
+
+    // Leaked deliberately if the sequence wedges: a deadlocked worker can never
+    // be destroyed, and ~DeferredCaptureWorker would block the test process on
+    // the join its own Shutdown can no longer reach.
+    auto* worker = new Worker();
+
+    std::promise<std::vector<uint8_t>> result;
+    auto finished = result.get_future();
+    std::thread runner([worker, &result] {
+        std::vector<uint8_t> pixels;
+        // Job 1, then the Release between jobs.
+        worker->Post(View{1}, std::vector<uint8_t>(4));
+        worker->Join(pixels);
+        worker->Shutdown();
+
+        // Job 2. The first Post restarts a thread; the second is the one that
+        // used to find it finished-but-joinable and start nothing.
+        worker->Post(View{2}, std::vector<uint8_t>(4));
+        worker->Join(pixels);
+        worker->Post(View{3}, std::vector<uint8_t>(4));
+        worker->Join(pixels);
+        result.set_value(pixels);
+    });
+
+    if (finished.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+        CHECK(false && "second job wedged: Join never returned");
+        runner.detach();
+        return;
+    }
+    runner.join();
+
+    // The bytes have to come from the third Post, not a stale buffer left by
+    // the second: a worker that never ran would return the previous contents.
+    const auto pixels = finished.get();
+    CHECK_EQ(size_t{4}, pixels.size());
+    if (pixels.size() == 4) CHECK_EQ(3, int(pixels[0]));
+    delete worker;
+}
+
+// Log lines are formatted outside the lock and written with one unbuffered
+// WriteFile each, so the lock covers nothing but the file. Every line written
+// from several threads at once has to land whole, once, with its timestamp.
+void log_lines_written_concurrently_land_whole_and_once_test()
+{
+    const std::string token = "log-concurrency-" + std::to_string(GetCurrentProcessId()) + "-" +
+                              std::to_string(GetTickCount64());
+    constexpr int kThreads = 8, kLines = 200;
+    {
+        std::vector<std::jthread> writers;
+        for (int thread = 0; thread < kThreads; ++thread) {
+            writers.emplace_back([&token, thread] {
+                for (int line = 0; line < kLines; ++line)
+                    LOG(token << " t=" << thread << " n=" << line << " payload=" << std::string(64, 'x'));
+            });
+        }
+    }
+    // A roll mid-test moves the earlier lines to the .1 file.
+    std::filesystem::path previous = Log::Path();
+    previous += L".1";
+    std::vector<int> seen(kThreads * kLines, 0);
+    size_t malformed = 0;
+    for (const auto& path : {previous, Log::Path()}) {
+        std::ifstream input(path, std::ios::binary);
+        for (std::string line; std::getline(input, line);) {
+            const size_t at = line.find(token);
+            if (at == std::string::npos) continue;
+            int thread = -1, index = -1;
+            const bool timestamped = line.size() > 15 && line[0] == '[' && line[13] == ']' && at == 15;
+            if (!timestamped ||
+                sscanf_s(line.c_str() + at + token.size(), " t=%d n=%d", &thread, &index) != 2 ||
+                thread < 0 || thread >= kThreads || index < 0 || index >= kLines ||
+                line.find(" payload=" + std::string(64, 'x')) == std::string::npos) {
+                ++malformed;
+                continue;
+            }
+            ++seen[size_t(thread) * kLines + size_t(index)];
+        }
+    }
+    CHECK_EQ(size_t{0}, malformed);
+    CHECK(std::all_of(seen.begin(), seen.end(), [](int count) { return count == 1; }));
+}
+
+// The capture's fence wait runs on the worker with the copy, so what the wait
+// found - and which frame the slot held - has to come back to the renderer's
+// thread with the bytes. Join hands back the view as the copy left it, per
+// post, and a Join that finds nothing posted touches neither output.
+void deferred_capture_join_returns_the_view_the_copy_updated_test()
+{
+    struct View { int id{}; int waited{}; bool completed{}; };
+    struct Copy {
+        void operator()(View& view, std::vector<uint8_t>& pixels) const
+        {
+            view.waited = view.id * 10;
+            view.completed = view.id != 2;
+            pixels.assign(4, static_cast<uint8_t>(view.id));
+        }
+    };
+    DeferredCaptureWorker<View, Copy> worker;
+    for (int id = 1; id <= 3; ++id) {
+        worker.Post(View{id}, std::vector<uint8_t>(4));
+        std::vector<uint8_t> pixels;
+        View joined;
+        CHECK(worker.Join(pixels, &joined));
+        CHECK_EQ(id, joined.id);
+        CHECK_EQ(id * 10, joined.waited);
+        CHECK_EQ(id != 2, joined.completed);
+        CHECK_EQ(size_t{4}, pixels.size());
+        if (!pixels.empty()) CHECK_EQ(id, int(pixels[0]));
+    }
+    std::vector<uint8_t> untouched{9};
+    View unchanged{7, 7, true};
+    CHECK(!worker.Join(untouched, &unchanged));
+    CHECK_EQ(7, unchanged.id);
+    CHECK_EQ(size_t{1}, untouched.size());
+}
+
+// A screen recording's spacing is the evidence; its two declared rates are
+// not. r_frame_rate is the largest interval the container could express and
+// avg_frame_rate is frames over duration, so a capture that ran at 60 and
+// dropped a tenth of its frames declares 60 and 54 - far enough apart to be
+// caught - while one that dropped almost nothing declares 60 and 59.8 and
+// sails through, and a perfectly constant file whose duration metadata is
+// slightly long is refused for no reason. This classifies the spacing itself.
+void variable_frame_rate_is_classified_from_the_spacing_not_the_declared_rates_test()
+{
+    using namespace variable_frame_rate;
+
+    const auto timesAt = [](double interval, size_t count) {
+        std::vector<double> times;
+        for (size_t index = 0; index < count; ++index) times.push_back(double(index) * interval);
+        return times;
+    };
+
+    // Exactly constant 23.976: nothing deviates.
+    const auto film = Classify(timesAt(1001.0 / 24000.0, 120));
+    CHECK(film.decided);
+    CHECK(film.constant);
+    CHECK_EQ(size_t{0}, film.deviatingIntervals);
+
+    // The same rate in a container that only stores milliseconds, so every
+    // interval alternates between 41 ms and 42 ms. That is rounding, not a
+    // variable rate, and refusing frame generation on it would be wrong.
+    std::vector<double> rounded;
+    for (size_t index = 0; index < 120; ++index)
+        rounded.push_back(std::round(double(index) * (1001.0 / 24000.0) * 1000.0) / 1000.0);
+    const auto millisecond = Classify(rounded);
+    CHECK(millisecond.decided);
+    CHECK(millisecond.constant);
+
+    // A screen recording: mostly 60 fps, with frames the compositor never
+    // produced. This is the case the whole check exists for.
+    std::vector<double> capture;
+    double now = 0.0;
+    for (size_t index = 0; index < 120; ++index) {
+        capture.push_back(now);
+        now += (index % 7 == 0) ? 3.0 / 60.0 : 1.0 / 60.0;
+    }
+    const auto recording = Classify(capture);
+    CHECK(recording.decided);
+    CHECK(!recording.constant);
+
+    // One dropped frame in a hundred is a hiccup, not a variable rate.
+    std::vector<double> hiccup = timesAt(1.0 / 30.0, 120);
+    for (size_t index = 60; index < hiccup.size(); ++index) hiccup[index] += 1.0 / 30.0;
+    const auto single = Classify(hiccup);
+    CHECK(single.decided);
+    CHECK(single.constant);
+
+    // Too few intervals to tell. It must say so rather than guess, because
+    // the caller keeps its existing answer when this one is undecided.
+    const auto tooFew = Classify(timesAt(1.0 / 30.0, 4));
+    CHECK(!tooFew.decided);
+
+    // Non-monotonic timestamps - B-frames handed over in coded order - carry
+    // no spacing information at all and must not read as wild variation.
+    std::vector<double> outOfOrder = timesAt(1.0 / 30.0, 120);
+    std::swap(outOfOrder[10], outOfOrder[11]);
+    const auto reordered = Classify(outOfOrder);
+    CHECK(reordered.decided);
+    CHECK(reordered.constant);
+}
+
+// A container lists packets in DECODE order. With B-frames that is
+// 0,3,1,2,6,4,5,... frame periods, and two gaps in every three come out
+// non-positive - so the probe, which classified exactly that list, left every
+// film and phone video undecided and fell back to the declared rates the
+// spacing test exists to replace. PresentationOrder rebuilds the order the
+// frames are shown in; the cut at the end of the read must not leave a
+// doubled gap where a B-frame decoded after the cut belongs.
+void variable_frame_rate_is_decided_on_b_frame_decode_order_test()
+{
+    using namespace variable_frame_rate;
+
+    // Presentation times, reordered the way an IPBB... stream decodes them:
+    // each anchor goes ahead of the two B-frames shown before it.
+    const auto decodeOrder = [](const std::vector<double>& shown) {
+        std::vector<double> coded;
+        if (shown.empty()) return coded;
+        coded.push_back(shown[0]);
+        for (size_t anchor = 3; anchor < shown.size(); anchor += 3) {
+            coded.push_back(shown[anchor]);
+            coded.push_back(shown[anchor - 2]);
+            coded.push_back(shown[anchor - 1]);
+        }
+        return coded;
+    };
+    const size_t read = kRecommendedSamples + kReorderSlack + 1;
+
+    std::vector<double> film;
+    for (size_t index = 0; index < read; ++index) film.push_back(double(index) * (1001.0 / 24000.0));
+    const std::vector<double> coded = decodeOrder(film);
+    // Exactly the lead's example at the head of the list.
+    const double period = 1001.0 / 24000.0;
+    const double expectedHead[] = {0.0, 3.0, 1.0, 2.0, 6.0, 4.0, 5.0};
+    for (size_t index = 0; index < std::size(expectedHead); ++index)
+        CHECK(std::abs(coded[index] - expectedHead[index] * period) < 1e-12);
+
+    // The old probe's answer on that list: undecided, never constant.
+    const auto raw = Classify(coded);
+    CHECK(!raw.decided);
+    CHECK(raw.reorderedIntervals > 0);
+
+    const auto sorted = PresentationOrder(coded, kRecommendedSamples);
+    CHECK_EQ(kRecommendedSamples, sorted.size());
+    const auto constant = Classify(sorted);
+    CHECK(constant.decided);
+    CHECK(constant.constant);
+    CHECK_EQ(size_t{0}, constant.deviatingIntervals);
+    CHECK_EQ(size_t{0}, constant.reorderedIntervals);
+
+    // Cut the read right after an anchor, so its two B-frames are missing:
+    // sorting alone would end on a gap three periods wide. The slack trims it.
+    // coded is 0 then groups of {anchor, B, B}, so a length of 1 + 3g + 1
+    // ends on an anchor whose B-frames were never read.
+    std::vector<double> cut = coded;
+    cut.resize(kRecommendedSamples + kReorderSlack - 2);
+    CHECK((cut.size() - 1) % 3 == 1);
+    const auto untrimmed = PresentationOrder(cut, cut.size());
+    CHECK(std::abs((untrimmed.back() - untrimmed[untrimmed.size() - 2]) - 3.0 * period) < 1e-9);
+    const auto trimmed = PresentationOrder(cut, kRecommendedSamples);
+    CHECK_EQ(kRecommendedSamples, trimmed.size());
+    for (size_t index = 1; index < trimmed.size(); ++index)
+        CHECK(std::abs((trimmed[index] - trimmed[index - 1]) - period) < 1e-9);
+
+    // A screen recording that also uses B-frames must still read as variable.
+    std::vector<double> capture;
+    double now = 0.0;
+    for (size_t index = 0; index < read; ++index) {
+        capture.push_back(now);
+        now += (index % 7 == 0) ? 3.0 / 60.0 : 1.0 / 60.0;
+    }
+    const auto variable = Classify(PresentationOrder(decodeOrder(capture), kRecommendedSamples));
+    CHECK(variable.decided);
+    CHECK(!variable.constant);
+}
+
+// The two rates a container declares and the spacing its packets actually
+// have can disagree in both directions, and the spacing is the one that is
+// true. Both halves matter: a capture wrongly called constant hands frame
+// generation a timeline it will lurch on, and a film wrongly called variable
+// loses the feature for no reason.
+void constant_frame_rate_is_decided_by_the_spacing_not_the_declared_rates_test()
+{
+    MediaFixture fixture;
+
+    // Declares a flat 60 against 60, which the two-rate comparison calls
+    // constant, while its packets are a screen recording's - mostly 60 fps
+    // with frames the compositor never produced.
+    auto capture = VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(capture->Open(L"vfrspacing_capture", MediaSourceKind::LocalFile));
+    CHECK(!capture->ConstantFrameRate());
+
+    // Declares 23 against 24, far enough apart that the two-rate comparison
+    // calls it variable, while every packet is exactly 1/24 apart.
+    auto film = VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(film->Open(L"vfrspacing_film", MediaSourceKind::LocalFile));
+    CHECK(film->ConstantFrameRate());
+
+    // The same film coded with B-frames, whose packets the container lists in
+    // decode order. The probe used to classify that order as-is and come back
+    // undecided, which left the declared 23-against-24 in charge.
+    auto bframes = VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(bframes->Open(L"vfrspacing_bframes", MediaSourceKind::LocalFile));
+    CHECK(bframes->ConstantFrameRate());
+
+    // No packets came back - a container ffprobe can describe but not walk.
+    // The declared rates are all there is, so the old answer stands rather
+    // than the absence of evidence reading as either verdict.
+    auto silent = VideoDecoderTestAccess::Create(fixture.directory);
+    CHECK(silent->Open(L"vfrspacing_nopackets", MediaSourceKind::LocalFile));
+    CHECK(!silent->ConstantFrameRate());
+}
+
+// A seek tears the stream down mid-waveform and the next one starts mid-
+// waveform, so the endpoint sees a step from some arbitrary sample value to
+// zero and back. That step is the click, and it is on every seek, every pause
+// and every resume - the controls a viewer uses most.
+//
+// A raised cosine rather than a straight line: its slope is zero at both ends,
+// so the ramp does not replace one discontinuity in the signal with a smaller
+// one in its derivative.
+// A stop or a seek right after audio started took about 600 ms: the ramped stop
+// waited for its tail to play out until the clock reached the last frame written,
+// the clock's frame count came out one short through a floating-point quotient,
+// and the wait was forty Sleep(2)s that each lasted a 15.6 ms tick.
+void audio_stop_waits_are_bounded_and_the_clock_counts_whole_frames_test()
+{
+    // IAudioClock in bytes at a float stereo byte rate: every frame written is
+    // counted, however far into the stream - the double quotient said 1727 of 1728.
+    for (const uint32_t rate : {44100u, 48000u, 96000u, 192000u}) {
+        const uint64_t bytesPerFrame = 8, frequency = uint64_t(rate) * bytesPerFrame;
+        for (const uint64_t frames : {uint64_t{1}, uint64_t{1728}, uint64_t{96202}, uint64_t{301056},
+                                      uint64_t{rate} * 3600u * 3u + 17u}) {
+            CHECK_EQ(frames, audio_clock::FramesFromClock(frames * bytesPerFrame, frequency, rate));
+            // Part of a frame is not a frame.
+            CHECK_EQ(frames - 1, audio_clock::FramesFromClock(frames * bytesPerFrame - 1, frequency, rate));
+        }
+    }
+    // A clock whose frequency is not a multiple of the rate (a 10 MHz QPC-style
+    // counter) still floors the exact quotient.
+    CHECK_EQ(uint64_t{48000}, audio_clock::FramesFromClock(10'000'000, 10'000'000, 48000));
+    CHECK_EQ(uint64_t{47999}, audio_clock::FramesFromClock(9'999'999, 10'000'000, 48000));
+    CHECK_EQ(uint64_t{0}, audio_clock::FramesFromClock(123, 0, 48000));
+
+    CHECK(audio_fade::Drained(1728, 1728));
+    CHECK(audio_fade::Drained(1727, 1728));   // the last frame is 20 microseconds
+    CHECK(!audio_fade::Drained(1726, 1728));
+    CHECK(audio_fade::Drained(0, 0));
+    // One buffer and a little: a 22 ms shared-mode buffer waits at most 42 ms, a
+    // long exclusive one its own length plus the same slack - never a count of
+    // sleeps whose length the system tick decides.
+    CHECK_EQ(42u, audio_fade::StopWaitBudgetMs(1056, 48000));
+    CHECK_EQ(120u, audio_fade::StopWaitBudgetMs(4800, 48000));
+    CHECK_EQ(0u, audio_fade::StopWaitBudgetMs(1056, 0));
+}
+
+void audio_fade_is_a_raised_cosine_that_starts_and_ends_flat_test()
+{
+    using namespace audio_fade;
+
+    // Four milliseconds at the two rates a mix format actually uses.
+    CHECK_EQ(uint32_t{192}, FrameCount(48000));
+    CHECK_EQ(uint32_t{176}, FrameCount(44100));
+    // No rate, no ramp - and never a division by zero.
+    CHECK_EQ(uint32_t{0}, FrameCount(0));
+
+    constexpr uint32_t fade = 192;
+    CHECK_EQ(0.0f, RampInGain(0, fade));
+    CHECK_EQ(1.0f, RampInGain(fade, fade));
+    // Past the end it stays open rather than wrapping back down.
+    CHECK_EQ(1.0f, RampInGain(fade * 4, fade));
+    CHECK(std::abs(RampInGain(fade / 2, fade) - 0.5f) < 1e-5f);
+    // A zero-length fade is "no fade", not "silence".
+    CHECK_EQ(1.0f, RampInGain(0, 0));
+
+    // Monotonic, and flat at both ends: the first and last steps are far
+    // smaller than the step through the middle, which is what a straight line
+    // would not give.
+    float previous = -1.0f;
+    for (uint32_t frame = 0; frame <= fade; ++frame) {
+        const float gain = RampInGain(frame, fade);
+        CHECK(gain >= previous);
+        previous = gain;
+    }
+    const float firstStep = RampInGain(1, fade) - RampInGain(0, fade);
+    const float middleStep = RampInGain(fade / 2 + 1, fade) - RampInGain(fade / 2, fade);
+    const float lastStep = RampInGain(fade, fade) - RampInGain(fade - 1, fade);
+    CHECK(firstStep * 10.0f < middleStep);
+    CHECK(lastStep * 10.0f < middleStep);
+
+    // The out-ramp is the in-ramp reflected, so a fade out into a fade in
+    // sums to unity and neither end has a step.
+    for (uint32_t frame = 0; frame <= fade; ++frame)
+        CHECK(std::abs(RampOutGain(frame, fade) + RampInGain(frame, fade) - 1.0f) < 1e-5f);
+}
+
+// Applied to real interleaved frames: every channel of a frame gets the same
+// gain, or the ramp would swing the stereo image while it runs.
+void audio_fade_in_scales_whole_frames_and_stops_once_it_is_open_test()
+{
+    using namespace audio_fade;
+    constexpr uint16_t channels = 2;
+    constexpr uint32_t fade = 8;
+
+    std::vector<float> samples(16, 1.0f);   // 8 frames, both channels at full scale
+    uint64_t faded = 0;
+    ApplyFadeIn(samples.data(), 8, channels, fade, faded);
+    CHECK_EQ(uint64_t{8}, faded);
+    CHECK_EQ(0.0f, samples[0]);
+    CHECK_EQ(0.0f, samples[1]);
+    for (size_t frame = 0; frame < 8; ++frame)
+        CHECK_EQ(samples[frame * 2], samples[frame * 2 + 1]);
+    // Strictly opening.
+    for (size_t frame = 1; frame < 8; ++frame) CHECK(samples[frame * 2] > samples[(frame - 1) * 2]);
+
+    // The next block is past the ramp and must be untouched, not scaled again.
+    std::vector<float> after(16, 0.25f);
+    ApplyFadeIn(after.data(), 8, channels, fade, faded);
+    CHECK_EQ(uint64_t{16}, faded);
+    for (const float sample : after) CHECK_EQ(0.25f, sample);
+
+    // A zero-length fade leaves the very first block alone.
+    std::vector<float> none(4, 0.5f);
+    uint64_t untouched = 0;
+    ApplyFadeIn(none.data(), 2, channels, 0, untouched);
+    for (const float sample : none) CHECK_EQ(0.5f, sample);
+}
+
+// The tail cannot be built from source that has not been decoded, so it decays
+// the last frame the endpoint was actually handed. Starting anywhere else
+// would insert the step it exists to remove.
+void audio_fade_out_tail_decays_from_the_last_frame_to_silence_test()
+{
+    using namespace audio_fade;
+    constexpr uint16_t channels = 2;
+    constexpr uint32_t fade = 8;
+    const float last[channels] = {0.5f, -0.25f};
+
+    std::vector<float> tail;
+    BuildFadeOutTail(last, channels, fade, tail);
+    CHECK_EQ(size_t{8 * 2}, tail.size());
+    // Continuous with what came before: the first tail frame IS the last frame.
+    CHECK_EQ(0.5f, tail[0]);
+    CHECK_EQ(-0.25f, tail[1]);
+    // And it reaches silence, so the step at the end is into zero.
+    CHECK(std::abs(tail[tail.size() - 2]) < 0.05f);
+    CHECK(std::abs(tail[tail.size() - 1]) < 0.05f);
+    // Both channels decay by the same factor throughout.
+    for (size_t frame = 0; frame < 8; ++frame)
+        CHECK(std::abs(tail[frame * 2] * -0.5f - tail[frame * 2 + 1]) < 1e-6f);
+
+    // Silence in, nothing to do.
+    const float quiet[channels] = {0.0f, 0.0f};
+    std::vector<float> none;
+    BuildFadeOutTail(quiet, channels, fade, none);
+    CHECK(none.empty());
+}
+
+// Auto-picking the director's commentary is one of the loudest complaints
+// there is about media players, and the path here could not do anything else:
+// ffmpeg was told `-map 0:a:0?`, which is the first audio stream whatever it
+// happens to be. A disc rip whose commentary is listed first played the
+// commentary, with no way to change it.
+void audio_track_selection_skips_the_tracks_nobody_asked_for_test()
+{
+    using namespace audio_track;
+    const auto make = [](int index, const char* language, bool isDefault) {
+        Track track; track.audioIndex = index; track.language = language;
+        track.isDefault = isDefault; track.codec = "ac3"; track.channels = 6;
+        return track;
+    };
+
+    // Nothing to choose from.
+    CHECK_EQ(kNoTrack, SelectDefault({}));
+
+    // One track, and it is the answer even if it is a commentary: a film has
+    // to have sound.
+    Track onlyCommentary = make(0, "eng", true);
+    onlyCommentary.comment = true;
+    const Track single[] = {onlyCommentary};
+    CHECK_EQ(size_t{0}, SelectDefault(single));
+
+    // The case that bites: commentary listed first, feature second.
+    Track commentary = make(0, "eng", true);
+    commentary.comment = true;
+    const Track rip[] = {commentary, make(1, "eng", false)};
+    CHECK_EQ(size_t{1}, SelectDefault(rip));
+
+    // Each of the four dispositions is disqualifying on its own.
+    for (int which = 0; which < 4; ++which) {
+        Track flagged = make(0, "eng", true);
+        if (which == 0) flagged.comment = true;
+        if (which == 1) flagged.visualImpaired = true;
+        if (which == 2) flagged.descriptions = true;
+        if (which == 3) flagged.hearingImpaired = true;
+        const Track pair[] = {flagged, make(1, "eng", false)};
+        CHECK_EQ(size_t{1}, SelectDefault(pair));
+    }
+
+    // Among ordinary tracks the container's own default wins, wherever it is.
+    const Track dubbed[] = {make(0, "fre", false), make(1, "eng", true), make(2, "deu", false)};
+    CHECK_EQ(size_t{1}, SelectDefault(dubbed));
+
+    // No default flagged anywhere: the first ordinary track, which is what a
+    // player without any of this would have done for the ordinary case.
+    const Track plain[] = {make(0, "fre", false), make(1, "eng", false)};
+    CHECK_EQ(size_t{0}, SelectDefault(plain));
+
+    // Every track flagged. Still has to produce sound, and still prefers the
+    // one the container marked.
+    Track first = make(0, "eng", false); first.descriptions = true;
+    Track second = make(1, "eng", true); second.comment = true;
+    const Track allFlagged[] = {first, second};
+    CHECK_EQ(size_t{1}, SelectDefault(allFlagged));
+}
+
+// The menu has to say enough that a viewer can tell two English tracks apart.
+void audio_track_labels_say_what_distinguishes_the_tracks_test()
+{
+    using namespace audio_track;
+    Track track;
+    track.audioIndex = 0; track.language = "eng"; track.codec = "ac3"; track.channels = 6;
+    CHECK_EQ(std::string("1. English - AC3 5.1"), Describe(track));
+
+    track.title = "Director's Commentary";
+    track.comment = true;
+    CHECK_EQ(std::string("1. English - Director's Commentary - AC3 5.1 (commentary)"), Describe(track));
+
+    // Untagged, which is most of what people actually have.
+    Track bare;
+    bare.audioIndex = 2; bare.codec = "aac"; bare.channels = 2;
+    CHECK_EQ(std::string("3. AAC stereo"), Describe(bare));
+
+    Track mono;
+    mono.audioIndex = 1; mono.codec = "opus"; mono.channels = 1;
+    mono.hearingImpaired = true;
+    CHECK_EQ(std::string("2. Opus mono (for the hard of hearing)"), Describe(mono));
+}
+
+// The player asked ffmpeg for `-map 0:a:0?` and offered nothing else, so a
+// rip whose commentary is listed first played the commentary. The tracks have
+// to be enumerated before the child is launched, and the choice has to
+// survive a seek, which tears the child down and starts another.
+void audio_player_enumerates_tracks_and_never_opens_on_the_commentary_test()
+{
+    MediaFixture fixture;
+    auto audio = AudioPlayerTestAccess::Create(fixture.directory);
+    CHECK(audio->Start(L"trackpick_commentary", 0.0, AudioStartState::Paused));
+
+    const auto& tracks = audio->AudioTracks();
+    CHECK_EQ(size_t{2}, tracks.size());
+    if (tracks.size() == 2) {
+        CHECK_EQ(std::string("1. English - Director's Commentary - AC3 5.1 (commentary)"),
+                 audio_track::Describe(tracks[0]));
+        CHECK_EQ(std::string("2. English - AC3 5.1"), audio_track::Describe(tracks[1]));
+        // What passthrough picks its IEC 61937 rate from.
+        CHECK_EQ(48000, tracks[1].sampleRate);
+    }
+    // The feature, not the commentary that is listed first and flagged default.
+    CHECK_EQ(1, audio->SelectedAudioTrack());
+
+    // A seek respawns the child, and the choice has to go with it rather than
+    // reverting to whatever is first.
+    CHECK(audio->Seek(5.0));
+    CHECK_EQ(1, audio->SelectedAudioTrack());
+    CHECK_EQ(size_t{2}, audio->AudioTracks().size());
+
+    // A viewer overriding the choice sticks, including across a seek.
+    CHECK(audio->SelectAudioTrack(0));
+    CHECK_EQ(0, audio->SelectedAudioTrack());
+    CHECK(audio->Seek(1.0));
+    CHECK_EQ(0, audio->SelectedAudioTrack());
+    // And a track that does not exist is refused rather than silencing the film.
+    CHECK(!audio->SelectAudioTrack(7));
+    CHECK_EQ(0, audio->SelectedAudioTrack());
+    audio->Stop();
+
+    // A source ffprobe cannot enumerate still plays: no list, first stream,
+    // which is exactly what the player did before any of this.
+    auto plain = AudioPlayerTestAccess::Create(fixture.directory);
+    CHECK(plain->Start(L"audiotrickle", 0.0, AudioStartState::Paused));
+    CHECK(plain->AudioTracks().empty());
+    CHECK_EQ(0, plain->SelectedAudioTrack());
+    plain->Stop();
+}
+
+// P1.25. Raw PCM carries no timestamps, so a track that starts 0.5 s after
+// the container played 0.5 s early until a seek passed its start. The owed
+// silence is the part of the gap a start has not already passed, measured on
+// the container's clock rather than from zero (this one starts at 1.0 s).
+void audio_track_that_starts_late_is_led_with_silence_test()
+{
+    using audio_track::LeadingSilenceSeconds;
+    CHECK_EQ(0.5, LeadingSilenceSeconds(0.5, 0.0, 0.0));
+    CHECK(std::abs(LeadingSilenceSeconds(0.5, 0.0, 0.2) - 0.3) < 1e-9);
+    CHECK_EQ(0.0, LeadingSilenceSeconds(0.5, 0.0, 0.5));
+    CHECK_EQ(0.0, LeadingSilenceSeconds(0.5, 0.0, 10.0));
+    // On the container's clock: an MPEG-TS whose clock starts at 1.4 s.
+    CHECK(std::abs(LeadingSilenceSeconds(1.423, 1.4, 0.0) - 0.023) < 1e-9);
+    // Unknown, rounding, and a track ahead of the container owe nothing.
+    CHECK_EQ(0.0, LeadingSilenceSeconds(std::nullopt, 0.0, 0.0));
+    CHECK_EQ(0.0, LeadingSilenceSeconds(0.5, std::nullopt, 0.0));
+    CHECK_EQ(0.0, LeadingSilenceSeconds(0.0004, 0.0, 0.0));
+    CHECK_EQ(0.0, LeadingSilenceSeconds(0.0, 0.5, 0.0));
+    CHECK_EQ(0.0, LeadingSilenceSeconds(std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0));
+
+    // Through the probe the player runs: stream and container start_time.
+    MediaFixture fixture;
+    auto audio = AudioPlayerTestAccess::Create(fixture.directory);
+    CHECK(audio->Start(L"lateaudio_half", 0.0, AudioStartState::Paused));
+    CHECK_EQ(0.5, audio->LeadingSilenceSeconds());
+    CHECK(audio->Seek(0.2));
+    CHECK(std::abs(audio->LeadingSilenceSeconds() - 0.3) < 1e-9);
+    CHECK(audio->Seek(3.0));
+    CHECK_EQ(0.0, audio->LeadingSilenceSeconds());
+    audio->Stop();
+    auto unknown = AudioPlayerTestAccess::Create(fixture.directory);
+    CHECK(unknown->Start(L"lateaudio_unknown", 0.0, AudioStartState::Paused));
+    CHECK_EQ(0.0, unknown->LeadingSilenceSeconds());
+    unknown->Stop();
+}
+
+// A track change and a device restart both respawn the child at the last
+// position the clock reported - and the clock is not read while paused. So
+// play to 60 s, pause, seek to 10 s, then pick another track: audio came back
+// at 60 s, and on resume the audio master clock dragged video forward 50 s
+// through a drop loop that decoded ~1,500 frames in one tick.
+void audio_restarts_at_a_paused_seek_rather_than_the_last_clock_reading_test()
+{
+    MediaFixture fixture;
+    auto audio = AudioPlayerTestAccess::Create(fixture.directory);
+    CHECK(audio->Start(L"trackpick_commentary", 60.0, AudioStartState::Playing));
+    audio->Pause(true);
+    // The player's paused seek: a fresh start at the target, still paused.
+    CHECK(audio->Start(L"trackpick_commentary", 10.0, AudioStartState::Paused));
+    CHECK_EQ(10.0, AudioPlayerTestAccess::SeekBase(*audio));
+    CHECK_EQ(1, audio->SelectedAudioTrack());
+    CHECK(audio->SelectAudioTrack(0));
+    CHECK_EQ(10.0, AudioPlayerTestAccess::SeekBase(*audio));
+    CHECK(audio->Paused());
+    audio->Stop();
+}
+
+// The audio helpers' stderr went to NUL, so a failed decode was a bare exit
+// code in the log - or, mid-stream, just a clock that stopped. The tail is
+// kept, bounded, and logged once when the child ends badly.
+void audio_helper_stderr_keeps_a_bounded_tail_and_reports_only_bad_exits_test()
+{
+    using namespace audio_stderr;
+    Tail tail;
+    CHECK(tail.Empty());
+    tail.Append("\r\n  \n", 5);
+    CHECK(tail.Empty());
+    const std::string lines = "first problem\r\nsecond problem\n";
+    tail.Append(lines.data(), lines.size());
+    CHECK(!tail.Empty());
+    CHECK_EQ(std::string("first problem | second problem"), tail.Line());
+
+    // Bounded: a flood keeps its last kTailBytes, and says the start is gone.
+    Tail flood;
+    const std::string block(1000, 'x');
+    for (int index = 0; index < 100; ++index) flood.Append(block.data(), block.size());
+    const std::string end = "\nthe reason it stopped\n";
+    flood.Append(end.data(), end.size());
+    const std::string line = flood.Line();
+    CHECK(line.starts_with("... "));
+    CHECK(line.ends_with(" | the reason it stopped"));
+    CHECK(line.size() <= kTailBytes + 8);
+    // One append larger than the whole tail keeps its end too.
+    Tail single;
+    std::string huge(kTailBytes * 3, 'y');
+    huge += "\nlast words";
+    single.Append(huge.data(), huge.size());
+    CHECK(single.Line().ends_with(" | last words"));
+    // Control bytes are not written raw into the log.
+    Tail control;
+    control.Append("a\x1b[31mb", 7);
+    CHECK_EQ(std::string("a?[31mb"), control.Line());
+
+    CHECK(!ReportOnExit(0));
+    CHECK(!ReportOnExit(STILL_ACTIVE));
+    // A video-only source under `-map 0:a:N?`: a silent film, not a failure.
+    CHECK(!ReportOnExit(DWORD(-22)));
+    CHECK(ReportOnExit(1));
+    CHECK(ReportOnExit(DWORD(-5)));
+}
+
+// End to end: a child that floods stderr is never blocked by it, and what it
+// said last reaches the log once it fails.
+void audio_child_stderr_is_drained_and_logged_when_it_fails_test()
+{
+    MediaFixture fixture;
+    const std::wstring source = L"audiostderr_" + std::to_wstring(GetTickCount64());
+    auto audio = AudioPlayerTestAccess::Create(fixture.directory);
+    CHECK(audio->Start(source, 0.0, AudioStartState::Playing));
+    // The line is written only after the child has exited, and its last words
+    // come after all 256 KiB of flood: finding them proves nothing blocked.
+    // (Counting ffmpeg processes would say the same less reliably, on a
+    // machine where other suites run ffmpeg too.)
+    std::string needle = "Audio: ffmpeg said: ";
+    bool logged = false;
+    std::string sourceText;
+    for (const wchar_t character : source) sourceText.push_back(static_cast<char>(character));
+    for (int attempt = 0; attempt < 250 && !logged; ++attempt) {
+        std::ifstream log(Log::Path(), std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
+        for (size_t at = text.find(needle); at != std::string::npos && !logged; at = text.find(needle, at + 1)) {
+            const size_t lineEnd = text.find('\n', at);
+            const std::string line = text.substr(at, lineEnd == std::string::npos ? std::string::npos : lineEnd - at);
+            logged = line.find("[fake ffmpeg] decode failed:") != std::string::npos &&
+                     line.find(sourceText) != std::string::npos && line.starts_with(needle + "... ");
+        }
+        if (!logged) Sleep(20);
+    }
+    CHECK(logged);
+    audio->Stop();
+}
+
+// A track list a viewer cannot reach is not a fix. The menu carries the
+// labels, marks which one is playing, and disables itself when there is
+// nothing to choose between.
+void audio_track_menu_lists_the_tracks_and_marks_the_one_playing_test()
+{
+    Localizer localizer;
+    const HMENU menu = app_menu::CreateMenuBar(localizer, true);
+    CHECK(menu != nullptr);
+    if (!menu) return;
+
+    // Nothing loaded: a disabled placeholder, not an empty popup a viewer
+    // clicks into and out of.
+    app_menu::UpdateAudioTracks(menu, {}, 0);
+    std::vector<MenuEntry> entries;
+    collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, L"No audio tracks", app_menu::IDM_AUDIO_TRACK_FIRST));
+
+    const std::wstring labels[] = {
+        L"1. English - Director's Commentary - AC3 5.1 (commentary)",
+        L"2. English - AC3 5.1",
+        L"3. French - AC3 5.1",
+    };
+    app_menu::UpdateAudioTracks(menu, labels, 1);
+    entries.clear();
+    collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, labels[0], app_menu::IDM_AUDIO_TRACK_FIRST));
+    CHECK(has_menu_entry(entries, labels[1], app_menu::IDM_AUDIO_TRACK_FIRST + 1));
+    CHECK(has_menu_entry(entries, labels[2], app_menu::IDM_AUDIO_TRACK_FIRST + 2));
+    CHECK(!has_menu_entry(entries, L"No audio tracks", app_menu::IDM_AUDIO_TRACK_FIRST));
+
+    // Exactly one radio mark, on the track that is playing.
+    // GetMenuState with MF_BYCOMMAND searches submenus, so the bar is enough.
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_AUDIO_TRACK_FIRST, MF_BYCOMMAND) & MF_CHECKED);
+    CHECK(GetMenuState(menu, app_menu::IDM_AUDIO_TRACK_FIRST + 1, MF_BYCOMMAND) & MF_CHECKED);
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_AUDIO_TRACK_FIRST + 2, MF_BYCOMMAND) & MF_CHECKED);
+
+    // A track title is free text from whoever made the file, so an ampersand
+    // in it has to reach the menu doubled or Windows eats it and underlines
+    // the next letter as an accelerator. The stored string is the escaped
+    // one; what a viewer sees is "1. R&B mix".
+    const std::wstring ampersand[] = {L"1. R&B mix", L"2. English"};
+    app_menu::UpdateAudioTracks(menu, ampersand, 0);
+    entries.clear();
+    collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, L"1. R&&B mix", app_menu::IDM_AUDIO_TRACK_FIRST));
+
+    DestroyMenu(menu);
+}
+
+// Playback > Subtitles: Off, one row per stream and the loaded file are one
+// radio group at the top of the popup, rebuilt in place above the commands.
+void subtitle_menu_lists_off_the_streams_and_the_file_test()
+{
+    Localizer localizer;
+    const HMENU menu = app_menu::CreateMenuBar(localizer, true);
+    CHECK(menu != nullptr);
+    if (!menu) return;
+    std::vector<MenuEntry> entries;
+    collect_menu_entries(menu, entries);
+    // Nothing loaded: Off alone, greyed, and the commands below it.
+    CHECK(has_menu_entry(entries, L"Off", app_menu::IDM_SUBTITLE_OFF));
+    CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_OFF, MF_BYCOMMAND) & MF_GRAYED);
+    CHECK(has_menu_entry(entries, L"Next subtitles\tV", app_menu::IDM_SUBTITLE_NEXT));
+    CHECK(has_menu_entry(entries, L"Load subtitle file…", app_menu::IDM_SUBTITLE_LOAD));
+
+    const std::wstring labels[] = {L"1. English - SRT", L"2. French - Styled & Co - ASS"};
+    app_menu::UpdateSubtitles(menu, L"Off", labels, L"File: Film.srt", app_menu::IDM_SUBTITLE_TRACK_FIRST + 1, true);
+    entries.clear();
+    collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, L"Off", app_menu::IDM_SUBTITLE_OFF));
+    CHECK(has_menu_entry(entries, labels[0], app_menu::IDM_SUBTITLE_TRACK_FIRST));
+    CHECK(has_menu_entry(entries, L"2. French - Styled && Co - ASS", app_menu::IDM_SUBTITLE_TRACK_FIRST + 1));
+    CHECK(has_menu_entry(entries, L"File: Film.srt", app_menu::IDM_SUBTITLE_FILE));
+    CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_TRACK_FIRST + 1, MF_BYCOMMAND) & MF_CHECKED);
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_OFF, MF_BYCOMMAND) & MF_CHECKED);
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_FILE, MF_BYCOMMAND) & MF_CHECKED);
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_LOAD, MF_BYCOMMAND) & MF_GRAYED);
+
+    // Rebuilt for a source with no streams: the old rows go, the commands stay.
+    app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true);
+    entries.clear();
+    collect_menu_entries(menu, entries);
+    CHECK(!has_menu_entry(entries, labels[0], app_menu::IDM_SUBTITLE_TRACK_FIRST));
+    CHECK(!has_menu_entry(entries, L"File: Film.srt", app_menu::IDM_SUBTITLE_FILE));
+    CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_OFF, MF_BYCOMMAND) & MF_CHECKED);
+    CHECK(has_menu_entry(entries, L"Next subtitles\tV", app_menu::IDM_SUBTITLE_NEXT));
+    const HMENU popup = app_menu::FindMenuContainingCommand(menu, app_menu::IDM_SUBTITLE_OFF);
+    CHECK(popup != nullptr);
+    if (popup) CHECK_EQ(8, GetMenuItemCount(popup));
+    DestroyMenu(menu);
+}
+
+// Subtitles are off unless the file asks for them: a track marked default is
+// what its author wants shown, and failing that a forced one, which carries
+// only the lines nobody could follow otherwise. A stream the player cannot draw
+// is never picked, even when it is the one marked.
+void subtitle_track_choice_follows_the_container_test()
+{
+    using namespace subtitle;
+    const auto make = [](int index, const char* language, const char* codec) {
+        Track track; track.subtitleIndex = index; track.language = language; track.codec = codec;
+        return track;
+    };
+    CHECK_EQ(kNoTrack, SelectDefault({}));
+    const Track plain[] = {make(0, "eng", "subrip"), make(1, "fre", "ass")};
+    CHECK_EQ(kNoTrack, SelectDefault(plain));
+
+    Track marked = make(1, "fre", "ass"); marked.isDefault = true;
+    const Track withDefault[] = {make(0, "eng", "subrip"), marked};
+    CHECK_EQ(size_t{1}, SelectDefault(withDefault));
+
+    Track forced = make(0, "eng", "hdmv_pgs_subtitle"); forced.forced = true;
+    const Track withForced[] = {make(0, "eng", "subrip"), forced};
+    CHECK_EQ(size_t{1}, SelectDefault(withForced));
+    // The default wins over a forced track listed ahead of it.
+    const Track both[] = {forced, marked};
+    CHECK_EQ(size_t{1}, SelectDefault(both));
+    // Teletext cannot be drawn, so its default flag is passed over.
+    Track teletext = make(0, "deu", "dvb_teletext"); teletext.isDefault = true;
+    const Track undrawable[] = {teletext, make(1, "eng", "subrip")};
+    CHECK_EQ(kNoTrack, SelectDefault(undrawable));
+
+    CHECK(KindForCodec("subrip") == Kind::Text);
+    CHECK(KindForCodec("ass") == Kind::Text);
+    CHECK(KindForCodec("webvtt") == Kind::Text);
+    CHECK(KindForCodec("mov_text") == Kind::Text);
+    CHECK(KindForCodec("hdmv_pgs_subtitle") == Kind::Bitmap);
+    CHECK(KindForCodec("dvd_subtitle") == Kind::Bitmap);
+    CHECK(KindForCodec("dvb_teletext") == Kind::Unsupported);
+    CHECK(KindForCodec("") == Kind::Unsupported);
+
+    // The labels read like the audio track list's.
+    Track sdh = make(1, "eng", "subrip"); sdh.title = "SDH"; sdh.hearingImpaired = true;
+    CHECK_EQ(std::string("2. English - SDH - SRT (for the hard of hearing)"), Describe(sdh));
+    CHECK_EQ(std::string("1. English - PGS (forced)"), Describe(forced));
+    CHECK_EQ(std::string("1. Teletext (not supported)"), Describe(make(0, "", "dvb_teletext")));
+    CHECK_EQ(std::string("3. Timed Text"), Describe(make(2, "und", "mov_text")));
+}
+
+// "Film.srt" beside "Film.mkv" is loaded without asking; so is "Film.en.srt"
+// when there is no plain one. The answer cannot depend on listing order.
+void subtitle_sidecar_is_the_video_name_with_a_subtitle_extension_test()
+{
+    using subtitle::FindSidecar;
+    const std::vector<std::wstring> none{L"Film.mkv", L"Other.srt", L"Film.txt", L"Film.sub", L"Filmic.srt"};
+    CHECK(!FindSidecar(L"Film.mkv", none).has_value());
+    const std::vector<std::wstring> tagged{L"Film.mkv", L"Film.fr.srt", L"Film.en.srt"};
+    CHECK(FindSidecar(L"Film.mkv", tagged) == std::optional<std::wstring>(L"Film.en.srt"));
+    const std::vector<std::wstring> exact{L"Film.en.ass", L"FILM.SRT", L"Film.mkv"};
+    CHECK(FindSidecar(L"Film.mkv", exact) == std::optional<std::wstring>(L"FILM.SRT"));
+    // ASS keeps its styling, so it beats SRT for the same name; text beats pictures.
+    const std::vector<std::wstring> styled{L"Film.srt", L"Film.sup", L"Film.ass"};
+    CHECK(FindSidecar(L"Film.mkv", styled) == std::optional<std::wstring>(L"Film.ass"));
+    const std::vector<std::wstring> pictures{L"Film.idx", L"Film.sub", L"Film.sup"};
+    CHECK(FindSidecar(L"Film.mkv", pictures) == std::optional<std::wstring>(L"Film.sup"));
+    // Two tags deep is somebody else's film ("Film.Part2.en.srt").
+    const std::vector<std::wstring> deeper{L"Film.Part2.en.srt"};
+    CHECK(!FindSidecar(L"Film.mkv", deeper).has_value());
+    // Dots in the video's own name are part of its stem.
+    const std::vector<std::wstring> dotted{L"The.Film.2024.srt"};
+    CHECK(FindSidecar(L"The.Film.2024.mkv", dotted) == std::optional<std::wstring>(L"The.Film.2024.srt"));
+    CHECK(subtitle::IsSidecarExtension(L".SRT"));
+    CHECK(!subtitle::IsSidecarExtension(L".sub"));
+}
+
+// libass takes UTF-8. FFmpeg converts a UTF-16 file with a byte-order mark by
+// itself; without one, and for a legacy code page, it needs to be told.
+void subtitle_text_encoding_is_detected_test()
+{
+    using namespace subtitle;
+    const auto detect = [](std::initializer_list<uint8_t> bytes) {
+        const std::vector<uint8_t> head(bytes);
+        return DetectTextEncoding(head);
+    };
+    CHECK(detect({0xEF, 0xBB, 0xBF, '1'}) == TextEncoding::Utf8Bom);
+    CHECK(detect({0xFF, 0xFE, '1', 0}) == TextEncoding::Utf16LeBom);
+    CHECK(detect({0xFE, 0xFF, 0, '1'}) == TextEncoding::Utf16BeBom);
+    CHECK(detect({'1', 0, '\r', 0, '\n', 0, '0', 0, '0', 0}) == TextEncoding::Utf16Le);
+    CHECK(detect({0, '1', 0, '\r', 0, '\n', 0, '0', 0, '0'}) == TextEncoding::Utf16Be);
+    // "Café" in UTF-8, and in Windows-1252.
+    CHECK(detect({'C', 'a', 'f', 0xC3, 0xA9}) == TextEncoding::Utf8);
+    CHECK(detect({'C', 'a', 'f', 0xE9, ' '}) == TextEncoding::Legacy);
+    // A sequence cut off by the end of the sample is not held against the file,
+    // an overlong one is.
+    CHECK(detect({'C', 'a', 'f', 0xC3}) == TextEncoding::Utf8);
+    CHECK(detect({0xC0, 0xAF}) == TextEncoding::Legacy);
+    CHECK(detect({0xED, 0xA0, 0x80}) == TextEncoding::Legacy);
+    CHECK(detect({}) == TextEncoding::Utf8);
+    CHECK(CharencFor(TextEncoding::Utf8, 1252).empty());
+    CHECK(CharencFor(TextEncoding::Utf16LeBom, 1252).empty());
+    CHECK_EQ(std::wstring(L"UTF-16LE"), CharencFor(TextEncoding::Utf16Le, 1252));
+    CHECK_EQ(std::wstring(L"CP1251"), CharencFor(TextEncoding::Legacy, 1251));
+}
+
+// A Windows path inside a filtergraph passes two parsers, each with its own
+// escaping; the command lines are what the overlay runs.
+void subtitle_command_lines_escape_paths_for_both_filtergraph_parsers_test()
+{
+    using namespace subtitle;
+    // Option level: C\:/Films/A, b\'s [1].srt; graph level escapes those
+    // backslashes and the quote again, and the , [ ] the graph parser splits on.
+    CHECK_EQ(std::wstring(L"C\\\\:/Films/A\\, b\\\\\\'s \\[1\\].srt"),
+             EscapeFilterValue(L"C:\\Films\\A, b's [1].srt"));
+    CHECK_EQ(std::wstring(L"plain.srt"), EscapeFilterValue(L"plain.srt"));
+
+    RenderCommand text;
+    text.input = L"C:\\t\\x.mks"; text.stream = 0; text.width = 1280; text.height = 720;
+    text.videoWidth = 1920; text.videoHeight = 1080; text.rate = 23.976; text.start = 12.5; text.duration = 60.0;
+    const std::wstring textArgs = RenderArguments(text);
+    CHECK(textArgs.find(L"color=c=0x10EF60:s=1280x720:r=23.976:d=48.500000,") != std::wstring::npos);
+    CHECK(textArgs.find(L"setpts=PTS+12.500000/TB,subtitles=f=C\\\\:/t/x.mks:si=0:original_size=1920x1080,mpdecimate=hi=0:lo=0:frac=0") != std::wstring::npos);
+    CHECK(textArgs.find(L"original_size=1920x1080:alpha=1,format=bgra[subs]") != std::wstring::npos);
+    CHECK(textArgs.find(L"-stats_mux_pre pipe:2 -stats_mux_pre_fmt \"SUBT {pts} {tb}\" -f rawvideo pipe:1") != std::wstring::npos);
+    CHECK(textArgs.find(L"-ss ") == std::wstring::npos);
+    text.charenc = L"CP1252"; text.duration = 0.0;
+    const std::wstring legacy = RenderArguments(text);
+    CHECK(legacy.find(L":si=0:charenc=CP1252:original_size=") != std::wstring::npos);
+    CHECK(legacy.find(L":d=21600.000000,") != std::wstring::npos);
+
+    RenderCommand bitmap = text;
+    bitmap.kind = Kind::Bitmap; bitmap.input = L"C:\\v\\film.mkv"; bitmap.stream = 2; bitmap.start = 100.0;
+    const std::wstring bitmapArgs = RenderArguments(bitmap);
+    CHECK(bitmapArgs.find(L"-copyts -ss 70.000000 -i \"C:\\v\\film.mkv\"") != std::wstring::npos);
+    CHECK(bitmapArgs.find(L"[0:s:2]format=gbrap,premultiply=inplace=1,scale=1280x720:flags=bilinear,format=bgra[subs]") != std::wstring::npos);
+    bitmap.start = 10.0;
+    CHECK(RenderArguments(bitmap).find(L"-ss ") == std::wstring::npos);
+
+    CHECK(ExtractArguments(L"a.mkv", 1, "subrip", L"o.mks").find(L"-map 0:s:1 -map 0:t? -c:s copy -c:t copy -f matroska \"o.mks\"") != std::wstring::npos);
+    CHECK(ExtractArguments(L"a.mp4", 0, "mov_text", L"o.mks").find(L"-c:s ass") != std::wstring::npos);
+
+    CHECK(ParseStatsLine("SUBT 72 1/24") == std::optional<double>(3.0));
+    CHECK(ParseStatsLine("SUBT 4000000 1/1000000\r") == std::optional<double>(4.0));
+    CHECK(!ParseStatsLine("SUBT 72 1/0").has_value());
+    CHECK(!ParseStatsLine("[Parsed_subtitles_0] error").has_value());
+    CHECK(!ParseStatsLine("SUBT x 1/24").has_value());
+}
+
+// Frames come only when the picture changes, so the one on screen is the newest
+// that has started; a seek is answered from them only when they bracket it.
+// The subtitle overlay uploads what changes, not the canvas: the reader finds the
+// box around every non-zero pixel off the UI thread, and the renderer copies the
+// union of that box, the one the texture already holds, and any copy not yet made.
+void subtitle_canvas_bounds_hold_every_drawn_pixel_test()
+{
+    using subtitle::PixelBox;
+    constexpr uint32_t w = 64, h = 32;
+    std::vector<uint8_t> canvas(size_t(w) * h * 4u, 0);
+    CHECK(subtitle::NonZeroBounds(canvas.data(), w, h).Empty());
+    CHECK(subtitle::NonZeroBounds(canvas.data(), w, h) == PixelBox{});
+    const auto set = [&](uint32_t x, uint32_t y, size_t channel, uint8_t value) {
+        canvas[(size_t(y) * w + x) * 4u + channel] = value;
+    };
+    // Alpha alone, then a colour under zero alpha: the compositor adds a
+    // premultiplied colour whatever its alpha, so both are drawn and both count.
+    set(10, 20, 3, 255);
+    CHECK(subtitle::NonZeroBounds(canvas.data(), w, h) == (PixelBox{10, 20, 11, 21}));
+    set(40, 5, 1, 7);
+    CHECK(subtitle::NonZeroBounds(canvas.data(), w, h) == (PixelBox{10, 5, 41, 21}));
+    // The edges are inclusive of the canvas's own last row and column.
+    set(w - 1, h - 1, 0, 1);
+    set(0, 0, 2, 1);
+    CHECK(subtitle::NonZeroBounds(canvas.data(), w, h) == (PixelBox{0, 0, w, h}));
+    CHECK_EQ(uint64_t(w) * h, subtitle::NonZeroBounds(canvas.data(), w, h).Area());
+
+    // Union ignores an empty box and never grows one out of nothing.
+    const PixelBox a{10, 20, 30, 25}, b{5, 22, 12, 40};
+    CHECK(subtitle::Union(a, b) == (PixelBox{5, 20, 30, 40}));
+    CHECK(subtitle::Union(a, {}) == a);
+    CHECK(subtitle::Union({}, b) == b);
+    CHECK(subtitle::Union({}, {}).Empty());
+    CHECK(subtitle::Union(PixelBox{3, 3, 3, 9}, {}).Empty());
+    CHECK_EQ(uint64_t{0}, (PixelBox{8, 1, 4, 9}).Area());
+}
+
+void subtitle_timing_follows_the_clock_and_the_delay_test()
+{
+    using namespace subtitle;
+    CHECK_EQ(100, StepDelay(0, +1));
+    CHECK_EQ(-200, StepDelay(-100, -1));
+    CHECK_EQ(kDelayLimitMs, StepDelay(kDelayLimitMs, +1));
+    CHECK_EQ(-kDelayLimitMs, StepDelay(-kDelayLimitMs, -1));
+    // A positive delay shows each line later: at video 10 s the 9.5 s line is up.
+    CHECK_EQ(9.5, SubtitleClock(10.0, 500));
+    CHECK_EQ(10.25, SubtitleClock(10.0, -250));
+
+    const std::vector<double> pts{3.0, 4.0, 5.5};
+    CHECK_EQ(kNoTrack, FrameOnScreen(pts, 2.9));
+    CHECK_EQ(size_t{0}, FrameOnScreen(pts, 3.0));
+    CHECK_EQ(size_t{1}, FrameOnScreen(pts, 5.4));
+    CHECK_EQ(size_t{2}, FrameOnScreen(pts, 60.0));
+    CHECK(QueueAnswers(pts, false, 4.5));
+    CHECK(!QueueAnswers(pts, false, 2.0));   // behind everything kept
+    CHECK(!QueueAnswers(pts, false, 6.0));   // past everything drawn so far
+    CHECK(QueueAnswers(pts, true, 6.0));     // unless the child has finished
+    CHECK(!QueueAnswers({}, true, 1.0));
+
+    CHECK(!ClockJumped(10.0, 10.016));
+    CHECK(ClockJumped(10.0, 9.9));
+    CHECK(ClockJumped(10.0, 20.0));
+
+    CHECK_EQ(23.976, CanvasRate(23.976));
+    CHECK_EQ(30.0, CanvasRate(59.94));
+    CHECK_EQ(10.0, CanvasRate(1.0));
+    CHECK_EQ(24.0, CanvasRate(0.0));
+    CHECK(CanvasUsable(1280, 720));
+    CHECK(!CanvasUsable(8, 720));
+    CHECK(!CanvasUsable(0, 0));
+}
+
+// The choice a viewer made for one source comes back with it.
+void subtitle_choice_round_trips_through_the_settings_file_test()
+{
+    using namespace subtitle;
+    Choice off; off.mode = Choice::Mode::Off; off.delayMs = -300; off.sequence = 4;
+    CHECK_EQ(std::wstring(L"4|off|-300|"), FormatChoice(off));
+    CHECK(ParseChoice(FormatChoice(off)) == std::optional<Choice>(off));
+    Choice track; track.mode = Choice::Mode::Track; track.track = 2; track.sequence = 9;
+    CHECK(ParseChoice(FormatChoice(track)) == std::optional<Choice>(track));
+    Choice file; file.mode = Choice::Mode::File; file.file = L"D:\\Subs\\a|b.srt"; file.delayMs = 1200; file.sequence = 1;
+    CHECK(ParseChoice(FormatChoice(file)) == std::optional<Choice>(file));
+    CHECK(!ParseChoice(L"").has_value());
+    CHECK(!ParseChoice(L"1|file|0|").has_value());
+    CHECK(!ParseChoice(L"1|track:x|0|").has_value());
+    CHECK(!ParseChoice(L"1|sideways|0|").has_value());
+    CHECK(!ParseChoice(L"1|off|99999999|").has_value());
+    std::map<std::wstring, Choice> remembered;
+    for (uint64_t index = 0; index < 5; ++index) {
+        Choice choice; choice.sequence = 10 - index;
+        remembered[L"k" + std::to_wstring(index)] = choice;
+    }
+    CHECK((Evict(remembered, 3) == std::vector<std::wstring>{L"k4", L"k3"}));
+    CHECK(Evict(remembered, 5).empty());
+}
+
+// Five distinct causes shared one opaque string, and the 1,143-line module
+// most exposed to upstream breakage logged nothing at all. "YouTube helper
+// files are missing beside the app" was wrong for four of the five: on a
+// read-only install the files are present and the cache cannot be created,
+// and a reparse point where a helper should be is a junction attack being
+// refused, not an absence.
+void youtube_helper_refusals_each_say_which_one_happened_test()
+{
+    MediaFixture fixture;
+    std::error_code error;
+    const auto outsideDirectory = fixture.directory.parent_path() / L"outside-helper-detail";
+    std::filesystem::create_directories(outsideDirectory, error);
+    CHECK(!error);
+
+    std::vector<std::wstring> details;
+    const auto refusalDetail = [&] {
+        auto resolver = YouTubeResolverTestAccess::Create(fixture.directory);
+        const auto result = resolver->Resolve(L"https://youtu.be/dQw4w9WgXcQ?success", {});
+        CHECK_EQ(ResolveError::HelperMissing, result.error);
+        CHECK(!result.detail.empty());
+        details.push_back(result.detail);
+    };
+
+    // Absent, which is the one the old wording described correctly.
+    std::filesystem::remove(fixture.directory / L"yt-dlp.exe", error);
+    CHECK(!error);
+    refusalDetail();
+
+    // A reparse point where a helper should be: a junction attack refused.
+    CHECK(create_reparse_file(fixture.directory / L"yt-dlp.exe"));
+    refusalDetail();
+
+    // A directory where a helper should be.
+    std::filesystem::remove(fixture.directory / L"yt-dlp.exe", error);
+    error.clear();
+    std::filesystem::create_directory(fixture.directory / L"yt-dlp.exe", error);
+    CHECK(!error);
+    refusalDetail();
+
+    // Helpers fine, cache directory redirected out of the package.
+    std::filesystem::remove_all(fixture.directory / L"yt-dlp.exe", error);
+    CHECK(!error);
+    CHECK(CopyFileW(current_test_executable().c_str(),
+                    (fixture.directory / L"yt-dlp.exe").c_str(), FALSE) != FALSE);
+    const std::filesystem::path cacheLink = fixture.directory / L"youtube-helper-cache";
+    CHECK(create_junction(cacheLink, outsideDirectory));
+    refusalDetail();
+    CHECK(RemoveDirectoryW(cacheLink.c_str()) != FALSE);
+
+    // Four causes, four different things said to the viewer, so a bug report
+    // can name which one happened.
+    CHECK_EQ(size_t{4}, details.size());
+    for (size_t first = 0; first + 1 < details.size(); ++first)
+        for (size_t second = first + 1; second < details.size(); ++second)
+            CHECK(details[first] != details[second]);
+
+    std::filesystem::remove_all(outsideDirectory, error);
+}
+
+// Every neural job full-hashed the source before doing anything, including
+// the prepare-only cache check and every live-session retarget. On a 5 GB
+// file that is 3-5 seconds of dead air after the viewer presses render, paid
+// again for each job against the same unchanged file.
+void source_digest_is_computed_once_per_file_and_never_survives_a_change_test()
+{
+    using namespace source_digest;
+    Entry entry;
+    int computed = 0;
+    const auto compute = [&]() -> std::optional<std::string> {
+        ++computed;
+        return std::string("digest-") + std::to_string(computed);
+    };
+
+    CHECK_EQ(std::optional<std::string>("digest-1"), Lookup(entry, L"film.mkv", 5000, 100, compute));
+    CHECK_EQ(1, computed);
+    // The whole point: the same file again costs nothing.
+    CHECK_EQ(std::optional<std::string>("digest-1"), Lookup(entry, L"film.mkv", 5000, 100, compute));
+    CHECK_EQ(std::optional<std::string>("digest-1"), Lookup(entry, L"film.mkv", 5000, 100, compute));
+    CHECK_EQ(1, computed);
+
+    // Any of the three identity terms changing re-hashes. A cache key is
+    // built from this digest, so a stale one would serve the wrong render.
+    CHECK_EQ(std::optional<std::string>("digest-2"), Lookup(entry, L"film.mkv", 5001, 100, compute));
+    CHECK_EQ(std::optional<std::string>("digest-3"), Lookup(entry, L"film.mkv", 5001, 101, compute));
+    CHECK_EQ(std::optional<std::string>("digest-4"), Lookup(entry, L"other.mkv", 5001, 101, compute));
+    CHECK_EQ(4, computed);
+
+    // Forgetting is what a new media load does, so a file replaced between
+    // loads is hashed again even if its size and timestamp were preserved.
+    Forget(entry);
+    CHECK_EQ(std::optional<std::string>("digest-5"), Lookup(entry, L"other.mkv", 5001, 101, compute));
+    CHECK_EQ(5, computed);
+
+    // A failed hash is not remembered as a failure: the next attempt tries.
+    int failures = 0;
+    const auto failing = [&]() -> std::optional<std::string> { ++failures; return std::nullopt; };
+    CHECK(!Lookup(entry, L"gone.mkv", 1, 1, failing).has_value());
+    CHECK(!Lookup(entry, L"gone.mkv", 1, 1, failing).has_value());
+    CHECK_EQ(2, failures);
+    // And it did not leave the previous file's digest reachable under the new
+    // identity, which would be the worst possible outcome here.
+    CHECK_EQ(std::optional<std::string>("digest-6"), Lookup(entry, L"gone.mkv", 1, 1, compute));
+}
+
+// The endpoint callbacks run on the OS's threads. Their back pointer was a
+// plain pointer cleared under the renderer's mutex and read with no lock, and
+// Close held that mutex across Unregister while every handler takes it - a
+// data race, and a deadlock if Unregister waits for a callback in flight. A
+// default-device change fires a burst of them (one per role, plus a property
+// change) exactly when ServiceDeviceChanges is tearing the renderer down.
+void audio_endpoint_callbacks_never_reach_a_detached_renderer_test()
+{
+    struct Owner {
+        std::atomic<bool> destroyed{false};
+        std::atomic<bool> touchedAfterDestroy{false};
+        std::atomic<uint64_t> calls{0};
+    };
+
+    // A storm of callbacks on several threads while the owner detaches: after
+    // Detach returns nothing may reach the owner, and the owner is treated as
+    // destroyed from that instant.
+    {
+        Owner owner;
+        audio_endpoint::CallbackGate<Owner> gate(&owner);
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> callers;
+        for (int index = 0; index < 4; ++index)
+            callers.emplace_back([&] {
+                while (!stop.load())
+                    gate.Forward([&](Owner& reached) {
+                        if (reached.destroyed.load()) reached.touchedAfterDestroy = true;
+                        ++reached.calls;
+                        std::this_thread::yield();
+                    });
+            });
+        while (owner.calls.load() < 1000) std::this_thread::yield();
+        gate.Detach();
+        owner.destroyed = true;
+        const uint64_t atDetach = owner.calls.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        stop = true;
+        for (auto& caller : callers) caller.join();
+        CHECK(!owner.touchedAfterDestroy.load());
+        CHECK_EQ(atDetach, owner.calls.load());
+    }
+
+    // A callback already inside the owner holds Detach until it leaves: that
+    // is the wait Close relies on before it frees anything.
+    {
+        Owner owner;
+        audio_endpoint::CallbackGate<Owner> gate(&owner);
+        std::atomic<bool> entered{false}, release{false}, detached{false};
+        std::thread callback([&] {
+            gate.Forward([&](Owner&) {
+                entered = true;
+                while (!release.load()) std::this_thread::yield();
+            });
+        });
+        while (!entered.load()) std::this_thread::yield();
+        std::thread closer([&] { gate.Detach(); detached = true; });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK(!detached.load());
+        release = true;
+        callback.join();
+        closer.join();
+        CHECK(detached.load());
+        // And afterwards a late notification is a no-op rather than a call.
+        bool reached = false;
+        gate.Forward([&](Owner&) { reached = true; });
+        CHECK(!reached);
+    }
+}
+
+// Device-change recovery was polled: the renderer only noticed an endpoint
+// had gone when a call to it returned AUDCLNT_E_DEVICE_INVALIDATED. That
+// covers an endpoint that disappears and nothing else. A default-device
+// change leaves the old endpoint working, so the film keeps playing out of
+// the headphones that were just unplugged from the mixer's point of view;
+// a format change under the stream is not reported at all; and some drivers
+// stop asking for data without ever erroring, which polling cannot see.
+void audio_endpoint_notifications_fire_only_for_the_stream_we_are_on_test()
+{
+    using namespace audio_endpoint;
+    const std::wstring ours = L"{0.0.0.00000000}.{aaaa}";
+    const std::wstring other = L"{0.0.0.00000000}.{bbbb}";
+
+    // A new default for playback is ours to follow.
+    CHECK(DefaultChangeAffectsUs(eRender, eConsole, other, ours));
+    CHECK(DefaultChangeAffectsUs(eRender, eMultimedia, other, ours));
+    // Capture is not ours, whatever happens to it.
+    CHECK(!DefaultChangeAffectsUs(eCapture, eConsole, other, ours));
+    // Communications is the headset role; the player does not follow it, or
+    // starting a call would move the film's audio.
+    CHECK(!DefaultChangeAffectsUs(eRender, eCommunications, other, ours));
+    // Already there: restarting would be an audible gap for no reason.
+    CHECK(!DefaultChangeAffectsUs(eRender, eConsole, ours, ours));
+    // No default at all - every endpoint removed - is still a change we lost.
+    CHECK(DefaultChangeAffectsUs(eRender, eConsole, L"", ours));
+
+    // State changes only matter for the endpoint being rendered to.
+    CHECK(StateChangeAffectsUs(ours, DEVICE_STATE_UNPLUGGED, ours));
+    CHECK(StateChangeAffectsUs(ours, DEVICE_STATE_DISABLED, ours));
+    CHECK(StateChangeAffectsUs(ours, DEVICE_STATE_NOTPRESENT, ours));
+    CHECK(!StateChangeAffectsUs(ours, DEVICE_STATE_ACTIVE, ours));
+    CHECK(!StateChangeAffectsUs(other, DEVICE_STATE_UNPLUGGED, ours));
+
+    // The forgotten one: the engine's mix format changing under a stream that
+    // was opened at the old format, and ffmpeg is still producing it.
+    CHECK(FormatChangeAffectsUs(ours, ours, true));
+    CHECK(!FormatChangeAffectsUs(ours, ours, false));
+    CHECK(!FormatChangeAffectsUs(other, ours, true));
+
+    // Before Open has an id, nothing can be about us - and a blank id must
+    // not match every notification.
+    CHECK(!DefaultChangeAffectsUs(eRender, eConsole, other, L""));
+    CHECK(!StateChangeAffectsUs(ours, DEVICE_STATE_UNPLUGGED, L""));
+    CHECK(!FormatChangeAffectsUs(ours, L"", true));
+
+    // With no endpoint left at all, nothing above is about anything, and audio
+    // used to stay off for good. A playback endpoint becoming the default, or
+    // any endpoint becoming active, is worth another attempt.
+    CHECK(DefaultChangeMayRestore(eRender, eConsole, other));
+    CHECK(DefaultChangeMayRestore(eRender, eMultimedia, other));
+    CHECK(!DefaultChangeMayRestore(eCapture, eConsole, other));
+    CHECK(!DefaultChangeMayRestore(eRender, eCommunications, other));
+    // "No default" is the loss itself, not a recovery.
+    CHECK(!DefaultChangeMayRestore(eRender, eConsole, L""));
+    CHECK(StateChangeMayRestore(DEVICE_STATE_ACTIVE));
+    CHECK(!StateChangeMayRestore(DEVICE_STATE_UNPLUGGED));
+    CHECK(!StateChangeMayRestore(DEVICE_STATE_NOTPRESENT));
+    CHECK(!StateChangeMayRestore(DEVICE_STATE_DISABLED));
+}
+
+// Some drivers stop signalling the render event without ever returning an
+// error, which Kodi documents and works around with a 1100 ms guard. Polling
+// cannot see that: every call succeeds and the film simply goes quiet.
+void audio_sink_is_declared_dead_only_after_a_playing_stream_goes_quiet_test()
+{
+    using namespace audio_sink;
+    State state;
+
+    // A stream that keeps being asked for data is alive.
+    CHECK(!Dead(state, 0.0, true, true));
+    CHECK(!Dead(state, 5.0, true, true));
+    CHECK(!Dead(state, 5.5, false, true));
+    CHECK(!Dead(state, 6.09, false, true));
+    // Past the guard with no request for data while playing.
+    CHECK(Dead(state, 6.11, false, true));
+
+    // A paused stream is silent on purpose and never signals. Declaring it
+    // dead would restart the pipeline every time someone pauses for a minute.
+    State paused;
+    CHECK(!Dead(paused, 0.0, true, true));
+    CHECK(!Dead(paused, 100.0, false, false));
+    CHECK(!Dead(paused, 200.0, false, false));
+    // And the clock it was paused for does not count against it on resume.
+    CHECK(!Dead(paused, 200.5, false, true));
+    CHECK(Dead(paused, 201.5, false, true));
+
+    // One signal resets the guard, so an underrun that recovers is not a
+    // death: the recovery path costs a restart and an audible gap.
+    State recovered;
+    CHECK(!Dead(recovered, 0.0, true, true));
+    CHECK(!Dead(recovered, 1.0, false, true));
+    CHECK(!Dead(recovered, 1.05, true, true));
+    CHECK(!Dead(recovered, 2.0, false, true));
+    CHECK(Dead(recovered, 2.2, false, true));
+}
+
+// P3.3 passthrough: which tracks qualify, and at what rate the link runs.
+// E-AC-3 is the one that is easy to get wrong - it travels at four times its
+// sample rate, and opening the endpoint at 48 kHz for it plays a quarter of
+// every burst period.
+void audio_passthrough_plans_the_iec61937_link_for_each_codec_test()
+{
+    using namespace audio_passthrough;
+    CHECK(CodecFromName("ac3") == Codec::Ac3);
+    CHECK(CodecFromName("eac3") == Codec::Eac3);
+    CHECK(CodecFromName("dts") == Codec::Dts);
+    // Decoded here, not passed through: TrueHD needs the eight-channel HBR
+    // link this does not open, and the rest are not bitstream formats.
+    for (const char* other : {"aac", "truehd", "flac", "opus", "pcm_s16le", ""})
+        CHECK(CodecFromName(other) == Codec::None);
+
+    const auto ac3 = PlanLink(Codec::Ac3, 48000, 6);
+    CHECK(ac3.has_value());
+    if (ac3) {
+        CHECK_EQ(48000u, ac3->transportRate);
+        CHECK_EQ(48000u, ac3->encodedRate);
+        CHECK_EQ(uint16_t{6}, ac3->encodedChannels);
+        CHECK(IsEqualGUID(ac3->subFormat, KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL) != 0);
+    }
+    const auto eac3 = PlanLink(Codec::Eac3, 48000, 8);
+    CHECK(eac3.has_value());
+    if (eac3) {
+        CHECK_EQ(192000u, eac3->transportRate);
+        CHECK_EQ(48000u, eac3->encodedRate);
+        CHECK(IsEqualGUID(eac3->subFormat, KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS) != 0);
+    }
+    const auto eac3At44 = PlanLink(Codec::Eac3, 44100, 2);
+    CHECK(eac3At44.has_value() && eac3At44->transportRate == 176400u);
+    const auto dts = PlanLink(Codec::Dts, 48000, 6);
+    CHECK(dts.has_value());
+    if (dts) {
+        CHECK_EQ(48000u, dts->transportRate);
+        CHECK(IsEqualGUID(dts->subFormat, KSDATAFORMAT_SUBTYPE_IEC61937_DTS) != 0);
+    }
+    // No carriage, so no link: the player plays PCM rather than opening an
+    // endpoint at a rate the bursts do not fit.
+    CHECK(!PlanLink(Codec::Ac3, 96000, 6));
+    CHECK(!PlanLink(Codec::Dts, 32000, 6));
+    CHECK(!PlanLink(Codec::Ac3, 0, 6));
+    CHECK(!PlanLink(Codec::None, 48000, 2));
+    // A track that did not say how many channels it has is described as
+    // stereo rather than as nothing.
+    const auto untold = PlanLink(Codec::Ac3, 44100, 0);
+    CHECK(untold.has_value() && untold->encodedChannels == 2);
+}
+
+// The format the exclusive stream asks for: IEC 61937 is 16-bit stereo frames
+// whatever the content is, and the WAVEFORMATEXTENSIBLE_IEC61937 extension
+// only adds what those frames decode to.
+void audio_passthrough_wave_format_is_16_bit_stereo_iec61937_extensible_test()
+{
+    using namespace audio_passthrough;
+    const auto link = PlanLink(Codec::Eac3, 48000, 6);
+    CHECK(link.has_value());
+    if (!link) return;
+    const WAVEFORMATEXTENSIBLE_IEC61937 full = WaveFormat(*link);
+    const WAVEFORMATEX& wave = full.FormatExt.Format;
+    CHECK_EQ(WORD(WAVE_FORMAT_EXTENSIBLE), wave.wFormatTag);
+    CHECK_EQ(WORD{2}, wave.nChannels);
+    CHECK_EQ(DWORD{192000}, wave.nSamplesPerSec);
+    CHECK_EQ(WORD{16}, wave.wBitsPerSample);
+    CHECK_EQ(WORD{4}, wave.nBlockAlign);
+    CHECK_EQ(DWORD{192000 * 4}, wave.nAvgBytesPerSec);
+    // The size of what follows WAVEFORMATEX is how a driver tells the two
+    // structures apart, so it has to be exactly the extension's.
+    CHECK_EQ(WORD(sizeof(WAVEFORMATEXTENSIBLE_IEC61937) - sizeof(WAVEFORMATEX)), wave.cbSize);
+    CHECK_EQ(WORD{16}, full.FormatExt.Samples.wValidBitsPerSample);
+    CHECK_EQ(DWORD(KSAUDIO_SPEAKER_STEREO), full.FormatExt.dwChannelMask);
+    CHECK(IsEqualGUID(full.FormatExt.SubFormat, KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS) != 0);
+    CHECK_EQ(DWORD{48000}, full.dwEncodedSamplesPerSec);
+    CHECK_EQ(DWORD{6}, full.dwEncodedChannelCount);
+    CHECK_EQ(DWORD{0}, full.dwAverageBytesPerSec);
+
+    // The plain form some drivers want instead: the same leading structure,
+    // sized as a WAVEFORMATEXTENSIBLE, and nothing past it.
+    const WAVEFORMATEXTENSIBLE_IEC61937 plain = WaveFormat(*link, true);
+    CHECK_EQ(WORD(sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)), plain.FormatExt.Format.cbSize);
+    CHECK_EQ(DWORD{192000}, plain.FormatExt.Format.nSamplesPerSec);
+    CHECK(IsEqualGUID(plain.FormatExt.SubFormat, full.FormatExt.SubFormat) != 0);
+    CHECK_EQ(DWORD{0}, plain.dwEncodedSamplesPerSec);
+    CHECK_EQ(DWORD{0}, plain.dwEncodedChannelCount);
+}
+
+// Every state the viewer can be in once they turned passthrough on has a
+// sentence, and Off has none. Kodi #18453: a display-mode change drops the
+// HDMI sink, so an ACTIVE stream - and only an active one - is reopened once
+// the display has settled, and a burst of changes reopens it once.
+void audio_passthrough_says_what_happened_and_reopens_after_a_display_change_test()
+{
+    using namespace audio_passthrough;
+    const Localizer localizer;
+    CHECK(StatusKey(State::Off) == nullptr);
+    for (const State state : {State::NotApplicable, State::Active, State::Refused, State::Unavailable}) {
+        const wchar_t* const key = StatusKey(state);
+        CHECK(key != nullptr);
+        if (!key) continue;
+        const std::wstring text = localizer.Get(key);
+        CHECK(text != key);  // an English default exists
+        CHECK(text.find(L"%s") != std::wstring::npos);
+        // A fallback always says what is playing instead: never silence.
+        if (state != State::Active) CHECK(text.find(L"playing PCM") != std::wstring::npos);
+    }
+    CHECK(localizer.Get(L"audio.passthrough.unsupported_rate") != L"audio.passthrough.unsupported_rate");
+    CHECK(localizer.Get(L"audio.passthrough.unknown_track") != L"audio.passthrough.unknown_track");
+    CHECK(std::wstring(CodecLabel(Codec::Eac3)) == L"E-AC-3");
+
+    // Nothing to reopen unless the bitstream is going out: a PCM fallback is a
+    // shared stream the engine carries across the mode change itself.
+    for (const State state : {State::Off, State::NotApplicable, State::Refused, State::Unavailable}) {
+        DisplayChangeReopen idle;
+        NoteDisplayChange(idle, 10.0, state);
+        CHECK(!ReopenDue(idle, 100.0));
+    }
+    DisplayChangeReopen reopen;
+    NoteDisplayChange(reopen, 10.0, State::Active);
+    // Not in the middle of the retrain.
+    CHECK(!ReopenDue(reopen, 10.0));
+    CHECK(!ReopenDue(reopen, 10.0 + kDisplaySettleSeconds - 0.01));
+    // A mode set sends several changes; each one pushes the reopen back.
+    NoteDisplayChange(reopen, 11.0, State::Active);
+    CHECK(!ReopenDue(reopen, 10.0 + kDisplaySettleSeconds + 0.01));
+    CHECK(ReopenDue(reopen, 11.0 + kDisplaySettleSeconds));
+    // Once.
+    CHECK(!ReopenDue(reopen, 20.0));
+    CHECK(!ReopenDue(reopen, 30.0));
+}
+
+// The passthrough toggle lives in the same popup as the track list, and the
+// track list is rebuilt on every load. The rebuild used to delete everything
+// in the popup, which would have taken the toggle - and its check - with it.
+void audio_menu_keeps_the_passthrough_toggle_across_track_list_rebuilds_test()
+{
+    Localizer localizer;
+    const HMENU menu = app_menu::CreateMenuBar(localizer, true);
+    CHECK(menu != nullptr);
+    if (!menu) return;
+    std::vector<MenuEntry> entries;
+    collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, L"Passthrough to receiver (AC-3/E-AC-3/DTS)", app_menu::IDM_AUDIO_PASSTHROUGH));
+    CHECK(has_menu_text(entries, L"Audio"));
+    // Outside the track block, which CheckMenuRadioItem clears.
+    CHECK(app_menu::IDM_AUDIO_PASSTHROUGH >= app_menu::IDM_AUDIO_TRACK_FIRST + app_menu::IDM_AUDIO_TRACK_COUNT);
+    CHECK(app_menu::IDM_AUDIO_PASSTHROUGH < app_menu::IDM_NEURAL_RENDERING);
+
+    const HMENU popup = app_menu::FindMenuContainingCommand(menu, app_menu::IDM_AUDIO_PASSTHROUGH);
+    CHECK(popup != nullptr);
+    CheckMenuItem(menu, app_menu::IDM_AUDIO_PASSTHROUGH, MF_BYCOMMAND | MF_CHECKED);
+    const std::wstring labels[] = {L"1. English - AC3 5.1", L"2. French - AC3 5.1"};
+    for (int round = 0; round < 3; ++round) {
+        app_menu::UpdateAudioTracks(menu, labels, 1);
+        app_menu::UpdateAudioTracks(menu, {}, 0);
+        app_menu::UpdateAudioTracks(menu, labels, 0);
+    }
+    CHECK(GetMenuState(menu, app_menu::IDM_AUDIO_PASSTHROUGH, MF_BYCOMMAND) & MF_CHECKED);
+    if (popup) {
+        // Tracks, one separator, the toggle - and not a second copy of any.
+        CHECK_EQ(4, GetMenuItemCount(popup));
+        CHECK_EQ(app_menu::IDM_AUDIO_TRACK_FIRST, GetMenuItemID(popup, 0));
+        CHECK_EQ(app_menu::IDM_AUDIO_TRACK_FIRST + 1, GetMenuItemID(popup, 1));
+        MENUITEMINFOW separator{};
+        separator.cbSize = sizeof(separator);
+        separator.fMask = MIIM_FTYPE;
+        CHECK(GetMenuItemInfoW(popup, 2, TRUE, &separator) && (separator.fType & MFT_SEPARATOR));
+        CHECK_EQ(app_menu::IDM_AUDIO_PASSTHROUGH, GetMenuItemID(popup, 3));
+    }
+    DestroyMenu(menu);
+}
+
+// P1.16: every hex value in a log line has the digits of its type, so an NGX
+// result or HRESULT reads the same there as in a receipt. std::hex wrote
+// "0x1" for NVSDK_NGX_Result_Success, which a search for the receipt's
+// "0x00000001" does not find.
+void hex_text_is_zero_padded_to_the_width_of_its_type_test()
+{
+    enum class Result : uint32_t { Success = 0x1, Fail = 0xBAD00000 };
+    CHECK_EQ(std::string("0x00000001"), HexText(Result::Success));
+    CHECK_EQ(std::string("0xbad00000"), HexText(Result::Fail));
+    CHECK_EQ(std::string("0x80070005"), HexText(HRESULT(0x80070005L)));
+    CHECK_EQ(std::string("0x00000001"), HexText(S_FALSE));
+    CHECK_EQ(std::string("0x000010de"), HexText(UINT{0x10de}));
+    CHECK_EQ(std::string("0x000000000001a2b3"), HexText(uint64_t{0x1a2b3}));
+    CHECK_EQ(std::string("0xff"), HexText(int8_t{-1}));
+    CHECK_EQ(HexResultText(0xbad00002u), HexText(uint32_t{0xbad00002u}));
+    CHECK(HexResultTextWide(0xbad00002u) == L"0xbad00002");
+}
+
+// P1.16: one atomic replace for every writer. It publishes whole files,
+// leaves no temporary behind whichever step fails, and never removes a file
+// it did not create.
+void atomic_file_replace_publishes_whole_files_and_cleans_up_only_its_own_test()
+{
+    const std::filesystem::path directory = test_support::FixtureTempRoot() /
+        (L"PolicyTests-AtomicFile-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    std::filesystem::remove_all(directory, error);
+    REQUIRE(std::filesystem::create_directories(directory, error));
+    const auto count = [&] {
+        size_t files = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) { (void)entry; ++files; }
+        return files;
+    };
+    const auto read = [](const std::filesystem::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    };
+    const auto destination = directory / L"settings.dat";
+    CHECK(static_cast<bool>(atomic_file::Replace(destination, "first")));
+    CHECK_EQ(std::string("first"), read(destination));
+    CHECK(static_cast<bool>(atomic_file::Replace(destination, std::string("second\0bytes", 12))));
+    CHECK_EQ(std::string("second\0bytes", 12), read(destination));
+    CHECK_EQ(size_t{1}, count());
+
+    // A missing directory fails at the temporary and creates nothing.
+    const auto missing = atomic_file::Replace(directory / L"absent" / L"file.dat", "x");
+    CHECK(missing.failed == atomic_file::Step::CreateTemporary);
+    CHECK(missing.error != ERROR_SUCCESS);
+
+    // A destination that cannot be replaced fails at the rename; the temporary
+    // goes and the destination stays as it was.
+    const auto occupied = directory / L"occupied";
+    REQUIRE(std::filesystem::create_directory(occupied, error));
+    const auto refused = atomic_file::Replace(occupied, "x");
+    CHECK(refused.failed == atomic_file::Step::Replace);
+    CHECK(std::filesystem::is_directory(occupied));
+    CHECK_EQ(size_t{2}, count());
+
+    // A temporary name that is already taken belongs to someone else.
+    const auto taken = directory / L"taken.tmp";
+    { std::ofstream(taken, std::ios::binary) << "theirs"; }
+    const auto collided = atomic_file::WriteAndReplace(taken, CREATE_NEW, destination, "mine");
+    CHECK(collided.failed == atomic_file::Step::CreateTemporary);
+    CHECK_EQ(std::string("theirs"), read(taken));
+    CHECK_EQ(std::string("second\0bytes", 12), read(destination));
+    std::filesystem::remove_all(directory, error);
+}
+
+// P1.16: one lookup for ffmpeg and ffprobe. The audio player searched three
+// places where the video decoder searched four and then PATH, so with the
+// tools only in <app>\ffmpeg a video's frames came from the packaged build and
+// its audio from whatever PATH offered. The neural-runtime package takes only
+// its parent's copy, and the export pipeline never searches PATH.
+void media_tools_are_found_the_same_way_by_every_caller_test()
+{
+    namespace fs = std::filesystem;
+    const fs::path root = test_support::FixtureTempRoot() /
+        (L"PolicyTests-MediaTools-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    fs::remove_all(root, error);
+    // A name nothing real carries, so PATH holds exactly the copy put there.
+    const std::wstring tool = L"dlss5-media-tools-probe.exe";
+    const auto plant = [&](const fs::path& directory) {
+        fs::create_directories(directory, error);
+        std::ofstream(directory / tool, std::ios::binary) << "tool";
+        return directory / tool;
+    };
+    using media_tools::Fallback;
+    using media_tools::FindToolIn;
+    const fs::path app = root / L"app";
+    const fs::path onPath = plant(root / L"on-path");
+    std::wstring savedPath(32768, L'\0');
+    savedPath.resize(GetEnvironmentVariableW(L"PATH", savedPath.data(), static_cast<DWORD>(savedPath.size())));
+    REQUIRE(SetEnvironmentVariableW(L"PATH", (onPath.parent_path().wstring() + L';' + savedPath).c_str()) != FALSE);
+
+    // Nothing packaged: playback falls back to PATH, the pipeline does not.
+    fs::create_directories(app, error);
+    CHECK(fs::equivalent(onPath, FindToolIn({}, app, tool, Fallback::SearchPath), error));
+    CHECK(FindToolIn({}, app, tool, Fallback::None).empty());
+
+    // Packaged under <app>\ffmpeg only: every caller takes it over PATH.
+    const fs::path nested = plant(app / L"ffmpeg");
+    CHECK_EQ(nested, FindToolIn({}, app, tool, Fallback::SearchPath));
+    CHECK_EQ(nested, FindToolIn({}, app, tool, Fallback::None));
+    // Beside the executable wins over the development layouts.
+    const fs::path beside = plant(app);
+    CHECK_EQ(beside, FindToolIn({}, app, tool, Fallback::SearchPath));
+
+    // The helper package, as its module directory or passed explicitly, uses
+    // its parent's copy and nothing else - not one inside it, not PATH's.
+    const fs::path runtime = app / L"neural-runtime";
+    plant(runtime);
+    CHECK_EQ(beside, FindToolIn({}, runtime, tool, Fallback::SearchPath));
+    CHECK_EQ(beside, FindToolIn(runtime, app, tool, Fallback::SearchPath));
+    fs::remove(beside, error);
+    CHECK(FindToolIn({}, runtime, tool, Fallback::SearchPath).empty());
+
+    // An explicit directory is the only place looked.
+    const fs::path chosen = root / L"chosen";
+    fs::create_directories(chosen, error);
+    CHECK(FindToolIn(chosen, app, tool, Fallback::SearchPath).empty());
+    const fs::path chosenTool = plant(chosen);
+    CHECK_EQ(chosenTool, FindToolIn(chosen, app, tool, Fallback::SearchPath));
+
+    CHECK(SetEnvironmentVariableW(L"PATH", savedPath.c_str()) != FALSE);
+    fs::remove_all(root, error);
+}
+
+// P0.11: the PATH fallback never runs a tool from the current directory. It
+// used SearchPathW with no path, which looks in the current directory before
+// PATH, and the core package ships no FFmpeg - so opening a video from a
+// folder that also held a planted ffprobe.exe ran it. Only fully qualified
+// PATH entries are walked now; a relative, drive-relative or root-relative
+// entry would resolve against the current directory or drive the same way.
+void media_tools_never_run_a_tool_from_the_current_directory_test()
+{
+    namespace fs = std::filesystem;
+    using media_tools::FindOnPathIn;
+    using media_tools::IsFullyQualifiedDirectory;
+    CHECK(IsFullyQualifiedDirectory(L"C:\\Tools"));
+    CHECK(IsFullyQualifiedDirectory(L"c:/tools"));
+    CHECK(IsFullyQualifiedDirectory(L"C:\\"));
+    CHECK(IsFullyQualifiedDirectory(L"\\\\server\\share\\bin"));
+    CHECK(IsFullyQualifiedDirectory(L"\\\\?\\C:\\Tools"));
+    CHECK(!IsFullyQualifiedDirectory(L""));
+    CHECK(!IsFullyQualifiedDirectory(L"."));
+    CHECK(!IsFullyQualifiedDirectory(L".\\bin"));
+    CHECK(!IsFullyQualifiedDirectory(L"..\\bin"));
+    CHECK(!IsFullyQualifiedDirectory(L"bin"));
+    CHECK(!IsFullyQualifiedDirectory(L"C:"));
+    CHECK(!IsFullyQualifiedDirectory(L"C:bin"));
+    CHECK(!IsFullyQualifiedDirectory(L"\\bin"));
+    CHECK(!IsFullyQualifiedDirectory(L"/bin"));
+    CHECK(!IsFullyQualifiedDirectory(L"\\\\\\bin"));
+    CHECK(!IsFullyQualifiedDirectory(L" C:\\Tools"));
+
+    // Every place the walk asks about, so a test can see it never asked about
+    // anything a relative entry would name.
+    std::vector<fs::path> asked;
+    const auto findIn = [&](std::wstring_view pathVariable, std::initializer_list<fs::path> present) {
+        asked.clear();
+        return FindOnPathIn(pathVariable, L"ffprobe.exe", [&](const fs::path& candidate) {
+            asked.push_back(candidate);
+            return std::find(present.begin(), present.end(), candidate) != present.end();
+        });
+    };
+    const fs::path first = L"C:\\First\\ffprobe.exe";
+    const fs::path second = L"D:\\Second\\ffprobe.exe";
+    const fs::path quoted = L"C:\\Program Files; Tools\\ffprobe.exe";
+    CHECK(findIn(L"", {first}).empty());
+    CHECK(asked.empty());
+    CHECK(findIn(L";;", {first}).empty());
+    CHECK(asked.empty());
+    CHECK(findIn(L".;bin;.\\bin;C:First;\\First;\"\";\".\"", {L".\\ffprobe.exe", L"bin\\ffprobe.exe",
+                                                              L"C:First\\ffprobe.exe", L"\\First\\ffprobe.exe"})
+              .empty());
+    CHECK(asked.empty());
+    // The first fully qualified match wins, and a miss moves on to the next.
+    CHECK_EQ(first, findIn(L"bin;C:\\First;D:\\Second", {first, second}));
+    CHECK_EQ(size_t{1}, asked.size());
+    CHECK_EQ(second, findIn(L"C:\\Empty\\;.;D:\\Second\\", {first, second}));
+    CHECK_EQ(size_t{2}, asked.size());
+    // Quotes are dropped and protect the semicolons inside them.
+    CHECK_EQ(quoted, findIn(L"\"C:\\Program Files; Tools\";D:\\Second", {quoted, second}));
+    CHECK_EQ(second, findIn(L"\"C:\\First\";D:\\Second", {second}));
+    CHECK_EQ(size_t{2}, asked.size());
+    // An unclosed quote runs to the end of PATH as one entry, which names no
+    // directory, rather than guessing where it was meant to stop.
+    CHECK(findIn(L"\"C:\\Missing;D:\\Second", {second}).empty());
+    CHECK_EQ(size_t{1}, asked.size());
+
+    const fs::path root = test_support::FixtureTempRoot() /
+        (L"PolicyTests-MediaToolsCwd-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    fs::remove_all(root, error);
+    const std::wstring tool = L"dlss5-media-tools-planted.exe";
+    const auto plant = [&](const fs::path& directory) {
+        fs::create_directories(directory, error);
+        std::ofstream(directory / tool, std::ios::binary) << "tool";
+        return directory / tool;
+    };
+    using media_tools::Fallback;
+    using media_tools::FindToolIn;
+    const fs::path app = root / L"app";
+    fs::create_directories(app, error);
+    const fs::path downloads = root / L"downloads";
+    plant(downloads);
+    plant(downloads / L"sub");
+    const fs::path onPath = plant(root / L"on-path");
+
+    std::wstring savedPath(32768, L'\0');
+    savedPath.resize(GetEnvironmentVariableW(L"PATH", savedPath.data(), static_cast<DWORD>(savedPath.size())));
+    const fs::path savedDirectory = fs::current_path(error);
+    fs::current_path(downloads, error);
+    REQUIRE(!error);
+
+    // The folder a video was opened from holds the tool, and PATH names it
+    // only in forms that resolve against the current directory or drive.
+    const std::wstring relativeEntries = std::wstring(L".;sub;.\\sub;") + downloads.root_name().wstring() +
+        L"sub;" + (downloads.root_directory() / downloads.relative_path()).wstring();
+    REQUIRE(SetEnvironmentVariableW(L"PATH", relativeEntries.c_str()) != FALSE);
+    CHECK(FindToolIn({}, app, tool, Fallback::SearchPath).empty());
+    REQUIRE(SetEnvironmentVariableW(L"PATH", nullptr) != FALSE);
+    CHECK(FindToolIn({}, app, tool, Fallback::SearchPath).empty());
+    REQUIRE(SetEnvironmentVariableW(L"PATH", L"") != FALSE);
+    CHECK(FindToolIn({}, app, tool, Fallback::SearchPath).empty());
+
+    // A fully qualified entry after them still finds its copy, quoted or not.
+    REQUIRE(SetEnvironmentVariableW(L"PATH", (relativeEntries + L";\"" + onPath.parent_path().wstring() + L'"').c_str()) != FALSE);
+    CHECK_EQ(onPath, FindToolIn({}, app, tool, Fallback::SearchPath));
+
+    fs::current_path(savedDirectory, error);
+    CHECK(!error);
+    CHECK(SetEnvironmentVariableW(L"PATH", savedPath.c_str()) != FALSE);
+    fs::remove_all(root, error);
+}
+
+// P1.16: one pair of UTF-8 converters, named for what they do with text that
+// is not well formed. The lossy pair keeps the rest of a message; the strict
+// pair refuses what it could not store faithfully.
+void utf8_text_lossy_keeps_the_message_and_strict_refuses_it_test()
+{
+    CHECK_EQ(std::string("caf\xc3\xa9"), utf8_text::FromWide(L"caf\u00e9"));
+    CHECK(utf8_text::FromWideStrict(L"caf\u00e9") == std::optional<std::string>("caf\xc3\xa9"));
+    CHECK(utf8_text::ToWide("caf\xc3\xa9") == L"caf\u00e9");
+    CHECK(utf8_text::ToWideStrict("caf\xc3\xa9") == std::optional<std::wstring>(L"caf\u00e9"));
+
+    const std::wstring unpaired{L'a', wchar_t(0xD800), L'b'};
+    CHECK_EQ(std::string("a\xef\xbf\xbd" "b"), utf8_text::FromWide(unpaired));
+    CHECK(!utf8_text::FromWideStrict(unpaired).has_value());
+    CHECK(utf8_text::ToWide("Caf\xe9 del Mar") == L"Caf\uFFFD del Mar");
+    CHECK(!utf8_text::ToWideStrict("Caf\xe9 del Mar").has_value());
+
+    CHECK(utf8_text::FromWide(L"").empty());
+    CHECK(utf8_text::FromWideStrict(L"") == std::optional<std::string>(""));
+    CHECK(utf8_text::ToWideStrict("") == std::optional<std::wstring>(L""));
+}
+
+// P3.4: ClampSeek, out of PlayerApp. A 10 s, 30 fps source whose last frame
+// sits at 299/30 s.
+void seek_clamp_stays_on_a_decodable_frame_and_inside_a_finished_range_test()
+{
+    seek_policy::Timeline source{10.0, 30.0, LastFramePts(30.0, 100000000)};
+    const double last = double(source.lastFramePts100ns) * 1e-7;
+    CHECK(last < 10.0);
+    // The container end has no frame to decode, so a seek there lands on the
+    // last one rather than paying for a second decoder restart.
+    CHECK_EQ(last, seek_policy::Clamp(10.0, source));
+    CHECK_EQ(last, seek_policy::Clamp(1e9, source));
+    CHECK_EQ(0.0, seek_policy::Clamp(-3.0, source));
+    CHECK_EQ(4.25, seek_policy::Clamp(4.25, source));
+
+    // A finished cached entry serves only its own range: [1.5,3.0) at 30 fps
+    // keeps the playhead between its first frame and its last.
+    seek_policy::Timeline range = source;
+    range.cachedPlayback = true;
+    range.cachedRange = NeuralRenderRange{15000000, 30000000};
+    CHECK(std::abs(seek_policy::Clamp(0.0, range) - 1.5) < 1e-9);
+    CHECK(std::abs(seek_policy::Clamp(9.0, range) - (3.0 - 1.0 / 30.0)) < 1e-9);
+    CHECK_EQ(2.0, seek_policy::Clamp(2.0, range));
+    // A whole-source entry is the source's own timeline.
+    range.cachedRange = {};
+    CHECK_EQ(last, seek_policy::Clamp(1e9, range));
+
+    // An active session's coverage has holes the original plays in, so every
+    // target is legal. Clamping it to the rendered range is what made a seek
+    // back to an earlier rendered region impossible to express.
+    seek_policy::Timeline live = source;
+    live.cachedPlayback = true;
+    live.liveSession = true;
+    live.cachedRange = NeuralRenderRange{50000000, 60000000};
+    CHECK_EQ(0.5, seek_policy::Clamp(0.5, live));
+    CHECK_EQ(8.0, seek_policy::Clamp(8.0, live));
+
+    // A stream whose duration is not known yet: nothing to clamp above.
+    const seek_policy::Timeline stream{0.0, 30.0, 0};
+    CHECK_EQ(123.0, seek_policy::Clamp(123.0, stream));
+    CHECK_EQ(0.0, seek_policy::Clamp(-1.0, stream));
+    // A range shorter than one frame never inverts the clamp.
+    seek_policy::Timeline sliver = source;
+    sliver.cachedPlayback = true;
+    sliver.cachedRange = NeuralRenderRange{20000000, 20100000};
+    CHECK(std::abs(seek_policy::Clamp(5.0, sliver) - 2.0) < 1e-9);
+}
+
+// P3.4: the render-pace record, out of PlayerApp's load and save. The
+// contended session that started it: 42.33 ms/frame for 1920x1080 among idle
+// sessions near 11.42 ms, persisted, and forecast from on every later start.
+void render_pace_median_outvotes_a_contended_sample_and_round_trips_test()
+{
+    using playback_timing::PredictRenderMs;
+    std::vector<render_pace::History> histories;
+    for (const double ms : {11.40, 11.45, 42.333431, 11.42}) render_pace::Record(histories, 1920, 1080, ms);
+    playback_timing::RenderPaceProfile source;
+    render_pace::ReducedProfiles reduced{};
+    render_pace::Rebuild(histories, source, reduced);
+    CHECK(std::abs(PredictRenderMs(source, 1920, 1080, 0.0) - (11.42 + 11.45) * 0.5) < 1e-9);
+    CHECK_EQ(11.42, render_pace::Median({11.42}));
+    CHECK_EQ(0.0, render_pace::Median({}));
+
+    // The ring keeps the newest five: the outlier ages out.
+    for (int index = 0; index < 5; ++index) render_pace::Record(histories, 1920, 1080, 11.0 + index);
+    CHECK_EQ(render_pace::kRingSamples, render_pace::SamplesKept(histories, 100, 1920, 1080));
+    CHECK_EQ(size_t{0}, render_pace::SamplesKept(histories, 50, 1920, 1080));
+    render_pace::Rebuild(histories, source, reduced);
+    CHECK_EQ(13.0, PredictRenderMs(source, 1920, 1080, 0.0));
+
+    // Nothing that is not a measurement is recorded.
+    const size_t before = histories.size();
+    render_pace::Record(histories, 0, 1080, 10.0);
+    render_pace::Record(histories, 1280, 720, 0.0);
+    render_pace::Record(histories, 1280, 720, std::nan(""));
+    render_pace::Record(histories, 1280, 720, 10.0, 60);
+    CHECK_EQ(before, histories.size());
+
+    // Per rung, and bounded per rung: six more geometries at 50% evict the
+    // oldest 50% one and never the source-scale history.
+    for (uint32_t index = 0; index < 7; ++index) render_pace::Record(histories, 640 + index * 2, 360, 5.0, 50);
+    CHECK_EQ(render_pace::kRingSamples, render_pace::SamplesKept(histories, 100, 1920, 1080));
+    CHECK_EQ(size_t{0}, render_pace::SamplesKept(histories, 50, 640, 360));
+    CHECK_EQ(size_t{1}, render_pace::SamplesKept(histories, 50, 652, 360));
+    render_pace::Rebuild(histories, source, reduced);
+    CHECK_EQ(size_t{1}, source.samples.size());
+    CHECK_EQ(playback_timing::RenderPaceProfile::kMaxSamples, render_pace::ProfileAt(50, source, reduced).samples.size());
+    CHECK(render_pace::ProfileAt(75, source, reduced).samples.empty());
+    CHECK(&render_pace::ProfileAt(100, source, reduced) == &source);
+
+    // The INI text: keys per rung, the source rung keeping the key older
+    // builds read, and a rung nobody measured writing nothing.
+    CHECK(render_pace::SamplesKey(100) == L"Samples");
+    CHECK(render_pace::SamplesKey(75) == L"Samples75");
+    CHECK(render_pace::SamplesKey(50) == L"Samples50");
+    CHECK(render_pace::Format(histories, 75).empty());
+    CHECK(render_pace::Format(histories, 100) ==
+          L"1920x1080:11.000000,12.000000,13.000000,14.000000,15.000000");
+    std::vector<render_pace::History> loaded;
+    for (const uint32_t scale : kProcessingScaleRungs) render_pace::Parse(render_pace::Format(histories, scale), scale, loaded);
+    CHECK_EQ(histories.size(), loaded.size());
+    for (const uint32_t scale : kProcessingScaleRungs)
+        CHECK(render_pace::Format(loaded, scale) == render_pace::Format(histories, scale));
+
+    // The single-value form earlier versions wrote loads as a one-sample
+    // ring; an entry without a geometry, and a sample that is not a number,
+    // are skipped on their own.
+    std::vector<render_pace::History> legacy;
+    render_pace::Parse(L"1280x720:9.5;garbage;x:3;1920x1080:abc,12.5,;3840x2160", 100, legacy);
+    CHECK_EQ(size_t{2}, legacy.size());
+    CHECK_EQ(size_t{1}, render_pace::SamplesKept(legacy, 100, 1280, 720));
+    CHECK_EQ(size_t{1}, render_pace::SamplesKept(legacy, 100, 1920, 1080));
+    CHECK(render_pace::Format(legacy, 100) == L"1280x720:9.500000;1920x1080:12.500000");
+    render_pace::Parse(L"", 50, legacy);
+    CHECK_EQ(size_t{2}, legacy.size());
+}
+
+// P3.4: ParseArgs's decisions, out of main.cpp, with a command line that is a
+// vector rather than the process's own.
+void player_command_line_takes_the_output_box_and_the_last_file_test()
+{
+    using player_command_line::Parse;
+    const auto defaults = Parse({});
+    CHECK_EQ(3840u, defaults.maxWidth);
+    CHECK_EQ(2160u, defaults.maxHeight);
+    CHECK(!defaults.outputExplicit);
+    CHECK(defaults.file.empty() && defaults.error.empty());
+
+    const auto output = Parse({L"--output", L"1920x1080", L"C:\\clips\\a.mp4"});
+    CHECK_EQ(1920u, output.maxWidth);
+    CHECK_EQ(1080u, output.maxHeight);
+    CHECK(output.outputExplicit);
+    CHECK(output.file == L"C:\\clips\\a.mp4");
+    CHECK(Parse({L"--output", L"2560X1440"}).maxHeight == 1440u);
+    // Either side below 64, or not a number, is 64.
+    const auto tiny = Parse({L"--output", L"8x-5"});
+    CHECK_EQ(64u, tiny.maxWidth);
+    CHECK_EQ(64u, tiny.maxHeight);
+    CHECK(tiny.outputExplicit);
+    // P1.33: and above D3D12's texture limit is that limit.
+    const auto huge = Parse({L"--output", L"99999x2147483647"});
+    CHECK_EQ(16384u, huge.maxWidth);
+    CHECK_EQ(16384u, huge.maxHeight);
+    // A value without a cross is consumed and ignored, so it is never taken
+    // for the file to open; a trailing --output with no value is ignored too.
+    const auto noCross = Parse({L"--output", L"1080", L"--output"});
+    CHECK(!noCross.outputExplicit);
+    CHECK(noCross.file.empty());
+    CHECK(noCross.error.empty());
+
+    // --safe-mode was read by ParseRuntimeArguments; here it is skipped, as
+    // is any other option. The last plain argument is the file.
+    const auto files = Parse({L"--safe-mode", L"first.mkv", L"--unknown", L"https://youtu.be/x"});
+    CHECK(files.file == L"https://youtu.be/x");
+    CHECK(files.error.empty());
+    // A path with spaces that arrived unquoted is one run of plain arguments,
+    // rejoined; an option ends a run, and the last run is still the file.
+    // A lone "-" is a word of the title, not an option.
+    const auto split = Parse({L"C:\\t\\007", L"First", L"Light", L"-", L"Story", L"Trailer.mkv"});
+    CHECK(split.file == L"C:\\t\\007 First Light - Story Trailer.mkv");
+    const auto runs = Parse({L"old", L"clip.mkv", L"--output", L"1920x1080", L"new", L"clip.mkv"});
+    CHECK(runs.file == L"new clip.mkv");
+    CHECK_EQ(1920u, runs.maxWidth);
+
+    // The removed --quality is refused by name rather than silently ignored.
+    const auto quality = Parse({L"clip.mp4", L"--quality", L"Balanced"});
+    CHECK(quality.error.find(L"--quality option was removed") != std::wstring::npos);
+    CHECK(quality.file == L"clip.mp4");
+}
+
+// P3.4: Position and the tick's decisions, out of PlayerApp, driven with fake
+// clocks. The audio clock is a callable so a test can see whether it was read.
+void playback_clock_reads_audio_only_while_playing_and_clamps_to_the_file_test()
+{
+    int audioReads = 0, wallReads = 0;
+    double audio = 12.5, wall = 3.0;
+    const auto readAudio = [&] { ++audioReads; return audio; };
+    const auto readWall = [&] { ++wallReads; return wall; };
+    playback_tick::ClockState state{true, true, 7.0, 40.0, 60.0};
+
+    CHECK_EQ(0.0, playback_tick::Position({false, true, 7.0, 40.0, 60.0}, readAudio, readWall));
+    // Paused: the presented frame, and the audio clock is not read. Reading
+    // it moves audio_clock's continuity and the position a restart resumes
+    // from; P0.2 was a restart from a reading taken before a paused seek.
+    state.playing = false;
+    CHECK_EQ(7.0, playback_tick::Position(state, readAudio, readWall));
+    CHECK_EQ(0, audioReads);
+    CHECK_EQ(0, wallReads);
+
+    // Playing with an audio clock: the audio clock, clamped to the file, and
+    // the steady clock is never consulted.
+    state.playing = true;
+    CHECK_EQ(12.5, playback_tick::Position(state, readAudio, readWall));
+    audio = 75.0;
+    CHECK_EQ(60.0, playback_tick::Position(state, readAudio, readWall));
+    CHECK_EQ(2, audioReads);
+    CHECK_EQ(0, wallReads);
+    // An unknown duration clamps nothing.
+    state.durationSeconds = 0.0;
+    CHECK_EQ(75.0, playback_tick::Position(state, readAudio, readWall));
+
+    // No audio clock (no stream, no endpoint): the steady clock from the last
+    // anchor. A stall does not land here any more - audio_clock::Present
+    // carries the clock through it (P1.4) - so this is the silent-file path.
+    audio = -1.0;
+    state.durationSeconds = 60.0;
+    CHECK_EQ(43.0, playback_tick::Position(state, readAudio, readWall));
+    wall = 30.0;
+    CHECK_EQ(60.0, playback_tick::Position(state, readAudio, readWall));
+    state.playStartSeconds = -5.0;
+    wall = 1.0;
+    CHECK_EQ(0.0, playback_tick::Position(state, readAudio, readWall));
+    state.durationSeconds = 0.0;
+    CHECK_EQ(0.0, playback_tick::Position(state, readAudio, readWall));
+    state.playStartSeconds = 100.0;
+    CHECK_EQ(101.0, playback_tick::Position(state, readAudio, readWall));
+}
+
+void playback_tick_seeks_first_presents_paused_frames_once_and_times_frames_test()
+{
+    using playback_tick::TickState;
+    TickState playing{};
+    playing.loaded = true; playing.playing = true; playing.haveNext = true;
+
+    // A requested seek runs before anything else, whatever else is true.
+    TickState pending = playing;
+    pending.seekPending = true;
+    CHECK(playback_tick::PerformsPendingSeek(pending));
+    CHECK(!playback_tick::PerformsPendingSeek(playing));
+
+    // A paused frame is presented only when something invalidated it; it
+    // used to be re-presented at 60 Hz for an image the compositor held.
+    TickState paused = playing;
+    paused.playing = false;
+    CHECK(!playback_tick::PresentsPausedFrame(paused, true, false, false));
+    CHECK(playback_tick::PresentsPausedFrame(paused, true, true, false));
+    CHECK(playback_tick::PresentsPausedFrame(paused, true, false, true));
+    CHECK(!playback_tick::PresentsPausedFrame(paused, false, true, true));
+    CHECK(!playback_tick::PresentsPausedFrame(playing, true, true, true));
+    TickState pausedSeeking = paused;
+    pausedSeeking.seeking = true;
+    CHECK(!playback_tick::PresentsPausedFrame(pausedSeeking, true, true, true));
+
+    // Read-ahead refills an empty queue for a cached pair or a stream only.
+    TickState empty = playing;
+    empty.haveNext = false;
+    CHECK(!playback_tick::ReadsCachedAhead(empty));
+    CHECK(!playback_tick::ReadsNetworkAhead(empty));
+    empty.cachedPlayback = true;
+    CHECK(playback_tick::ReadsCachedAhead(empty));
+    CHECK(!playback_tick::ReadsNetworkAhead(empty));
+    empty.cachedPlayback = false; empty.networkPlayback = true;
+    CHECK(playback_tick::ReadsNetworkAhead(empty));
+    empty.seeking = true;
+    CHECK(!playback_tick::ReadsNetworkAhead(empty));
+    CHECK(!playback_tick::ReadsCachedAhead(playing));
+
+    CHECK(playback_tick::AdvancesFrame(playing));
+    CHECK(!playback_tick::AdvancesFrame(paused));
+    CHECK(!playback_tick::AdvancesFrame(pausedSeeking));
+    TickState dry = playing;
+    dry.haveNext = false;
+    CHECK(!playback_tick::AdvancesFrame(dry));
+
+    // At 30 fps a frame more than 1.5 intervals late is dropped; one more
+    // than a millisecond early waits; anything between is presented.
+    const double frame = 1.0 / 30.0;
+    CHECK(!playback_tick::IsLate(10.0 + frame, 10.0, frame));
+    CHECK(playback_tick::IsLate(10.0 + frame * 1.5 + 1e-6, 10.0, frame));
+    CHECK(playback_tick::IsLate(std::nan(""), 10.0, frame));
+    CHECK(!playback_tick::IsEarly(9.9995, 10.0));
+    CHECK(playback_tick::IsEarly(9.998, 10.0));
+    CHECK(!playback_tick::IsEarly(10.2, 10.0));
+
+    // A dry queue ends a file or a pair; a stream is only waiting for data.
+    CHECK(playback_tick::EndsPlaybackWhenQueueEmpty(false));
+    CHECK(!playback_tick::EndsPlaybackWhenQueueEmpty(true));
+
+    // Only a paused, settled player lets the pump block.
+    CHECK_EQ(8u, playback_tick::SleepMs(paused));
+    CHECK_EQ(0u, playback_tick::SleepMs(playing));
+    TickState pausedPending = paused;
+    pausedPending.seekPending = true;
+    CHECK_EQ(0u, playback_tick::SleepMs(pausedPending));
+    CHECK_EQ(0u, playback_tick::SleepMs(pausedSeeking));
+    CHECK_EQ(0u, playback_tick::SleepMs(TickState{}));
+
+    // Play on a local file with nothing queued restarts through a seek.
+    CHECK(playback_tick::ResumeRestartsWithSeek(dry, 60.0));
+    CHECK(!playback_tick::ResumeRestartsWithSeek(dry, 0.0));
+    CHECK(!playback_tick::ResumeRestartsWithSeek(playing, 60.0));
+    TickState dryPair = dry;
+    dryPair.cachedPlayback = true;
+    CHECK(!playback_tick::ResumeRestartsWithSeek(dryPair, 60.0));
+    TickState dryStream = dry;
+    dryStream.networkPlayback = true;
+    CHECK(!playback_tick::ResumeRestartsWithSeek(dryStream, 60.0));
+}
+
+void seek_requests_coalesce_and_a_seek_at_the_end_retries_before_it_test()
+{
+    // The first request pauses playback, so a second one before the tick
+    // runs keeps the first one's intent rather than reading "paused".
+    CHECK(seek_policy::ResumeAfterRequest(false, false, true));
+    CHECK(!seek_policy::ResumeAfterRequest(false, true, false));
+    CHECK(seek_policy::ResumeAfterRequest(true, true, false));
+    CHECK(!seek_policy::ResumeAfterRequest(true, false, true));
+
+    // A decoder that returns nothing at the target is asked again a frame
+    // and a half before the end; never past the target, never below zero.
+    const double frame = 1.0 / 30.0;
+    const auto retry = seek_policy::RetryTarget(10.0, 10.0, 30.0);
+    CHECK(retry.has_value());
+    if (retry) CHECK(std::abs(*retry - (10.0 - frame * 1.5)) < 1e-12);
+    CHECK(!seek_policy::RetryTarget(5.0, 10.0, 30.0).has_value());
+    CHECK(!seek_policy::RetryTarget(0.0, 10.0, 30.0).has_value());
+    CHECK(!seek_policy::RetryTarget(10.0, 0.0, 30.0).has_value());
+    const auto tiny = seek_policy::RetryTarget(0.02, 0.03, 30.0);
+    CHECK(tiny.has_value());
+    if (tiny) CHECK_EQ(0.0, *tiny);
+    // An unknown rate is read as 1 fps.
+    const auto slow = seek_policy::RetryTarget(10.0, 10.0, 0.0);
+    CHECK(slow.has_value());
+    if (slow) CHECK_EQ(8.5, *slow);
+
+    // A plain file plays on after a seek only if a frame follows the one
+    // shown; a cached pair reads its own next frame on the next tick.
+    CHECK(seek_policy::PlaysAfterSeek(true, false, true));
+    CHECK(!seek_policy::PlaysAfterSeek(true, false, false));
+    CHECK(seek_policy::PlaysAfterSeek(true, true, false));
+    CHECK(!seek_policy::PlaysAfterSeek(false, true, true));
+    // A drag preview would respawn the audio helper on every step; the
+    // release restarts it once.
+    CHECK(!seek_policy::RestartsAudioAfterSeek(true));
+    CHECK(seek_policy::RestartsAudioAfterSeek(false));
+}
+
+// P3.4: the decisions inside the player's neural job, out of the 420-line
+// thread lambda StartNeuralJob used to be.
+void neural_job_checks_the_range_and_what_a_cached_entry_must_agree_with_test()
+{
+    CHECK_EQ(30u, neural_job::SegmentFrames(30.0, 1.0));
+    CHECK_EQ(60u, neural_job::SegmentFrames(29.97, 2.0));
+    CHECK_EQ(1u, neural_job::SegmentFrames(0.1, 1.0));
+
+    const int64_t source = 100000000;  // 10 s
+    CHECK(!neural_job::RangeOutsideSource({}, source));
+    CHECK(!neural_job::RangeOutsideSource({0, 5000000}, source));
+    CHECK(!neural_job::RangeOutsideSource({90000000, 200000000}, source));
+    CHECK(neural_job::RangeOutsideSource({-1, 5000000}, source));
+    CHECK(neural_job::RangeOutsideSource({5000000, 5000000}, source));
+    CHECK(neural_job::RangeOutsideSource({source, source + 1}, source));
+    CHECK_EQ(source, neural_job::ExpectedDuration100ns({}, source));
+    CHECK_EQ(int64_t{15000000}, neural_job::ExpectedDuration100ns({15000000, 30000000}, source));
+    CHECK_EQ(int64_t{333334}, neural_job::FrameDurationTolerance100ns(30.0));
+
+    // A 1080p 10 s entry of 300 frames, and the probe of a healthy payload.
+    NeuralCacheManifest manifest{};
+    manifest.sourceDigest = "s"; manifest.runtimeDigest = "r"; manifest.settingsDigest = "k";
+    manifest.guides = "mv=1"; manifest.width = 1920; manifest.height = 1080;
+    manifest.frameCount = 300; manifest.duration100ns = source;
+    ProbeResult probe{};
+    probe.ok = true; probe.width = 1920; probe.height = 1080; probe.duration100ns = source;
+    const neural_job::Expected expected{"s", "r", "k", {}, "mv=1", 1920, 1080, source,
+                                        neural_job::FrameDurationTolerance100ns(30.0)};
+    CHECK(cached_render::Judge(neural_job::CachedRenderEvidence(manifest, probe, expected)) ==
+          cached_render::Verdict::Serve);
+
+    // A probe that could not run is not a probe that disagreed: the entry,
+    // whose payload hash was just verified, is kept rather than quarantined.
+    ProbeResult unrun{};
+    unrun.detail = L"ffprobe could not be started";
+    const auto unverified = neural_job::CachedRenderEvidence(manifest, unrun, expected);
+    CHECK(!unverified.probeRan);
+    CHECK(unverified.manifestMatches);
+    CHECK(cached_render::Judge(unverified) == cached_render::Verdict::Unverified);
+
+    // Each identity term the manifest carries has to agree.
+    for (int term = 0; term < 5; ++term) {
+        neural_job::Expected other = expected;
+        if (term == 0) other.sourceDigest = "x";
+        if (term == 1) other.runtimeDigest = "x";
+        if (term == 2) other.settingsDigest = "x";
+        if (term == 3) other.range = {0, 50000000};
+        if (term == 4) other.guides = "mv=0";
+        const auto evidence = neural_job::CachedRenderEvidence(manifest, probe, other);
+        CHECK(!evidence.manifestMatches);
+        CHECK(cached_render::Judge(evidence) == cached_render::Verdict::Discard);
+    }
+    // Geometry: the probe against both the job and the manifest.
+    ProbeResult small = probe;
+    small.width = 1280; small.height = 720;
+    CHECK(!neural_job::CachedRenderEvidence(manifest, small, expected).geometryMatches);
+    // Duration: within one frame of the manifest's own frame duration, and
+    // within one frame of what this job expects.
+    ProbeResult longer = probe;
+    longer.duration100ns = source + source / 300 + 1;
+    CHECK(neural_job::CachedRenderEvidence(manifest, longer, expected).durationMatches);
+    longer.duration100ns = source + source / 300 + 2;
+    CHECK(!neural_job::CachedRenderEvidence(manifest, longer, expected).durationMatches);
+    neural_job::Expected ranged = expected;
+    ranged.duration100ns = source / 2;
+    CHECK(!neural_job::CachedRenderEvidence(manifest, probe, ranged).durationMatches);
+
+    CHECK(std::string(neural_job::CacheEncoderName(EncoderKind::HevcNvenc)) == "hevc_nvenc");
+    CHECK(std::string(neural_job::CacheEncoderName(EncoderKind::Ffv1)) == "ffv1");
+    CHECK(std::string(neural_job::CacheEncoderName(EncoderKind::H264Software)) == "h264_software");
+}
+
+// A resumed session's index holds earlier runs' coverage beside this run's,
+// sorted by time, and the published entry must be exactly this run's files:
+// joining the others in once produced 2622 frames against a result of 1647.
+void neural_job_publishes_only_its_own_run_and_only_what_it_reported_test()
+{
+    NeuralSegmentIndex index;
+    const auto add = [&](uint64_t run, int64_t start, const wchar_t* name) {
+        NeuralSegment segment{};
+        segment.path = name; segment.runId = run; segment.firstTimestamp100ns = start;
+        segment.end100ns = start + 10000000; segment.frameCount = 30;
+        index.Append(std::move(segment));
+    };
+    add(1, 0, L"r1-a.mkv");
+    add(2, 50000000, L"r2-a.mkv");
+    add(1, 10000000, L"r1-b.mkv");
+    // Run 2 filled a hole behind run 3: it is not the tail of the index.
+    add(3, 80000000, L"r3-a.mkv");
+    add(2, 60000000, L"r2-b.mkv");
+    const auto run2 = neural_job::SegmentsOfRun(index, 2);
+    CHECK_EQ(size_t{2}, run2.size());
+    if (run2.size() == 2) {
+        CHECK(run2[0] == L"r2-a.mkv");
+        CHECK(run2[1] == L"r2-b.mkv");
+    }
+    CHECK_EQ(size_t{2}, neural_job::SegmentsOfRun(index, 1).size());
+    CHECK(neural_job::SegmentsOfRun(index, 9).empty());
+
+    ProbeResult probe{};
+    probe.ok = true; probe.width = 1920; probe.height = 1080; probe.frameCount = 60;
+    probe.duration100ns = 20000000;
+    const int64_t tolerance = JoinedMediaDurationTolerance100ns(30.0, 2);
+    CHECK(neural_job::PublishedProbeMatches(probe, 1920, 1080, 60, 20000000, 20000000, tolerance));
+    CHECK(!neural_job::PublishedProbeMatches(probe, 1920, 1080, 61, 20000000, 20000000, tolerance));
+    CHECK(!neural_job::PublishedProbeMatches(probe, 1280, 1080, 60, 20000000, 20000000, tolerance));
+    CHECK(!neural_job::PublishedProbeMatches(probe, 1920, 1080, 60, 20000000, 30000000, tolerance));
+    ProbeResult failed = probe;
+    failed.ok = false;
+    CHECK(!neural_job::PublishedProbeMatches(failed, 1920, 1080, 60, 20000000, 20000000, tolerance));
+}
+
+// ---- Direct NVENC encoding (P3.7) ---------------------------------------------
+// The direct path has to write the packets the ffmpeg child writes (the GPU
+// smokes NvencDirectIdentitySmoke and NeuralDirectEncodeSmoke hold it to that on
+// hardware). What can be pinned without a GPU is every number it derives the way
+// FFmpeg does, and the hand-off file's layout.
+
+void nvenc_direct_rates_are_the_ones_the_encoder_child_parses_test()
+{
+    using nvenc_direct::Rational;
+    // FrameRateText's decimal parsed back through av_d2q. The NTSC rates do NOT
+    // come back as 24000/1001 and friends: the six-place decimal is not that
+    // fraction, and each of these is what the shipped ffmpeg's -framerate made of
+    // the same text (ffprobe -f rawvideo -framerate 29.97003 reports 979001/32666).
+    // Those are the rates the child configures NVENC with and times packets in.
+    CHECK(nvenc_direct::ChildFrameRate(30.0) == (Rational{30, 1}));
+    CHECK(nvenc_direct::ChildFrameRate(60.0) == (Rational{60, 1}));
+    CHECK(nvenc_direct::ChildFrameRate(25.0) == (Rational{25, 1}));
+    CHECK(nvenc_direct::ChildFrameRate(12.5) == (Rational{25, 2}));
+    CHECK(nvenc_direct::ChildFrameRate(24000.0 / 1001.0) == (Rational{991001, 41333}));
+    CHECK(nvenc_direct::ChildFrameRate(30000.0 / 1001.0) == (Rational{979001, 32666}));
+    CHECK(nvenc_direct::ChildFrameRate(60000.0 / 1001.0) == (Rational{979001, 16333}));
+    CHECK(nvenc_direct::ChildFrameRate(48000.0 / 1001.0) == (Rational{967001, 20166}));
+    CHECK(nvenc_direct::ChildFrameRate(120000.0 / 1001.0) == (Rational{919001, 7666}));
+    CHECK(nvenc_direct::Reduce(1920, 1080, 1024 * 1024) == (Rational{16, 9}));
+    CHECK(nvenc_direct::Reduce(3840, 2160, 1024 * 1024) == (Rational{16, 9}));
+    CHECK(nvenc_direct::Reduce(2578, 1080, 1024 * 1024) == (Rational{1289, 540}));
+    // av_rescale_q into Matroska's milliseconds, rounded half away from zero: the
+    // 24000/1001 grid lands exactly on .5 at frame 12.
+    CHECK_EQ(int64_t{0}, nvenc_direct::FrameMilliseconds(0, {30, 1}));
+    CHECK_EQ(int64_t{33}, nvenc_direct::FrameMilliseconds(1, {30, 1}));
+    CHECK_EQ(int64_t{67}, nvenc_direct::FrameMilliseconds(2, {30, 1}));
+    CHECK_EQ(int64_t{100}, nvenc_direct::FrameMilliseconds(3, {30, 1}));
+    CHECK_EQ(int64_t{42}, nvenc_direct::FrameMilliseconds(1, {24000, 1001}));
+    CHECK_EQ(int64_t{83}, nvenc_direct::FrameMilliseconds(2, {24000, 1001}));
+    CHECK_EQ(int64_t{501}, nvenc_direct::FrameMilliseconds(12, {24000, 1001}));
+    // ...where the child's real 23.976 rate lands just short of it, which is why
+    // the rate has to be the child's and not the fraction it approximates.
+    CHECK_EQ(int64_t{500}, nvenc_direct::FrameMilliseconds(12, {991001, 41333}));
+    CHECK_EQ(int64_t{1543}, nvenc_direct::FrameMilliseconds(37, {991001, 41333}));
+    CHECK_EQ(uint64_t{33333333}, nvenc_direct::DefaultDurationNanoseconds({30, 1}));
+    CHECK_EQ(uint64_t{33366666}, nvenc_direct::DefaultDurationNanoseconds({30000, 1001}));
+}
+
+void nvenc_direct_is_tried_only_where_it_can_write_the_childs_packets_test()
+{
+    using nvenc_direct::Eligibility;
+    using nvenc_direct::Ineligible;
+    CHECK(Eligibility(EncoderKind::HevcNvenc, EncoderPixelFormat::Nv12, false, EncoderPath::Auto) == Ineligible::None);
+    CHECK(Eligibility(EncoderKind::HevcNvenc, EncoderPixelFormat::P010, false, EncoderPath::Direct) == Ineligible::None);
+    // Standard's default capture is BGRA, which the child converts with swscale.
+    CHECK(Eligibility(EncoderKind::HevcNvenc, EncoderPixelFormat::Bgra, false, EncoderPath::Auto) ==
+          Ineligible::PackedCapture);
+    CHECK(Eligibility(EncoderKind::Ffv1, EncoderPixelFormat::P010, false, EncoderPath::Auto) == Ineligible::NotNvenc);
+    CHECK(Eligibility(EncoderKind::H264Software, EncoderPixelFormat::Nv12, false, EncoderPath::Auto) ==
+          Ineligible::NotNvenc);
+    CHECK(Eligibility(EncoderKind::HevcNvenc, EncoderPixelFormat::Nv12, true, EncoderPath::Auto) ==
+          Ineligible::Segmented);
+    CHECK(Eligibility(EncoderKind::HevcNvenc, EncoderPixelFormat::Nv12, false, EncoderPath::Ffmpeg) ==
+          Ineligible::Forced);
+    // The pool covers the capture ring, the B-frames NVENC holds for their anchor,
+    // the lookahead and the unlocked pictures - 11 surfaces for the p5 preset's
+    // frameIntervalP 4, as the session logs - and one bitstream buffer is taken by
+    // every picture not yet locked.
+    CHECK_EQ(11u, nvenc_direct::SurfacePoolSize(4, 4, 0, 2));
+    CHECK_EQ(19u, nvenc_direct::SurfacePoolSize(4, 4, 8, 2));
+    CHECK_EQ(7u, nvenc_direct::SurfacePoolSize(4, 1, 0, 1));
+    CHECK_EQ(7u, nvenc_direct::OutputBufferCount(4, 0, 2));
+    CHECK_EQ(15u, nvenc_direct::OutputBufferCount(4, 8, 2));
+    CHECK_EQ(2u * 1024u * 1024u, nvenc_direct::OutputBufferBytes(1280, 720, false));
+    CHECK_EQ(uint32_t(3840u * 2160u * 3u), nvenc_direct::OutputBufferBytes(3840, 2160, true));
+    // The token a direct capture resolves to round-trips, and nothing else reads as one.
+    std::vector<uint8_t> bytes;
+    WriteNvencDirectToken(NvencDirectToken{NvencDirectToken::kMagic, 7, 123456789}, bytes);
+    NvencDirectToken token;
+    CHECK(ReadNvencDirectToken(bytes, token));
+    CHECK_EQ(7u, token.surface);
+    CHECK_EQ(uint64_t{123456789}, token.fenceValue);
+    bytes[0] ^= 1u;
+    CHECK(!ReadNvencDirectToken(bytes, token));
+    CHECK(!ReadNvencDirectToken(std::vector<uint8_t>(24, 0), token));
+}
+
+#ifdef DLSS_VIDEO_PLAYER_HAS_NVENC
+void nvenc_direct_configures_the_preset_as_hevc_nvenc_does_test()
+{
+    // A preset shaped like the driver's p5/hq answer, with the fields hevc_nvenc
+    // overrides set to something else so each override is visible.
+    NV_ENC_CONFIG preset{};
+    preset.frameIntervalP = 4;
+    preset.gopLength = 0xFFFFFFFFu;
+    preset.rcParams.averageBitRate = 5'000'000;
+    preset.rcParams.vbvBufferSize = 10'000'000;
+    preset.rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+    preset.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+    preset.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
+    preset.encodeCodecConfig.hevcConfig.hevcVUIParameters.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+
+    EncoderSpec spec{1920, 1080, 30000.0 / 1001.0, EncoderKind::HevcNvenc, EncoderPixelFormat::Nv12};
+    spec.nvencPreset = 5;
+    NV_ENC_CONFIG config = preset;
+    NV_ENC_INITIALIZE_PARAMS init{};
+    const nvenc_direct::Plan plan =
+        nvenc_direct::ApplyHevcNvencOptions(spec, nvenc_direct::ChildFrameRate(spec.fps), init, config);
+    CHECK(init.encodeGUID == NV_ENC_CODEC_HEVC_GUID);
+    CHECK(init.presetGUID == NV_ENC_PRESET_P5_GUID);
+    CHECK(init.tuningInfo == NV_ENC_TUNING_INFO_HIGH_QUALITY);
+    CHECK_EQ(16u, init.darWidth);
+    CHECK_EQ(9u, init.darHeight);
+    CHECK_EQ(979001u, init.frameRateNum);
+    CHECK_EQ(32666u, init.frameRateDen);
+    CHECK_EQ(1u, init.enablePTD);
+    CHECK_EQ(0u, init.enableEncodeAsync);
+    CHECK_EQ(uint32_t(NV_ENC_SPLIT_AUTO_MODE), uint32_t(init.splitEncodeMode));
+    CHECK(init.encodeConfig == &config);
+    CHECK(init.bufferFormat == NV_ENC_BUFFER_FORMAT_NV12);
+    // g=250 with bf=-1: the length changes, the preset's B-frames stand.
+    CHECK_EQ(250u, config.gopLength);
+    CHECK_EQ(4, config.frameIntervalP);
+    CHECK_EQ(4, plan.frameIntervalP);
+    CHECK_EQ(0u, plan.lookahead);
+    const NV_ENC_RC_PARAMS& rc = config.rcParams;
+    CHECK(rc.rateControlMode == NV_ENC_PARAMS_RC_VBR);
+    CHECK(rc.multiPass == NV_ENC_MULTI_PASS_DISABLED);
+    CHECK_EQ(16u, uint32_t(rc.targetQuality));
+    CHECK_EQ(0u, uint32_t(rc.targetQualityLSB));
+    CHECK_EQ(0u, rc.averageBitRate);
+    CHECK_EQ(0u, rc.vbvBufferSize);
+    CHECK_EQ(800'000'000u, rc.maxBitRate);
+    CHECK_EQ(1u, uint32_t(rc.enableInitialRCQP));
+    CHECK_EQ(26u, rc.initialRCQP.qpInterP);
+    CHECK_EQ(21u, rc.initialRCQP.qpIntra);
+    CHECK_EQ(34u, rc.initialRCQP.qpInterB);
+    CHECK_EQ(0u, uint32_t(rc.enableLookahead));
+    const NV_ENC_CONFIG_HEVC& hevc = config.encodeCodecConfig.hevcConfig;
+    CHECK(config.profileGUID == NV_ENC_HEVC_PROFILE_MAIN_GUID);
+    CHECK_EQ(1u, uint32_t(hevc.disableSPSPPS));
+    CHECK_EQ(0u, uint32_t(hevc.repeatSPSPPS));
+    CHECK_EQ(250u, hevc.idrPeriod);
+    CHECK_EQ(1u, uint32_t(hevc.outputPictureTimingSEI));
+    CHECK_EQ(0u, uint32_t(hevc.outputBufferingPeriodSEI));
+    CHECK_EQ(3u, hevc.sliceMode);
+    CHECK_EQ(1u, hevc.sliceModeData);
+    CHECK_EQ(1u, uint32_t(hevc.chromaFormatIDC));
+    CHECK(hevc.inputBitDepth == NV_ENC_BIT_DEPTH_8 && hevc.outputBitDepth == NV_ENC_BIT_DEPTH_8);
+    CHECK(hevc.numRefL0 == NV_ENC_NUM_REF_FRAMES_AUTOSELECT && hevc.numRefL1 == NV_ENC_NUM_REF_FRAMES_AUTOSELECT);
+    const NV_ENC_CONFIG_HEVC_VUI_PARAMETERS& vui = hevc.hevcVUIParameters;
+    CHECK(vui.colourMatrix == NV_ENC_VUI_MATRIX_COEFFS_BT709);
+    CHECK(vui.colourPrimaries == NV_ENC_VUI_COLOR_PRIMARIES_BT709);
+    CHECK(vui.transferCharacteristics == NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709);
+    CHECK_EQ(0u, vui.videoFullRangeFlag);
+    CHECK_EQ(1u, vui.colourDescriptionPresentFlag);
+    CHECK_EQ(1u, vui.videoSignalTypePresentFlag);
+    CHECK(vui.videoFormat == NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED);
+
+    // High: Main10 from P010 at kHighRungCq.
+    spec.quality = EncoderQuality::High;
+    spec.pixelFormat = EncoderPixelFormat::P010;
+    spec.nvencPreset = 7;
+    config = preset;
+    init = {};
+    nvenc_direct::ApplyHevcNvencOptions(spec, nvenc_direct::ChildFrameRate(spec.fps), init, config);
+    CHECK(init.presetGUID == NV_ENC_PRESET_P7_GUID);
+    CHECK(init.bufferFormat == NV_ENC_BUFFER_FORMAT_YUV420_10BIT);
+    CHECK(config.profileGUID == NV_ENC_HEVC_PROFILE_MAIN10_GUID);
+    CHECK_EQ(kHighRungCq, uint32_t(config.rcParams.targetQuality));
+    CHECK(config.encodeCodecConfig.hevcConfig.inputBitDepth == NV_ENC_BIT_DEPTH_10 &&
+          config.encodeCodecConfig.hevcConfig.outputBitDepth == NV_ENC_BIT_DEPTH_10);
+
+    // A preset that brings its own lookahead keeps it, within the bound FFmpeg's
+    // surface count allows, with scene-cut and B-adaptation left on.
+    config = preset;
+    config.rcParams.enableLookahead = 1;
+    config.rcParams.lookaheadDepth = 8;
+    config.rcParams.disableIadapt = 1;
+    init = {};
+    const nvenc_direct::Plan lookahead =
+        nvenc_direct::ApplyHevcNvencOptions(spec, nvenc_direct::ChildFrameRate(spec.fps), init, config);
+    CHECK_EQ(1u, uint32_t(config.rcParams.enableLookahead));
+    CHECK_EQ(8u, uint32_t(config.rcParams.lookaheadDepth));
+    CHECK_EQ(0u, uint32_t(config.rcParams.disableIadapt));
+    CHECK_EQ(0u, uint32_t(config.rcParams.disableBadapt));
+    CHECK_EQ(8u, lookahead.lookahead);
+}
+#endif
+
+void nvenc_direct_hand_off_matroska_is_laid_out_as_ebml_test()
+{
+    namespace mkv = nvenc_direct::mkv;
+    const auto size = [](uint64_t value) {
+        std::vector<uint8_t> out;
+        mkv::AppendSize(out, value);
+        return out;
+    };
+    // Shortest form whose value bits are not all ones - that is "unknown size".
+    CHECK(size(0) == (std::vector<uint8_t>{0x80}));
+    CHECK(size(126) == (std::vector<uint8_t>{0xFE}));
+    CHECK(size(127) == (std::vector<uint8_t>{0x40, 0x7F}));
+    CHECK(size(16382) == (std::vector<uint8_t>{0x7F, 0xFE}));
+    CHECK(size(16383) == (std::vector<uint8_t>{0x20, 0x3F, 0xFF}));
+    std::vector<uint8_t> element;
+    mkv::AppendUnsigned(element, mkv::id::kTimestampScale, 1'000'000);
+    CHECK(element == (std::vector<uint8_t>{0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40}));
+    element.clear();
+    mkv::AppendUnsigned(element, mkv::id::kTimestamp, 0);
+    CHECK(element == (std::vector<uint8_t>{0xE7, 0x81, 0x00}));
+    // Track 1, a signed relative timestamp, the keyframe flag, then the picture.
+    element.clear();
+    const uint8_t picture[] = {1, 2, 3};
+    mkv::AppendSimpleBlock(element, picture, -5, true);
+    CHECK(element == (std::vector<uint8_t>{0xA3, 0x87, 0x81, 0xFF, 0xFB, 0x80, 1, 2, 3}));
+    element.clear();
+    mkv::AppendSimpleBlock(element, picture, 300, false);
+    CHECK(element == (std::vector<uint8_t>{0xA3, 0x87, 0x81, 0x01, 0x2C, 0x00, 1, 2, 3}));
+
+    // The header: EBML, then a Segment whose eight-byte size is filled in at the
+    // end, the Annex B parameter sets as CodecPrivate and BT.709 limited range.
+    const uint8_t parameterSets[] = {0, 0, 0, 1, 0x40, 0x01, 0xAA};
+    size_t segmentSize = 0;
+    const std::vector<uint8_t> header = mkv::Header(1280, 720, {30, 1}, parameterSets, segmentSize);
+    REQUIRE(header.size() > segmentSize + 8);
+    CHECK((std::vector<uint8_t>(header.begin(), header.begin() + 4)) == (std::vector<uint8_t>{0x1A, 0x45, 0xDF, 0xA3}));
+    CHECK((std::vector<uint8_t>(header.begin() + std::ptrdiff_t(segmentSize) - 4, header.begin() + std::ptrdiff_t(segmentSize))) ==
+          (std::vector<uint8_t>{0x18, 0x53, 0x80, 0x67}));
+    CHECK_EQ(uint8_t{0x01}, header[segmentSize]);
+    const std::string text(header.begin(), header.end());
+    CHECK(text.find("V_MPEGH/ISO/HEVC") != std::string::npos);
+    CHECK(text.find(std::string("\x63\xA2\x87\x00\x00\x00\x01\x40\x01\xAA", 10)) != std::string::npos);
+    CHECK(text.find(std::string("\x55\xB9\x81\x01", 4)) != std::string::npos);  // Range: broadcast
+
+    // A written file's Segment size covers exactly what follows it.
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / ("nvenc-direct-mkv-" + std::to_string(GetCurrentProcessId()) + ".mkv");
+    {
+        mkv::Writer writer;
+        REQUIRE(writer.Open(path, 1280, 720, {30, 1}, parameterSets));
+        CHECK(writer.Write(picture, 0, true));
+        CHECK(writer.Write(picture, 133, false));
+        CHECK(writer.Write(picture, 67, false));
+        CHECK(writer.Write(picture, 8'400, true));
+        CHECK(writer.Close());
+        writer.Release();
+    }
+    std::ifstream in(path, std::ios::binary);
+    const std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    REQUIRE(file.size() > segmentSize + 8);
+    uint64_t declared = 0;
+    for (size_t index = 0; index < 8; ++index) declared = (declared << 8) | file[segmentSize + index];
+    declared &= (uint64_t{1} << 56) - 1u;
+    CHECK_EQ(uint64_t(file.size() - segmentSize - 8), declared);
+    // Two keyframes, two clusters.
+    size_t clusters = 0;
+    for (size_t index = 0; index + 4 <= file.size(); ++index)
+        if (file[index] == 0x1F && file[index + 1] == 0x43 && file[index + 2] == 0xB6 && file[index + 3] == 0x75) ++clusters;
+    CHECK_EQ(size_t{2}, clusters);
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    // Abandon deletes what it wrote.
+    {
+        mkv::Writer writer;
+        REQUIRE(writer.Open(path, 1280, 720, {30, 1}, parameterSets));
+        writer.Abandon();
+    }
+    CHECK(!std::filesystem::exists(path));
+}
+
+constexpr test_support::TestCase kCases[] = {
+    TEST_CASE(harness_isolates_a_failing_case_from_the_ones_after_it_test),
+    TEST_CASE(runtime_shutdown_releases_player_before_media_foundation_and_com_test),
+    TEST_CASE(runtime_shutdown_rethrows_only_after_single_ordered_cleanup_test),
+    TEST_CASE(toolbar_layout_selects_stable_action_sets_for_width_modes_test),
+    TEST_CASE(toolbar_layout_preserves_group_separation_test),
+    TEST_CASE(toolbar_layout_scales_hit_height_and_avoids_overlap_test),
+    TEST_CASE(toolbar_hit_testing_is_half_open_and_boundary_stable_test),
+    TEST_CASE(minimum_toolbar_client_width_owns_required_target_floor_across_dpi_test),
+    TEST_CASE(volume_slider_never_intersects_compact_or_threshold_toolbar_test),
+    TEST_CASE(toolbar_focus_order_includes_idle_open_and_skips_disabled_actions_test),
+    TEST_CASE(frame_generation_pill_follows_media_and_availability_only_test),
+    TEST_CASE(open_action_content_keeps_idle_and_toolbar_copy_distinct_test),
+    TEST_CASE(focused_toolbar_action_reconciles_layout_and_availability_changes_test),
+    TEST_CASE(idle_surface_exposes_file_and_disabled_youtube_without_focusing_it_test),
+    TEST_CASE(dpi_change_suggested_rect_respects_new_monitor_minimum_track_size_test),
+    TEST_CASE(player_status_formats_exact_runtime_and_playback_states_test),
+    TEST_CASE(status_chips_carry_the_rate_the_drops_and_the_render_test),
+    TEST_CASE(first_window_takes_a_share_of_the_work_area_and_keeps_the_pill_words_test),
+    TEST_CASE(slider_geometry_fills_from_its_origin_and_keeps_the_knob_and_bubble_inside_test),
+    TEST_CASE(window_placement_round_trips_and_is_dropped_off_the_current_screens_test),
+    TEST_CASE(escape_leaves_fullscreen_before_it_stops_anything_test),
+    TEST_CASE(toolbar_tips_name_every_control_and_the_key_its_menu_row_runs_test),
+    TEST_CASE(warm_up_names_the_cold_start_step_and_the_chip_invents_no_eta_test),
+    TEST_CASE(status_chip_tips_say_what_was_measured_test),
+    TEST_CASE(status_chips_flash_on_the_fact_not_on_every_repaint_test),
+    TEST_CASE(status_chips_keep_fixed_places_and_give_the_line_the_rest_test),
+    TEST_CASE(feature_pills_shrink_before_the_bar_goes_compact_test),
+    TEST_CASE(timeline_reads_chapters_the_way_ffprobe_prints_them_test),
+    TEST_CASE(timeline_hover_says_where_and_what_the_render_map_says_there_test),
+    TEST_CASE(timeline_thumbnails_are_bucketed_cached_and_cheap_to_ask_for_test),
+    TEST_CASE(keyboard_cheat_sheet_is_read_from_the_menus_test),
+    TEST_CASE(menu_paths_named_in_text_exist_test),
+    TEST_CASE(keyboard_cheat_sheet_flows_whole_groups_into_columns_test),
+    TEST_CASE(dark_menu_bar_and_dialog_scaling_follow_the_palette_and_the_dpi_test),
+    TEST_CASE(media_controls_ask_for_a_state_and_push_the_timeline_sparingly_test),
+    TEST_CASE(taskbar_thumbnail_buttons_are_fixed_and_follow_the_player_test),
+    TEST_CASE(start_screen_checks_say_what_passed_and_what_failed_test),
+    TEST_CASE(start_screen_names_a_loaded_frame_generation_addon_test),
+    TEST_CASE(render_cache_revision_is_a_release_no_later_than_this_one_test),
+    TEST_CASE(command_argument_quoting_round_trips_through_argv_test),
+    TEST_CASE(segment_names_refuse_devices_and_trailing_dots_test),
+    TEST_CASE(framegen_addon_picks_the_dlssg_sm86_proxy_beside_the_player_test),
+    TEST_CASE(framegen_addon_refusal_advice_names_the_gpu_not_the_driver_on_rtx20_and_rtx30_test),
+    TEST_CASE(framegen_addon_loads_its_proxy_as_a_second_module_beside_system32_test),
+    TEST_CASE(framegen_addon_download_is_offered_only_on_rtx20_and_rtx30_without_it_test),
+    TEST_CASE(framegen_addon_install_verifies_every_pin_before_writing_test),
+    TEST_CASE(start_screen_stacks_the_panel_and_tiles_and_gives_way_to_small_windows_test),
+    TEST_CASE(playback_timeline_follows_the_presented_frame_test),
+    TEST_CASE(playback_lateness_is_bounded_to_one_and_a_half_frames_test),
+    TEST_CASE(long_media_title_is_bounded_with_a_real_ellipsis_test),
+    TEST_CASE(recovery_copy_and_rehook_confirmation_are_actionable_test),
+    TEST_CASE(unchanged_hover_action_has_no_dirty_rectangles_test),
+    TEST_CASE(changed_hover_action_dirties_only_present_old_and_new_actions_test),
+    TEST_CASE(hover_resolution_tracks_layout_action_changes_and_disappearance_test),
+    TEST_CASE(current_cursor_hover_clears_when_cursor_query_is_unavailable_test),
+    TEST_CASE(paint_buffer_layout_uses_only_the_clipped_nonzero_paint_rectangle_test),
+    TEST_CASE(tabler_glyph_mapping_uses_the_pinned_css_codepoints_test),
+    TEST_CASE(native_button_palette_has_distinct_interaction_states_test),
+    TEST_CASE(active_button_small_text_meets_wcag_contrast_test),
+    TEST_CASE(chrome_motion_fades_ease_without_overshoot_and_honour_reduced_motion_test),
+    TEST_CASE(chrome_motion_compare_mark_slides_from_the_old_mode_to_the_new_test),
+    TEST_CASE(chrome_motion_toast_rises_holds_and_goes_and_a_second_one_does_not_bounce_test),
+    TEST_CASE(chrome_motion_band_reveals_only_new_coverage_left_to_right_test),
+    TEST_CASE(chrome_motion_render_complete_glow_sweeps_once_and_only_for_a_render_watched_happening_test),
+    TEST_CASE(failed_icon_font_uses_label_only_presentation_test),
+    TEST_CASE(button_content_layout_preserves_required_insets_and_icon_gap_at_every_dpi_test),
+    TEST_CASE(button_content_layout_centers_combined_icon_and_label_without_outline_contact_test),
+    TEST_CASE(prerender_surface_layout_keeps_progress_cancel_and_text_inside_client_bounds_test),
+    TEST_CASE(advanced_menu_contains_clear_neural_cache_and_no_removed_quality_commands_test),
+    TEST_CASE(feature_menu_uses_distinct_controls_and_honest_availability_test),
+    TEST_CASE(debug_view_popup_contains_all_existing_views_and_selection_test),
+    TEST_CASE(range_preview_and_comparison_menus_route_keys_and_gate_availability_test),
+    TEST_CASE(player_menu_is_english_only_and_retains_advanced_commands_test),
+    TEST_CASE(youtube_source_quality_menu_is_distinct_radio_group_and_updates_test),
+    TEST_CASE(youtube_availability_drives_real_menu_and_idle_action_consistently_test),
+    TEST_CASE(youtube_resolution_generation_accepts_only_the_current_completion_test),
+    TEST_CASE(youtube_resolution_disables_only_conflicting_source_actions_test),
+    TEST_CASE(youtube_resolution_error_mapping_is_actionable_and_distinct_test),
+    TEST_CASE(youtube_source_forces_ffmpeg_and_never_allows_media_foundation_fallback_test),
+    TEST_CASE(youtube_resolution_cancellation_runs_stop_cancel_join_in_order_test),
+    TEST_CASE(youtube_display_and_log_labels_never_expose_direct_urls_test),
+    TEST_CASE(youtube_real_menu_and_ctrl_l_route_share_the_enabled_action_test),
+    TEST_CASE(fixed_youtube_examples_are_complete_safe_and_menu_routable_test),
+    TEST_CASE(youtube_completion_registry_is_scalar_once_only_and_spoof_safe_test),
+    TEST_CASE(youtube_completion_registry_post_failure_and_concurrency_are_owned_test),
+    TEST_CASE(youtube_renderer_transaction_validates_every_open_seek_and_quality_candidate_geometry_test),
+    TEST_CASE(network_prepared_geometry_accepts_both_source_layouts_test),
+    TEST_CASE(youtube_renderer_transaction_validates_before_atomic_handoff_and_rolls_back_test),
+    TEST_CASE(youtube_candidate_seek_render_failure_preserves_all_active_state_before_commit_test),
+    TEST_CASE(youtube_network_read_decisions_are_identical_and_once_only_at_both_positions_test),
+    TEST_CASE(youtube_async_transaction_coalesces_and_discards_stale_work_before_handoff_test),
+    TEST_CASE(youtube_stale_and_cancelled_prepared_seek_ownership_is_destroyed_once_test),
+    TEST_CASE(youtube_decoder_probe_and_frame_reads_are_bounded_nonblocking_test),
+    TEST_CASE(video_decoder_prefers_video_duration_tag_over_longer_container_test),
+    TEST_CASE(youtube_decoder_discards_only_expected_trailing_partial_frame_test),
+    TEST_CASE(youtube_decoder_background_seek_trickles_and_cancels_boundedly_test),
+    TEST_CASE(video_decoder_close_releases_a_blocked_blocking_read_test),
+    TEST_CASE(video_decoder_hardware_failure_falls_back_to_software_test),
+    TEST_CASE(video_decoder_remembers_dead_hardware_paths_test),
+    TEST_CASE(video_decoder_drains_complete_raw_frame_buffered_after_child_exit_test),
+    TEST_CASE(video_decoder_background_queue_is_bounded_to_four_frames_test),
+    TEST_CASE(video_decoder_close_returns_promptly_when_local_queue_thread_is_blocked_on_pipe_read_test),
+    TEST_CASE(video_decoder_open_sequential_selects_nv12_for_even_geometry_test),
+    TEST_CASE(video_decoder_open_sequential_can_keep_bgra_for_even_geometry_test),
+    TEST_CASE(video_decoder_open_sequential_stays_bgra_for_odd_geometry_test),
+    TEST_CASE(video_decoder_open_metadata_decides_the_playback_layout_without_a_decoder_test),
+    TEST_CASE(video_decoder_bounds_declared_geometry_and_known_rates_test),
+    TEST_CASE(dropped_files_open_the_first_supported_file_and_count_the_rest_test),
+    TEST_CASE(status_notes_last_exactly_as_long_as_they_are_true_test),
+    TEST_CASE(child_stderr_tail_keeps_the_last_bytes_as_log_lines_test),
+    TEST_CASE(video_decoder_seeks_a_source_with_an_unknown_duration_test),
+    TEST_CASE(video_decoder_open_sequential_refuses_nv12_for_an_unconvertible_source_test),
+    TEST_CASE(video_decoder_open_sequential_keeps_nv12_for_a_declared_source_test),
+    TEST_CASE(video_decoder_stands_turned_video_up_on_every_path_test),
+    TEST_CASE(video_decoder_decodes_hdr_originals_as_pq_on_request_test),
+    TEST_CASE(video_decoder_swap_carries_probe_derived_state_test),
+    TEST_CASE(source_nv12_conversion_constants_are_the_shipped_coefficients_test),
+    TEST_CASE(source_nv12_conversion_compiles_a_distinct_program_per_arm_test),
+    TEST_CASE(present_scale_follows_the_window_only_where_it_should_test),
+    TEST_CASE(compare_compositor_stays_out_of_the_capture_program_test),
+    TEST_CASE(vsr_policy_decides_the_view_its_ladder_and_its_size_test),
+    TEST_CASE(vsr_policy_holds_a_new_output_size_until_the_window_settles_test),
+    TEST_CASE(vsr_policy_keep_up_guard_steps_down_only_for_sustained_drops_it_explains_test),
+    TEST_CASE(vsr_policy_playback_treats_both_single_picture_views_alike_test),
+    TEST_CASE(vsr_policy_playback_upscales_only_a_plain_picture_shown_larger_test),
+    TEST_CASE(hdr_output_leaves_the_capture_programs_alone_test),
+    TEST_CASE(hdr_output_follows_the_display_under_the_window_test),
+    TEST_CASE(compare_refusal_names_what_is_missing_test),
+    TEST_CASE(compare_gesture_tells_press_drag_and_hold_apart_test),
+    TEST_CASE(compare_settings_migrate_strength_and_blend_to_the_mix_test),
+    TEST_CASE(compare_label_premultiply_matches_the_gdi_composite_test),
+    TEST_CASE(compare_bar_lays_out_and_hit_tests_test),
+    TEST_CASE(compare_bar_fits_every_width_and_dpi_test),
+    TEST_CASE(compare_zoom_ladder_zooms_at_the_pointer_and_pans_test),
+    TEST_CASE(compare_loupe_and_one_to_one_placement_test),
+    TEST_CASE(compare_mask_shrinks_feathers_and_is_remembered_per_source_test),
+    TEST_CASE(compare_saved_image_carries_its_provenance_test),
+    TEST_CASE(compare_panes_locate_the_point_under_the_pointer_test),
+    TEST_CASE(temporal_stability_blends_only_across_a_continuous_history_test),
+    TEST_CASE(temporal_stability_shader_compiles_test),
+    TEST_CASE(blue_noise_dither_map_is_balanced_and_blue_test),
+    TEST_CASE(blue_noise_dither_preserves_the_mean_a_rounded_store_loses_test),
+    TEST_CASE(blue_noise_dither_reaches_the_present_and_capture_programs_test),
+    TEST_CASE(bayer_capture_dither_map_is_the_classic_matrix_test),
+    TEST_CASE(deband_pre_pass_smooths_bands_and_keeps_edges_test),
+    TEST_CASE(deband_pre_pass_reaches_the_conversion_program_test),
+    TEST_CASE(youtube_prepared_handoff_shows_candidate_and_retires_every_old_owner_before_activation_test),
+    TEST_CASE(youtube_prepared_handoff_sizes_and_shows_real_candidate_before_owned_retirement_test),
+    TEST_CASE(youtube_prepared_window_api_failures_are_reported_before_commit_test),
+    TEST_CASE(youtube_destroyed_window_and_visibility_failure_leave_active_state_unchanged_test),
+    TEST_CASE(legacy_language_configuration_is_ignored_and_english_lookup_remains_builtin_test),
+    TEST_CASE(eviction_removes_entries_that_can_never_match_a_key_again_test),
+    TEST_CASE(eviction_keeps_everything_reusable_while_the_disk_has_room_test),
+    TEST_CASE(eviction_frees_the_least_recently_used_until_the_floor_is_met_test),
+    TEST_CASE(eviction_never_touches_an_active_entry_test),
+    TEST_CASE(eviction_frees_what_it_can_when_the_floor_is_unreachable_test),
+    TEST_CASE(a_zero_floor_evicts_only_the_dead_test),
+    TEST_CASE(identity_retirement_needs_certainty_and_respects_other_installations_test),
+    TEST_CASE(live_session_owner_is_read_only_from_names_session_directory_writes_test),
+    TEST_CASE(staging_sweep_keeps_quarantined_entries_for_the_retention_test),
+    TEST_CASE(module_path_grows_past_max_path_test),
+    TEST_CASE(module_path_never_accepts_a_filled_buffer_test),
+    TEST_CASE(module_path_reports_a_failed_query_test),
+    TEST_CASE(module_directory_is_the_parent_of_the_module_test),
+    TEST_CASE(module_directory_answers_for_this_process_test),
+    TEST_CASE(renderer_recovery_rebuilds_into_a_fresh_window_test),
+    TEST_CASE(renderer_recovery_keeps_a_retained_renderers_window_test),
+    TEST_CASE(renderer_recovery_destroys_the_old_window_once_its_renderer_is_gone_test),
+    TEST_CASE(renderer_recovery_without_a_window_does_not_initialize_test),
+    TEST_CASE(renderer_recovery_reports_the_new_window_after_a_failed_initialize_test),
+    TEST_CASE(gpu_teardown_fence_signal_failure_stops_before_event_registration_test),
+    TEST_CASE(gpu_teardown_fence_signal_failure_maps_to_device_removed_when_device_reason_failed_test),
+    TEST_CASE(gpu_teardown_fence_event_registration_failure_stops_before_wait_test),
+    TEST_CASE(gpu_teardown_fence_wait_failure_is_bounded_and_reported_test),
+    TEST_CASE(gpu_teardown_fence_timeout_is_bounded_and_reported_test),
+    TEST_CASE(gpu_render_fence_wait_uses_the_render_budget_and_reports_device_loss_first_test),
+    TEST_CASE(gpu_teardown_fence_ignores_old_event_wake_until_new_target_completes_test),
+    TEST_CASE(gpu_teardown_fence_consecutive_timeout_does_not_let_old_registration_complete_new_target_test),
+    TEST_CASE(gpu_teardown_fence_device_removed_sentinel_is_not_completion_test),
+    TEST_CASE(gpu_teardown_fence_stale_wakes_share_one_absolute_timeout_budget_test),
+    TEST_CASE(frame_generation_stalled_submission_frees_only_what_the_gpu_cannot_touch_test),
+    TEST_CASE(renderer_non_teardown_wait_failure_is_propagated_test),
+    TEST_CASE(renderer_safe_owner_releases_owned_resources_only_after_completed_or_removed_drain_test),
+    TEST_CASE(renderer_safe_owner_retains_resources_after_live_device_drain_failure_test),
+    TEST_CASE(renderer_second_retained_renderer_ends_the_process_test),
+    TEST_CASE(renderer_frame_signal_failure_is_cached_without_advancing_tracking_test),
+    TEST_CASE(renderer_frame_signal_device_removal_is_cached_and_safe_owner_releases_test),
+    TEST_CASE(renderer_frame_signal_device_loss_code_latches_device_removed_test),
+    TEST_CASE(renderer_frame_signal_success_advances_tracking_once_test),
+    TEST_CASE(renderer_cache_capture_requires_a_successful_neural_evaluation_test),
+    TEST_CASE(renderer_cache_capture_returns_exact_tight_bgra_geometry_test),
+    TEST_CASE(renderer_cache_capture_carries_the_identity_of_the_frame_it_rendered_test),
+    TEST_CASE(renderer_cache_capture_wait_failure_never_exposes_partial_bytes_test),
+    TEST_CASE(renderer_cache_capture_does_not_apply_playback_color_adjustments_test),
+    TEST_CASE(gpu_classification_table_test),
+    TEST_CASE(adapter_luid_identity_compares_parts_not_model_names_test),
+    TEST_CASE(detected_high_performance_gpu_carries_the_luid_of_the_adapter_it_describes_test),
+    TEST_CASE(nvidia_driver_version_is_read_out_of_the_dxgi_quad_test),
+    TEST_CASE(neural_driver_floor_separates_the_failing_machine_from_the_working_ones_test),
+    TEST_CASE(neural_addon_policy_test),
+    TEST_CASE(neural_addon_is_gated_by_the_driver_floor_not_by_the_generation_test),
+    TEST_CASE(render_pace_prior_zero_means_unmeasured_not_unsupported_test),
+    TEST_CASE(ada_render_pace_prior_forecasts_both_ends_of_the_measured_bracket_test),
+    TEST_CASE(frame_generation_plan_follows_the_panel_not_just_the_source_test),
+    TEST_CASE(frame_generation_reaches_every_multiplier_the_verified_ceiling_admits_test),
+    TEST_CASE(frame_generation_menu_follows_the_measured_runtime_cap_test),
+    TEST_CASE(display_cadence_spread_is_one_refresh_period_or_nothing_test),
+    TEST_CASE(refresh_switch_offer_names_the_mode_that_removes_the_pulldown_test),
+    TEST_CASE(neural_prerender_defaults_prefer_1080p_and_preserve_explicit_output_test),
+    TEST_CASE(neural_playback_lifecycle_accepts_its_generation_and_reaches_ready_test),
+    TEST_CASE(neural_playback_lifecycle_runs_render_validate_then_ready_test),
+    TEST_CASE(neural_completion_publishes_only_after_probe_and_manifest_validation_test),
+    TEST_CASE(neural_publish_tolerance_admits_one_muxer_rounding_per_joined_segment_test),
+    TEST_CASE(render_range_residual_below_one_frame_is_coverage_not_work_test),
+    TEST_CASE(feature_pills_are_visually_distinguishable_test),
+    TEST_CASE(menus_group_two_to_seven_related_items_per_block_test),
+    TEST_CASE(export_plan_runs_super_resolution_and_neural_as_one_pass_test),
+    TEST_CASE(export_container_follows_the_chosen_extension_test),
+    TEST_CASE(live_forecast_scales_by_the_processing_rung_test),
+    TEST_CASE(render_command_line_parses_the_stages_and_refuses_what_it_cannot_describe_test),
+    TEST_CASE(stage_export_summaries_are_the_dialogs_and_the_command_lines_test),
+    TEST_CASE(neural_zero_motion_test_ships_on_and_is_a_cache_key_term_test),
+    TEST_CASE(upscaling_history_defaults_to_temporal_and_never_reaches_the_model_test),
+    TEST_CASE(processing_scale_ladder_defaults_to_the_source_and_keys_every_rung_test),
+    TEST_CASE(area_downscale_is_the_exact_coverage_mean_and_deterministic_test),
+    TEST_CASE(untagged_hd_video_decodes_as_bt709_and_only_it_test),
+    TEST_CASE(untagged_hd_video_is_decoded_under_a_description_the_gpu_converts_test),
+    TEST_CASE(display_matrix_stands_the_picture_up_as_ffmpeg_does_test),
+    TEST_CASE(media_foundation_copy_never_reads_past_the_sample_test),
+    TEST_CASE(hdr_tone_map_integer_path_follows_the_curve_test),
+    TEST_CASE(hdr_sources_tone_map_for_a_static_peak_test),
+    TEST_CASE(one_step_of_the_frame_grid_is_always_work_test),
+    TEST_CASE(every_hole_the_session_keeps_is_a_hole_a_job_can_start_on_test),
+    TEST_CASE(render_start_snaps_into_the_frame_it_lands_in_not_past_it_test),
+    TEST_CASE(coverage_merge_sorts_drops_degenerate_and_joins_touching_spans_test),
+    TEST_CASE(uncovered_spans_of_nothing_is_everything_and_of_everything_is_nothing_test),
+    TEST_CASE(uncovered_spans_find_the_hole_between_regions_and_the_lead_in_before_the_first_test),
+    TEST_CASE(uncovered_spans_clip_coverage_to_the_range_and_ignore_coverage_outside_it_test),
+    TEST_CASE(uncovered_spans_drop_sub_frame_holes_but_keep_a_hole_one_frame_wide_test),
+    TEST_CASE(next_render_target_clips_the_hole_under_the_playhead_to_the_playhead_test),
+    TEST_CASE(next_render_target_prefers_the_nearest_hole_ahead_then_the_earliest_behind_test),
+    TEST_CASE(next_render_target_without_a_hole_has_nothing_to_render_test),
+    TEST_CASE(span_containing_returns_the_playable_region_not_a_later_disjoint_one_test),
+    TEST_CASE(covered_duration_counts_only_rendered_video_inside_the_range_test),
+    TEST_CASE(neural_cancel_and_failure_offer_original_only_without_partial_cache_test),
+    TEST_CASE(neural_pause_suspends_rendering_and_resumes_without_advancing_test),
+    TEST_CASE(neural_recovery_resolves_to_rendering_failed_or_retry_exhausted_test),
+    TEST_CASE(neural_failure_kind_selects_the_lifecycle_state_test),
+    TEST_CASE(neural_progress_phase_drives_the_lifecycle_through_pause_and_recovery_test),
+    TEST_CASE(dlss_toggle_in_cached_playback_changes_comparison_view_not_renderer_feature_test),
+    TEST_CASE(neural_runtime_layout_is_absent_complete_or_fail_closed_test),
+    TEST_CASE(default_neural_carrier_uses_native_resolution_dlaa_test),
+    TEST_CASE(windows_command_line_quoting_round_trip_test),
+    TEST_CASE(runtime_argument_parsing_preserves_user_arguments_and_strips_markers_test),
+    TEST_CASE(restart_argument_lifecycle_and_create_process_command_line_test),
+    TEST_CASE(advanced_safe_mode_normal_invocation_adds_safe_mode_test),
+    TEST_CASE(advanced_safe_mode_cancel_keeps_current_open_without_launch_test),
+    TEST_CASE(advanced_safe_mode_launch_failure_keeps_current_open_test),
+    TEST_CASE(advanced_safe_mode_launch_success_closes_with_sanitized_arguments_test),
+    TEST_CASE(disabled_addons_creates_missing_addon_section_test),
+    TEST_CASE(disabled_addons_updates_empty_and_populated_lists_test),
+    TEST_CASE(disabled_addons_preserves_mixed_line_endings_and_unrelated_sections_test),
+    TEST_CASE(disabled_addons_removes_only_exact_target_entries_test),
+    TEST_CASE(disabled_addons_collapses_only_exact_target_duplicates_test),
+    TEST_CASE(disabled_addons_matches_trimmed_tokens_without_changing_retained_whitespace_test),
+    TEST_CASE(reshade_68_disabled_addon_token_conformance_test),
+    TEST_CASE(reshade_68_aliases_migrate_to_one_canonical_token_test),
+    TEST_CASE(reshade_68_section_and_key_lookup_are_case_sensitive_test),
+    TEST_CASE(reshade_68_utf8_bom_is_ignored_for_lookup_and_preserved_test),
+    TEST_CASE(disabled_addons_insertion_uses_target_section_line_ending_test),
+    TEST_CASE(neural_addon_runtime_settings_enable_neural_and_hold_native_resolution_test),
+    TEST_CASE(neural_addon_runtime_settings_are_created_at_native_resolution_test),
+    TEST_CASE(neural_addon_section_this_player_writes_carries_the_addon_schema_version_test),
+    TEST_CASE(neural_addon_runtime_settings_fail_closed_on_duplicate_managed_keys_test),
+    TEST_CASE(reshade_trailing_section_text_uses_reshade_section_boundaries_test),
+    TEST_CASE(configure_neural_addon_is_idempotent_test),
+    TEST_CASE(configure_neural_addon_reports_semantic_state_across_text_canonicalization_test),
+    TEST_CASE(configure_neural_addon_safe_then_normal_observes_reshade_state_test),
+    TEST_CASE(evaluated_config_update_observes_actual_final_bytes_test),
+    TEST_CASE(configure_neural_addon_fails_closed_for_malformed_ini_test),
+    TEST_CASE(configure_neural_addon_rejects_non_regular_path_before_replacement_test),
+    TEST_CASE(youtube_url_validation_accepts_only_supported_video_routes_test),
+    TEST_CASE(youtube_url_validation_rejects_unsafe_or_unselected_inputs_test),
+    TEST_CASE(youtube_watch_query_requires_one_unambiguous_lowercase_v_field_test),
+    TEST_CASE(youtube_video_id_must_be_exactly_eleven_characters_test),
+    TEST_CASE(youtube_url_validation_enforces_exact_2048_character_boundary_test),
+    TEST_CASE(resolver_output_accepts_one_https_googlevideo_url_and_trims_crlf_test),
+    TEST_CASE(resolver_output_accepts_separate_https_video_and_audio_urls_test),
+    TEST_CASE(resolver_output_accepts_authoritative_duration_before_stream_urls_test),
+    TEST_CASE(resolver_output_rejects_invalid_duration_live_status_and_metadata_framing_test),
+    TEST_CASE(resolver_output_rejects_empty_multiple_oversize_or_untrusted_urls_test),
+    TEST_CASE(resolver_output_enforces_raw_16k_and_single_trailing_line_ending_test),
+    TEST_CASE(resolver_nonzero_exit_returns_fixed_generic_non_url_detail_test),
+    TEST_CASE(youtube_resolver_windows_argument_quoting_covers_empty_spaces_quotes_and_slashes_test),
+    TEST_CASE(youtube_resolver_argument_vector_is_exact_and_ordered_test),
+    TEST_CASE(youtube_source_quality_selectors_pin_exact_rungs_and_cap_auto_at_1440_test),
+    TEST_CASE(resolver_metadata_reports_selected_height_video_bitrate_and_age_limit_test),
+    TEST_CASE(youtube_resolver_success_uses_beside_app_helpers_and_exact_child_arguments_test),
+    TEST_CASE(youtube_resolver_waits_for_fractional_stream_availability_test),
+    TEST_CASE(resolver_output_validates_stream_availability_metadata_test),
+    TEST_CASE(youtube_resolver_requires_duration_metadata_before_acquisition_test),
+    TEST_CASE(youtube_resolver_reports_missing_and_unstartable_helpers_without_sensitive_data_test),
+    TEST_CASE(youtube_resolver_maps_nonzero_exit_and_output_overflow_precisely_test),
+    TEST_CASE(youtube_resolver_honors_stop_token_and_explicit_cancel_with_bounded_wait_test),
+    TEST_CASE(youtube_resolver_times_out_and_kills_its_descendant_job_tree_test),
+    TEST_CASE(youtube_resolver_repeated_runs_leave_process_handle_count_stable_test),
+    TEST_CASE(youtube_resolver_rejects_reparse_points_and_nonregular_helpers_before_execution_test),
+    TEST_CASE(youtube_resolver_holds_verified_helpers_against_replacement_until_completion_test),
+    TEST_CASE(youtube_resolver_forces_package_local_deno_cache_over_parent_override_test),
+    TEST_CASE(youtube_resolver_disables_default_plugin_execution_from_inherited_config_test),
+    TEST_CASE(youtube_resolver_serializes_queued_resolve_and_cancel_does_not_poison_reuse_test),
+    TEST_CASE(youtube_resolver_queued_stop_token_cancels_before_launch_test),
+    TEST_CASE(youtube_resolver_injected_startup_and_drain_failures_cleanup_boundedly_test),
+    TEST_CASE(youtube_resolver_repeated_owned_pipe_failures_cannot_hide_two_handle_leaks_test),
+    TEST_CASE(ngx_same_device_overlapping_sessions_initialize_and_shutdown_once_test),
+    TEST_CASE(ngx_failed_initialization_never_acquires_a_session_test),
+    TEST_CASE(ngx_failed_candidate_setup_releases_only_its_overlapping_lease_test),
+    TEST_CASE(ngx_distinct_devices_own_independent_sessions_test),
+    TEST_CASE(ngx_create_failure_is_not_retried_until_explicit_reset_test),
+    TEST_CASE(ngx_renderer_frame_state_prioritizes_explicit_rehook_after_create_failure_test),
+    TEST_CASE(ngx_live_feature_is_never_released_on_a_frame_count_test),
+    TEST_CASE(spawning_a_corrupt_helper_fails_closed_without_a_hard_error_dialog_test),
+    TEST_CASE(live_session_sizes_the_cushion_from_the_render_drain_test),
+    TEST_CASE(playback_cadence_thins_presentation_before_it_seeks_test),
+    TEST_CASE(playback_cadence_phase_presents_exactly_one_pair_in_stride_test),
+    TEST_CASE(playback_cadence_reports_a_rate_no_cadence_can_follow_test),
+    TEST_CASE(deferred_capture_serves_a_second_job_after_a_shutdown_test),
+    TEST_CASE(deferred_capture_join_returns_the_view_the_copy_updated_test),
+    TEST_CASE(log_lines_written_concurrently_land_whole_and_once_test),
+    TEST_CASE(audio_clock_stops_being_the_master_once_it_stops_advancing_test),
+    TEST_CASE(audio_clock_carries_through_a_stall_and_slews_back_instead_of_jumping_test),
+    TEST_CASE(live_session_directory_is_per_process_and_never_relative_test),
+    TEST_CASE(a_probe_that_could_not_run_does_not_condemn_a_cached_render_test),
+    TEST_CASE(nv12_reference_conversion_is_bit_identical_to_the_scalar_original_test),
+    TEST_CASE(neural_presets_round_trip_and_default_to_the_shipped_settings_test),
+    TEST_CASE(swapchain_never_asks_for_the_frame_latency_waitable_object_test),
+    TEST_CASE(variable_frame_rate_is_classified_from_the_spacing_not_the_declared_rates_test),
+    TEST_CASE(variable_frame_rate_is_decided_on_b_frame_decode_order_test),
+    TEST_CASE(audio_fade_is_a_raised_cosine_that_starts_and_ends_flat_test),
+    TEST_CASE(audio_fade_in_scales_whole_frames_and_stops_once_it_is_open_test),
+    TEST_CASE(audio_fade_out_tail_decays_from_the_last_frame_to_silence_test),
+    TEST_CASE(audio_stop_waits_are_bounded_and_the_clock_counts_whole_frames_test),
+    TEST_CASE(audio_track_selection_skips_the_tracks_nobody_asked_for_test),
+    TEST_CASE(audio_track_labels_say_what_distinguishes_the_tracks_test),
+    TEST_CASE(video_decoder_swap_keeps_the_frames_the_candidate_read_ahead_test),
+    TEST_CASE(every_child_spawn_names_the_handles_it_inherits_test),
+    TEST_CASE(local_inputs_reach_files_only_test),
+    TEST_CASE(audio_restarts_at_a_paused_seek_rather_than_the_last_clock_reading_test),
+    TEST_CASE(audio_helper_stderr_keeps_a_bounded_tail_and_reports_only_bad_exits_test),
+    TEST_CASE(audio_child_stderr_is_drained_and_logged_when_it_fails_test),
+    TEST_CASE(audio_track_menu_lists_the_tracks_and_marks_the_one_playing_test),
+    TEST_CASE(subtitle_menu_lists_off_the_streams_and_the_file_test),
+    TEST_CASE(subtitle_track_choice_follows_the_container_test),
+    TEST_CASE(subtitle_sidecar_is_the_video_name_with_a_subtitle_extension_test),
+    TEST_CASE(subtitle_text_encoding_is_detected_test),
+    TEST_CASE(subtitle_command_lines_escape_paths_for_both_filtergraph_parsers_test),
+    TEST_CASE(subtitle_timing_follows_the_clock_and_the_delay_test),
+    TEST_CASE(subtitle_canvas_bounds_hold_every_drawn_pixel_test),
+    TEST_CASE(subtitle_choice_round_trips_through_the_settings_file_test),
+    TEST_CASE(youtube_helper_refusals_each_say_which_one_happened_test),
+    TEST_CASE(source_digest_is_computed_once_per_file_and_never_survives_a_change_test),
+    TEST_CASE(audio_endpoint_notifications_fire_only_for_the_stream_we_are_on_test),
+    TEST_CASE(audio_endpoint_callbacks_never_reach_a_detached_renderer_test),
+    TEST_CASE(audio_sink_is_declared_dead_only_after_a_playing_stream_goes_quiet_test),
+    TEST_CASE(audio_passthrough_plans_the_iec61937_link_for_each_codec_test),
+    TEST_CASE(audio_passthrough_wave_format_is_16_bit_stereo_iec61937_extensible_test),
+    TEST_CASE(audio_passthrough_says_what_happened_and_reopens_after_a_display_change_test),
+    TEST_CASE(audio_menu_keeps_the_passthrough_toggle_across_track_list_rebuilds_test),
+    TEST_CASE(hex_text_is_zero_padded_to_the_width_of_its_type_test),
+    TEST_CASE(atomic_file_replace_publishes_whole_files_and_cleans_up_only_its_own_test),
+    TEST_CASE(media_tools_are_found_the_same_way_by_every_caller_test),
+    TEST_CASE(media_tools_never_run_a_tool_from_the_current_directory_test),
+    TEST_CASE(utf8_text_lossy_keeps_the_message_and_strict_refuses_it_test),
+    TEST_CASE(seek_clamp_stays_on_a_decodable_frame_and_inside_a_finished_range_test),
+    TEST_CASE(render_pace_median_outvotes_a_contended_sample_and_round_trips_test),
+    TEST_CASE(player_command_line_takes_the_output_box_and_the_last_file_test),
+    TEST_CASE(playback_clock_reads_audio_only_while_playing_and_clamps_to_the_file_test),
+    TEST_CASE(playback_tick_seeks_first_presents_paused_frames_once_and_times_frames_test),
+    TEST_CASE(seek_requests_coalesce_and_a_seek_at_the_end_retries_before_it_test),
+    TEST_CASE(neural_job_checks_the_range_and_what_a_cached_entry_must_agree_with_test),
+    TEST_CASE(neural_job_publishes_only_its_own_run_and_only_what_it_reported_test),
+    TEST_CASE(nvenc_direct_rates_are_the_ones_the_encoder_child_parses_test),
+    TEST_CASE(nvenc_direct_is_tried_only_where_it_can_write_the_childs_packets_test),
+#ifdef DLSS_VIDEO_PLAYER_HAS_NVENC
+    TEST_CASE(nvenc_direct_configures_the_preset_as_hevc_nvenc_does_test),
+#endif
+    TEST_CASE(nvenc_direct_hand_off_matroska_is_laid_out_as_ebml_test),
+};
+
+// Cases that drive real child processes through stalls, timeouts, hand-offs and
+// leak loops: each takes a second or more, and together they are most of this
+// suite's run time. `PolicyTests --tier=quick` (the quick CTest tier, which
+// every pull request runs) leaves them out; the full device-free run, which
+// the nightly and release builds use, runs them as PolicyTestsSlow.
+constexpr test_support::TestCase kSlowCases[] = {
+    TEST_CASE(youtube_bitrate_selection_uses_real_helper_without_network_test),
+    TEST_CASE(youtube_audio_held_pipe_stop_destroy_and_failure_fallback_are_bounded_test),
+    TEST_CASE(youtube_audio_failed_waits_and_query_retire_reader_without_termination_or_leaks_test),
+    TEST_CASE(video_decoder_resume_failures_are_bounded_and_leak_free_for_local_and_network_startup_test),
+    TEST_CASE(video_decoder_forward_seek_reuses_child_and_delivers_the_same_frame_as_a_restart_test),
+    TEST_CASE(constant_frame_rate_is_decided_by_the_spacing_not_the_declared_rates_test),
+    TEST_CASE(youtube_resolver_waits_until_both_selected_streams_are_available_test),
+    TEST_CASE(youtube_resolver_keeps_stderr_out_of_the_answer_and_logs_it_test),
+    TEST_CASE(video_decoder_reports_child_stderr_and_a_mid_file_failure_is_not_the_end_test),
+    TEST_CASE(youtube_candidate_render_failure_releases_window_handle_and_prepared_processes_test),
+    TEST_CASE(video_decoder_tone_maps_hdr_sources_to_sdr_test),
+    TEST_CASE(youtube_prepared_audio_starts_silent_and_handoff_has_no_overlap_test),
+    TEST_CASE(video_decoder_blocking_reads_recycle_the_callers_buffer_test),
+    TEST_CASE(youtube_resolver_availability_wait_is_cancellable_and_deadline_bounded_test),
+    TEST_CASE(audio_player_enumerates_tracks_and_never_opens_on_the_commentary_test),
+    TEST_CASE(youtube_resolver_repeated_timeout_cancel_overflow_cycles_are_leak_free_test),
+    TEST_CASE(audio_track_that_starts_late_is_led_with_silence_test),
+    TEST_CASE(youtube_decoder_partial_stall_cancel_and_exit_leave_no_children_test),
+};
+
+
+} // namespace
+
+int wmain(int argc, wchar_t* argv[])
+{
+    const std::wstring executableName=current_test_executable().filename().wstring();
+    if(_wcsicmp(executableName.c_str(),L"ffprobe.exe")==0||_wcsicmp(executableName.c_str(),L"ffmpeg.exe")==0)return run_fake_media_child(argc,argv);
+    test_support::ContainChildProcesses();
+    // Manual and online, so never registered with CTest: the real download of
+    // the pinned dlssg_sm86 files into <dir>, through the same HttpsGet and
+    // Install the player uses. `PolicyTests --addon-download-smoke <dir>`.
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--addon-download-smoke") {
+        std::wstring transport;
+        const auto result = framegen_addon::Install(argv[2], [&](const framegen_addon::PinnedFile& file) -> std::optional<std::string> {
+            const std::wstring path = framegen_addon::SourcePath(file);
+            HttpsGetResult got = HttpsGet({framegen_addon::kSourceHost, path, {}, static_cast<size_t>(file.bytes), 60000, false}, {});
+            if (got.outcome == HttpsGetResult::Outcome::Ok) return std::move(got.body);
+            transport = got.error + L" status " + std::to_wstring(got.status);
+            return std::nullopt;
+        });
+        std::wcout << L"step=" << static_cast<int>(result.failed) << L" file=" << result.file << L" " << transport << L'\n';
+        return result.failed == framegen_addon::InstallStep::None ? 0 : 1;
+    }
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--resolver-availability-tests") {
+        test_support::run_cases(kResolverAvailabilityCases, std::size(kResolverAvailabilityCases), {});
+        return test_support::failure_count == 0 ? 0 : 1;
+    }
+    // `--only=<text>` runs the cases whose name contains the text, from either
+    // table. `--tier=quick` runs kCases and `--tier=slow` kSlowCases; with
+    // neither, every case runs.
+    std::string only;
+    bool quick = true;
+    bool slow = true;
+    if (argc == 2 && std::wstring_view(argv[1]).starts_with(L"--only=")) {
+        for (const wchar_t character : std::wstring_view(argv[1]).substr(7)) only.push_back(static_cast<char>(character));
+        if (only.empty()) {
+            std::cerr << "--only= needs part of a case name\n";
+            return EXIT_FAILURE;
+        }
+    } else if (argc == 2 && std::wstring_view(argv[1]) == L"--tier=quick") {
+        slow = false;
+    } else if (argc == 2 && std::wstring_view(argv[1]) == L"--tier=slow") {
+        quick = false;
+    } else if (argc > 1) {
+        return run_fake_resolver_child(argc, argv);
+    }
+    size_t ran = 0;
+    if (quick) ran += test_support::run_cases(kCases, std::size(kCases), only).ran;
+    if (slow) ran += test_support::run_cases(kSlowCases, std::size(kSlowCases), only).ran;
+    if (ran == 0) {
+        std::cerr << "no case name contains '" << only << "'\n";
+        return EXIT_FAILURE;
+    }
+
+    if (test_support::failure_count != 0) {
+        std::cerr << test_support::failure_count << " test assertion(s) failed\n";
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "PolicyTests: " << ran << " cases, all assertions passed\n";
+    return EXIT_SUCCESS;
+}

@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "entries": [
+    {
+      "name": "ffmpeg.exe",
+      "size": 165155840,
+      "sha256": "8B1374CC93156C8ADE8C2A91749A5BEA0EB658E88A6F8FAF6B108A41603C200B",
+      "signatureStatus": "NotSigned",
+      "provenance": "BtbN FFmpeg-Builds GPL build n9.0.2-14-gebafaee10a (release autobuild-2026-09-29-13-10, archive ffmpeg-n9.0.2-14-gebafaee10a-win64-gpl-9.0.zip, SHA-256 11F676F2EE62C39768CEF1892E2E171ADF00FD04C85620B771520E985E7C7A69, build scripts at FFmpeg-Builds 6c9aec5fc9a72ec3abedd1fa84db141fa18cf52b), fetched by tools/fetch_ffmpeg_helpers.ps1."
+    },
+    {
+      "name": "ffprobe.exe",
+      "size": 164954624,
+      "sha256": "4F90C18EBE44636A894B1E7F227206BD34DD49420F7EA1F9B4F8FC20A7AD97B2",
+      "signatureStatus": "NotSigned",
+      "provenance": "BtbN FFmpeg-Builds GPL build n9.0.2-14-gebafaee10a (release autobuild-2026-09-29-13-10, archive ffmpeg-n9.0.2-14-gebafaee10a-win64-gpl-9.0.zip, SHA-256 11F676F2EE62C39768CEF1892E2E171ADF00FD04C85620B771520E985E7C7A69, build scripts at FFmpeg-Builds 6c9aec5fc9a72ec3abedd1fa84db141fa18cf52b), fetched by tools/fetch_ffmpeg_helpers.ps1."
+    },
+    {
+      "name": "yt-dlp.exe",
+      "size": 17842237,
+      "sha256": "E7CAFC44DB8AA433DA8DD78303B9157F2C1DD509C4CBFCD8418081B7E1D26A7A",
+      "signatureStatus": "NotSigned",
+      "provenance": "Official yt-dlp nightly 2026.10.10.233141 Windows build (yt-dlp/yt-dlp-nightly-builds, from yt-dlp commit 897341241f2bfb2439fe0367f4c7c9ccd29a3828) fetched by the pinned helper script."
+    },
+    {
+      "name": "deno.exe",
+      "size": 97408288,
+      "sha256": "98F8C2A2D470E4CCB04C935C86FF8050817D877762AEC5EAEEB9E409CCB3B9FD",
+      "signatureStatus": "Valid",
+      "signerContains": "Deno Land Inc.",
+      "provenance": "Deno 2.9.5 extracted from the pinned official Windows archive."
+    }
+  ]
+}

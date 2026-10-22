@@ -1,0 +1,86 @@
+# Build output
+/build*/
+/out/
+/artifacts/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/*.sln
+/*.vcxproj*
+
+# Downloaded dependencies / local runtime packs
+/external/*
+!/external/youtube/
+/external/youtube/*
+!/external/youtube/README.md
+# The two Optical Flow interface headers carry their own MIT notice, scoped to the
+# file, so unlike the DLSS SDK they can live here and the build needs no download.
+!/external/nvof/
+/external/nvof/*
+!/external/nvof/nvOpticalFlowCommon.h
+!/external/nvof/nvOpticalFlowD3D12.h
+# The NVENC API header is under the same kind of file-scoped MIT notice, pinned from
+# FFmpeg's nv-codec-headers (THIRD_PARTY.md has the tag and its SHA-256).
+!/external/nvenc/
+/external/nvenc/*
+!/external/nvenc/nvEncodeAPI.h
+/external/runtime/
+/streamline/
+/Streamline/
+
+# Runtime files that should not be committed
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.addon64
+ReShade.ini
+ReShadePreset.ini
+# ...except the two packaged templates, which are inputs rather than runtime output:
+# build_windows.bat and tools/package_release.ps1 both copy them out of packaging/.
+!/packaging/ReShade.ini
+!/packaging/ReShadePreset.ini
+DLSSVideoPlayer.ini
+DLSSVideoPlayer.log
+PhoenixVideoPlayer.ini
+phoenix-media.json
+phoenix-runtime.json
+ReShade.log
+/dist/
+# tools/release_notes.ps1 writes it here for the release workflow's publish step.
+/release-notes.md
+/cache/
+
+# Local archives / generated checksums
+*.zip
+*.7z
+*.rar
+*.sha256
+*_SHA256.txt
+
+# IDE / OS
+.worktrees/
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
+
+# Python bytecode from the benchmark tools
+__pycache__/
+
+# Project website build output (site/README.md explains the build)
+site/dist/
+
+# Impeccable working files; the surface brief under .impeccable/surfaces/ is kept
+.impeccable/review/
+.impeccable/analysis/
+.impeccable/mocks/
+.impeccable/brief-body.md
+
+# Browser-automation session logs (Playwright MCP) written into the working directory
+/.playwright-mcp/
