@@ -38,6 +38,7 @@ From a Developer PowerShell for Visual Studio, in the player checkout:
 git clone https://github.com/NVIDIA/DLSS.git ../DLSS
 git -C ../DLSS checkout a291cc7d2cc642a51566f3dfd5376f635cd1b284
 git clone https://github.com/RazvanManolache/dlss5-phoenix-addon.git ../dlss5-phoenix-addon
+git -C ../dlss5-phoenix-addon checkout a151512eb51438f2ad944c7a4b0ce5ead76c2d39
 
 cmake -S . -B build/current -G "Visual Studio 17 2022" -A x64 `
   -DDLSS_SDK=../DLSS -DPHOENIX_SOURCE=../dlss5-phoenix-addon `

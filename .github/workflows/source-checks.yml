@@ -39,3 +39,7 @@ jobs:
           New-Item -ItemType Directory -Force build | Out-Null
           python tests/test_media_helper_staging.py
           if ($LASTEXITCODE) { throw 'Helper staging checks failed.' }
+      - name: Check package updates preserve local recipes
+        run: |
+          python tests/test_package_updates.py
+          if ($LASTEXITCODE) { throw 'Package update checks failed.' }

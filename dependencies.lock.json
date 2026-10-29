@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "phoenix": {
+    "repository": "https://github.com/RazvanManolache/dlss5-phoenix-addon",
+    "tag": "0.19",
+    "revision": "a151512eb51438f2ad944c7a4b0ce5ead76c2d39",
+    "runtime": "Source-compatible native SDK; package identities are in package-manifest.json"
+  }
+}

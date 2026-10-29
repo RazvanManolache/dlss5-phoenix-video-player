@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import subprocess
 import tempfile
 import zipfile
 import sys
@@ -53,7 +54,7 @@ def install(stage):
             if name == 'package-manifest.json':
                 continue
             if name not in previous and name not in current:
-                raise RuntimeError('Preserving an unknown package file: ' + name)
+                continue  # Local recipes/settings are not managed package files.
             if sha(path) not in {previous.get(name), current.get(name)}:
                 raise RuntimeError('Preserving a locally modified package file: ' + name)
     destination.mkdir(parents=True, exist_ok=True)
@@ -79,8 +80,16 @@ def install(stage):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--stage-everything', action='store_true')
+    parser.add_argument('--release', action='store_true', help='Require a clean source tree and matching version tag')
     parser.add_argument('--bundle',type=Path,default=ADDON/'artifacts/current/native-kernels')
     args = parser.parse_args()
+    version = (ROOT / 'VERSION').read_text().strip()
+    commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    if args.release:
+        subprocess.run(['git', 'diff', '--quiet', 'HEAD'], cwd=ROOT, check=True)
+        tagged = subprocess.check_output(['git', 'rev-parse', 'v'+version+'^{commit}'], cwd=ROOT, text=True).strip()
+        if tagged != commit:
+            raise RuntimeError('Release tag does not describe the packaged source')
     build = ROOT / 'build/current'
     sdk = ADDON / 'artifacts/current/pipeline-native'
     bundle = args.bundle.resolve()
@@ -96,6 +105,10 @@ def main():
         raise RuntimeError('Required native/player validation has not passed')
     if not evidence['native'].get('public_binary_audit_passed'):
         raise RuntimeError('Native SDK public-binary audit has not passed')
+    for name, digest in evidence['native'].get('source_inputs', {}).items():
+        source = (ADDON / name).resolve()
+        if not source.is_relative_to(ADDON.resolve()) or sha(source) != digest:
+            raise RuntimeError('Phoenix source differs from its SDK validation: '+name)
     portable_checks=next((case['result'] for case in evidence['native']['cases'] if case['suite']=='portable-shared-pipeline'),None)
     if not portable_checks or not portable_checks.get('passed'):
         raise RuntimeError('Shared portable backend pipeline has not passed validation')
@@ -207,6 +220,8 @@ def main():
         if any(Path(name).name.lower() in forbidden for name in files):
             raise RuntimeError('Package contains a model or local session file')
         write(stage / 'package-manifest.json', {'schema':'phoenix-player-package/1','model_weights_included':False,
+            'version':version,'source_commit':commit,'release':args.release,
+            'dependencies':read(ROOT/'dependencies.lock.json'),
             'files':files,'checks':{name:sha(path) for name,path in checks.items()}})
         archive=Path(temporary)/'PhoenixVideoPlayer-Windows-x64.zip'
         with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED,compresslevel=5) as package:

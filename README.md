@@ -1,5 +1,7 @@
 # Phoenix Video Player
 
+[Download Windows x64 v0.1.0](https://github.com/RazvanManolache/dlss5-phoenix-video-player/releases/tag/v0.1.0) · [Build instructions](docs/BUILDING.md)
+
 Native Windows player sharing Phoenix models and processing with DLSS Everything.
 
 Your movies have acquired a few more knobs. Use responsibly. Or at least keep
@@ -15,6 +17,10 @@ the original view within reach.
 **Windows x64 / D3D12.** This repository contains source, tests and packaging
 recipes. NVIDIA model DLLs and weights remain external. Start with the
 [build instructions](docs/BUILDING.md); Phoenix's SDK is a separate dependency.
+
+The source dependency is pinned to **Phoenix 0.19** in `dependencies.lock.json`.
+Release packages include the native library and model-free kernels; supply a
+compatible model separately.
 
 The direct Phoenix adapter now sends the neural dialog's strength, tone,
 structure, skin mask, style, color strength and network passes to the native
