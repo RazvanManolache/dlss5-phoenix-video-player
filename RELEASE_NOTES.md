@@ -1,5 +1,6 @@
 # Phoenix Video Player 1.0 Beta
 
+- **Quiet update notice:** the menu links to newer GitHub releases, including numbered betas. Opening the link keeps the notice visible until the installed version catches up.
 - Updated to Phoenix DLSS5 1.0 Beta and its rebuilt native SDK, model-free kernels and portable runtime companions.
 - Original and Lightweight models, live appearance/skin/style controls, comparison views, processing budgets and optional spatial scaling.
 - Native RTX plus available CPU/CUDA/Vulkan workers, resumable SDR exports and authenticated matching-frame caches.
