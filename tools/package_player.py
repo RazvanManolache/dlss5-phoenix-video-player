@@ -81,13 +81,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--stage-everything', action='store_true')
     parser.add_argument('--release', action='store_true', help='Require a clean source tree and matching version tag')
+    parser.add_argument('--release-tag', help='Explicit beta release tag; defaults to v plus VERSION')
     parser.add_argument('--bundle',type=Path,default=ADDON/'artifacts/current/native-kernels')
     args = parser.parse_args()
     version = (ROOT / 'VERSION').read_text().strip()
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
     if args.release:
         subprocess.run(['git', 'diff', '--quiet', 'HEAD'], cwd=ROOT, check=True)
-        tagged = subprocess.check_output(['git', 'rev-parse', 'v'+version+'^{commit}'], cwd=ROOT, text=True).strip()
+        tagged = subprocess.check_output(['git', 'rev-parse', '--verify', 'refs/tags/'+(args.release_tag or 'v'+version)+'^{commit}'], cwd=ROOT, text=True).strip()
         if tagged != commit:
             raise RuntimeError('Release tag does not describe the packaged source')
     build = ROOT / 'build/current'
@@ -221,6 +222,7 @@ def main():
             raise RuntimeError('Package contains a model or local session file')
         write(stage / 'package-manifest.json', {'schema':'phoenix-player-package/1','model_weights_included':False,
             'version':version,'source_commit':commit,'release':args.release,
+            'release_tag':(args.release_tag or 'v'+version) if args.release else None,
             'dependencies':read(ROOT/'dependencies.lock.json'),
             'files':files,'checks':{name:sha(path) for name,path in checks.items()}})
         archive=Path(temporary)/'PhoenixVideoPlayer-Windows-x64.zip'

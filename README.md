@@ -1,6 +1,6 @@
 # Phoenix Video Player
 
-[Download Windows x64 v0.1.0](https://github.com/RazvanManolache/dlss5-phoenix-video-player/releases/tag/v0.1.0) · [Build instructions](docs/BUILDING.md)
+[Download Windows x64 v1.0-beta](https://github.com/RazvanManolache/dlss5-phoenix-video-player/releases/tag/v1.0-beta) Â· [Build instructions](docs/BUILDING.md)
 
 Native Windows player sharing Phoenix models and processing with DLSS Everything.
 
@@ -18,7 +18,7 @@ the original view within reach.
 recipes. NVIDIA model DLLs and weights remain external. Start with the
 [build instructions](docs/BUILDING.md); Phoenix's SDK is a separate dependency.
 
-The source dependency is pinned to **Phoenix 0.19** in `dependencies.lock.json`.
+The source dependency is pinned to **Phoenix 1.0 Beta** in `dependencies.lock.json`.
 Release packages include the native library and model-free kernels; supply a
 compatible model separately.
 
