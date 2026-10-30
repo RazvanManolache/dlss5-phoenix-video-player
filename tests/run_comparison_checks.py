@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -18,6 +19,10 @@ def main():
     parser.add_argument('--seek', type=float, default=43)
     args = parser.parse_args()
     recipe = json.loads((BUILD / 'phoenix-media.json').read_text(encoding='utf-8'))
+    # Comparison fixtures own their runtime selection. Portable replacement has
+    # its own live matrix; a saved developer recipe may point at an older package.
+    recipe.pop('portable_package', None)
+    recipe.pop('execution_devices', None)
     native = Path(recipe['native_library'])
     env = os.environ.copy()
     env.pop('PHOENIX_MEDIA_RECIPE', None)
@@ -44,7 +49,12 @@ def main():
             check('spatial-transfer', [BUILD / 'PhoenixPipelineTests.exe', native, spatial])
             hardware = work / 'hardware-transfer';hardware.mkdir()
             check('hardware-sdr-hdr-transfer',[BUILD / 'PhoenixPipelineTests.exe',native,hardware,'--transfer-gpu'])
-            check('standalone-bgra-nv12', [BUILD / 'PhoenixPipelineTests.exe', native, work, '--standalone'])
+            # Exercise real executable-adjacent recipe discovery in an isolated
+            # folder, without borrowing or changing the developer's saved recipe.
+            standalone = work / 'PhoenixPipelineTests.exe'
+            shutil.copy2(BUILD / standalone.name, standalone)
+            (work / 'phoenix-media.json').write_text(json.dumps(recipe), encoding='utf-8')
+            check('standalone-bgra-nv12', [standalone, native, work, '--standalone'])
             for model in ('original', 'small-fp8'):
                 selected = json.loads(json.dumps(recipe))
                 selected['runtime']['weight_source']['model'] = model
