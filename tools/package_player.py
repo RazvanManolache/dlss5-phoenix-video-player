@@ -86,9 +86,13 @@ def main():
     args = parser.parse_args()
     version = (ROOT / 'VERSION').read_text().strip()
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    declared_tag = (ROOT / 'RELEASE_TAG').read_text().strip() if (ROOT / 'RELEASE_TAG').exists() else 'v'+version
+    selected_tag = args.release_tag or declared_tag
+    if args.release and selected_tag != declared_tag:
+        raise RuntimeError('Release tag differs from the notifier release identity')
     if args.release:
         subprocess.run(['git', 'diff', '--quiet', 'HEAD'], cwd=ROOT, check=True)
-        tagged = subprocess.check_output(['git', 'rev-parse', '--verify', 'refs/tags/'+(args.release_tag or 'v'+version)+'^{commit}'], cwd=ROOT, text=True).strip()
+        tagged = subprocess.check_output(['git', 'rev-parse', '--verify', 'refs/tags/'+selected_tag+'^{commit}'], cwd=ROOT, text=True).strip()
         if tagged != commit:
             raise RuntimeError('Release tag does not describe the packaged source')
     build = ROOT / 'build/current'
@@ -222,7 +226,7 @@ def main():
             raise RuntimeError('Package contains a model or local session file')
         write(stage / 'package-manifest.json', {'schema':'phoenix-player-package/1','model_weights_included':False,
             'version':version,'source_commit':commit,'release':args.release,
-            'release_tag':(args.release_tag or 'v'+version) if args.release else None,
+            'release_tag':selected_tag if args.release else None,
             'dependencies':read(ROOT/'dependencies.lock.json'),
             'files':files,'checks':{name:sha(path) for name,path in checks.items()}})
         archive=Path(temporary)/'PhoenixVideoPlayer-Windows-x64.zip'

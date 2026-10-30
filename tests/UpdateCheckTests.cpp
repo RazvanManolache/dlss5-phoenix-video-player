@@ -116,12 +116,12 @@ void semantic_versions_accept_triples_and_release_tags()
     CHECK(Is(ParseSemanticVersion("4294967295.1.2"), 4294967295u, 1, 2));
 
     constexpr std::string_view rejected[] = {
-        "", "v", "1", "1.2", "1.2.", ".1.2", "1..2", "1.2.3.4", "1.2.3-beta.1", "0.18.0-beta.1",
+        "", "v", "1", "1.2.", ".1.2", "1..2", "1.2.3.4", "1.2.3-beta..1", "0.18.0-",
         "0.18.0+1", "1.2.3 ", " 1.2.3", "1.2.-3", "abc", "v1.2.x", "4294967296.0.0",
         // The prefix is matched case-sensitively, and a suffix is still a
         // suffix once the prefix is gone.
-        "DLSS5-Video-Player-v0.17.2", "dlss5-video-player-v0.18.0-beta.1",
-        "dlss5-video-player-", "dlss5-video-player-v1.2", "dlss5-video-player-dlss5-v1.2.3",
+        "DLSS5-Video-Player-v0.17.2", "dlss5-video-player-v0.18.0-beta..1",
+        "dlss5-video-player-", "dlss5-video-player-v1.x", "dlss5-video-player-dlss5-v1.2.3",
     };
     for (const auto text : rejected) {
         CHECK(!ParseSemanticVersion(text));
@@ -165,7 +165,7 @@ void malformed_feeds_yield_no_tag()
     CHECK(!ParseNewestReleaseTag("   "));
     CHECK(!ParseNewestReleaseTag(R"json("dlss5-video-player-v9.9.9")json"));
     // Only unparseable tags: nothing to offer, but no crash either.
-    CHECK(!ParseNewestReleaseTag(R"json([{"tag_name": "nightly"}, {"tag_name": "v1.2"}])json"));
+    CHECK(!ParseNewestReleaseTag(R"json([{"tag_name": "nightly"}, {"tag_name": "v1.x"}])json"));
 }
 
 void notices_require_a_newer_undismissed_release()
@@ -186,7 +186,7 @@ void notices_require_a_newer_undismissed_release()
     CHECK(EvaluateUpdateNotice("0.18.0", "dlss5-video-player-v0.18.1",
                                "dlss5-video-player-v0.18.0").has_value());
     CHECK(!EvaluateUpdateNotice("nightly", "dlss5-video-player-v0.18.1", ""));
-    CHECK(!EvaluateUpdateNotice("0.18.0", "dlss5-video-player-v0.19.0-rc.1", ""));
+    CHECK(EvaluateUpdateNotice("0.18.0", "dlss5-video-player-v0.19.0-rc.1", "").has_value());
 }
 
 void check_scheduling_respects_interval_and_clock_skew()
@@ -558,6 +558,14 @@ int main()
     // DecodeTrailerThumbnail runs WIC on the calling thread, as the worker does on its own.
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 1;
     semantic_versions_accept_triples_and_release_tags();
+    CHECK(Is(ParseSemanticVersion("v1.0-beta"), 1, 0, 0));
+    CHECK(!EvaluateUpdateNotice("1.0.0-beta", "v1.0-beta", ""));
+    CHECK(EvaluateUpdateNotice("v1.0-beta", "v1.0-beta.2", "").has_value());
+    CHECK(EvaluateUpdateNotice("v1.0-beta.2", "v1.0-beta.10", "").has_value());
+    CHECK(!EvaluateUpdateNotice("v1.0-beta.10", "v1.0-beta.2", ""));
+    CHECK(EvaluateUpdateNotice("v1.0-beta", "v1.0.0", "").has_value());
+    CHECK(!EvaluateUpdateNotice("1.0.0", "v1.0-beta", ""));
+    CHECK_EQ(std::string("v1.0-beta"), TagOf(ParseNewestReleaseTag(R"([{"tag_name":"v1.0-beta","draft":false,"prerelease":true}])")));
     release_feeds_yield_the_highest_non_draft_tag();
     malformed_feeds_yield_no_tag();
     notices_require_a_newer_undismissed_release();

@@ -223,3 +223,7 @@ Their VSR/fusion/relay implementations have not been imported into this player;
 those ideas do not establish completed feature support. Retained upstream
 dependency notices and their historical scope are explained in
 [THIRD_PARTY.md](THIRD_PARTY.md).
+
+## Update notice
+
+A newer published version adds a clickable **Update available** entry to the menu. It opens this project’s GitHub releases. Background checks include numbered beta releases and respect the existing update-check setting and daily cache. Offline checks do not interrupt playback or install anything.

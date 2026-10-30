@@ -10,6 +10,8 @@ if(NOT DLSS_VIDEO_PLAYER_VERSION_FILE MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
     message(FATAL_ERROR "VERSION must read major.minor.patch; received '${DLSS_VIDEO_PLAYER_VERSION_FILE}'.")
 endif()
 project(PhoenixVideoPlayer VERSION ${DLSS_VIDEO_PLAYER_VERSION_FILE} LANGUAGES CXX RC)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/RELEASE_TAG" DLSS_VIDEO_PLAYER_RELEASE_TAG LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/RELEASE_TAG")
 
 include(CTest)
 
@@ -254,7 +256,8 @@ endif()
 add_library(dlss_video_player_common INTERFACE)
 target_compile_definitions(dlss_video_player_common INTERFACE
     UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
-    DLSS_VIDEO_PLAYER_VERSION="${PROJECT_VERSION}")
+    DLSS_VIDEO_PLAYER_VERSION="${PROJECT_VERSION}"
+    DLSS_VIDEO_PLAYER_UPDATE_VERSION="${DLSS_VIDEO_PLAYER_RELEASE_TAG}")
 target_compile_options(dlss_video_player_common INTERFACE /W4 /permissive- /EHsc /Zc:__cplusplus)
 target_include_directories(dlss_video_player_common INTERFACE
     "${CMAKE_SOURCE_DIR}/src" "${GENERATED_INCLUDE_DIR}" "${DLSS_SDK}/include")

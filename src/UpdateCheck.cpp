@@ -14,7 +14,6 @@
 
 namespace {
 
-constexpr size_t kMaximumVersionCharacters = 64;
 constexpr size_t kMaximumTagCharacters = 64;
 constexpr size_t kMaximumBodyBytes = 256 * 1024;
 // The feed is asked for ten releases; the extra slack absorbs a larger page
@@ -24,11 +23,6 @@ constexpr size_t kMaximumReleaseObjects = 32;
 // Anything deeper is not a release feed, so refuse it instead of walking it.
 constexpr size_t kMaximumNestingDepth = 16;
 constexpr DWORD kTimeoutMilliseconds = 8000;
-
-// The one definition of this project's tag shape. Tags read as
-// "dlss5-video-player-v0.18.0"; the prefix is stripped before version parsing
-// but never before storing or comparing a tag.
-constexpr std::string_view kReleaseTagPrefix = "dlss5-video-player-";
 
 constexpr std::wstring_view kUserAgent =
     L"DLSSVideoPlayer/" UPDATE_CHECK_WIDEN(DLSS_VIDEO_PLAYER_VERSION)
@@ -180,34 +174,13 @@ private:
 
 std::optional<SemanticVersion> ParseSemanticVersion(std::string_view text)
 {
-    // Release tags carry the project name, so "dlss5-video-player-v0.18.0"
-    // must read as 0.18.0. The prefix is matched case-sensitively because it
-    // is emitted by the release tooling, never typed by a user.
-    if (text.starts_with(kReleaseTagPrefix)) text.remove_prefix(kReleaseTagPrefix.size());
-    if (text.starts_with('v') || text.starts_with('V')) text.remove_prefix(1);
-    if (text.empty() || text.size() > kMaximumVersionCharacters) return {};
-    uint32_t components[3]{};
-    size_t position = 0;
-    for (size_t index = 0; index < 3; ++index) {
-        const size_t begin = position;
-        while (position < text.size() && text[position] >= '0' && text[position] <= '9') ++position;
-        if (position == begin) return {};
-        const auto parsed = std::from_chars(text.data() + begin, text.data() + position,
-                                            components[index]);
-        if (parsed.ec != std::errc{}) return {};
-        if (index == 2) break;
-        if (position >= text.size() || text[position] != '.') return {};
-        ++position;
-    }
-    // A pre-release or build suffix is left over here, and is never an update.
-    if (position != text.size()) return {};
-    return SemanticVersion{components[0], components[1], components[2]};
+    return release_updates::parse(text);
 }
 
 std::wstring FormatSemanticVersion(SemanticVersion version)
 {
     return std::to_wstring(version.major) + L'.' + std::to_wstring(version.minor) + L'.' +
-           std::to_wstring(version.patch);
+           std::to_wstring(version.patch) + (version.prerelease.empty() ? L"" : L"-" + std::wstring(version.prerelease.begin(), version.prerelease.end()));
 }
 
 namespace {
@@ -412,9 +385,18 @@ HttpsGetResult HttpsGet(const HttpsGetRequest& request, std::stop_token stop)
     return result;
 }
 
-UpdateFetchResult FetchLatestReleaseTag(std::stop_token)
+UpdateFetchResult FetchLatestReleaseTag(std::stop_token stop)
 {
+    const auto response = HttpsGet({kApiHost, kApiPath, kRequestHeaders, kMaximumBodyBytes,
+                                   kTimeoutMilliseconds, false}, stop);
     UpdateFetchResult result;
-    result.error = L"Phoenix builds are updated through DLSS Everything. No Phoenix release feed is configured.";
+    if (response.outcome != HttpsGetResult::Outcome::Ok) {
+        result.error = response.error;
+        return result;
+    }
+    if (const auto tag = ParseNewestReleaseTag(response.body)) {
+        result.ok = true;
+        result.tag = *tag;
+    }
     return result;
 }

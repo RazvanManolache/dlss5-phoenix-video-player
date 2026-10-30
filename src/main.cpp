@@ -4385,7 +4385,7 @@ private:
         ApplyUpdateNotice(completion->userRequested,completion->fetch.ok);
     }
     void ApplyUpdateNotice(bool announce,bool reachable){
-        m_updateNotice=EvaluateUpdateNotice(DLSS_VIDEO_PLAYER_VERSION,m_updateLatestTag,m_updateDismissedTag);
+        m_updateNotice=EvaluateUpdateNotice(DLSS_VIDEO_PLAYER_UPDATE_VERSION,m_updateLatestTag,m_updateDismissedTag);
         if(HMENU bar=GetMenu(m_hwnd)){
             const std::wstring label=m_updateNotice?T(L"update.badge")+FormatSemanticVersion(m_updateNotice->latest):std::wstring();
             if(app_menu::SetUpdateBadge(bar,label))DrawMenuBar(m_hwnd);
@@ -4407,15 +4407,8 @@ private:
         const auto result=reinterpret_cast<INT_PTR>(ShellExecuteW(m_hwnd,L"open",url.c_str(),nullptr,nullptr,SW_SHOWNORMAL));
         if(result<=32)LOG("Opening the releases page failed: code="<<result);
     }
-    // The badge is a one-shot reminder: opening the page retires this release
-    // so the bar goes quiet again until the next one ships.
-    void ActivateUpdateBadge(){
-        OpenReleasesPage();
-        if(!m_updateNotice)return;
-        m_updateDismissedTag=m_updateNotice->tag;
-        SaveUpdateSettings();
-        ApplyUpdateNotice(false,true);
-    }
+    // Opening a web page does not install the update. Keep the notice visible.
+    void ActivateUpdateBadge(){ OpenReleasesPage(); }
     uint64_t ActivityElapsedMs()const{
         return m_activityBusy?static_cast<uint64_t>(std::max<int64_t>(0,std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-m_activityStarted).count())):0;
     }

@@ -10,14 +10,10 @@
 // Release discovery for the GitHub project. Everything except the fetch is
 // pure so the decision logic stays testable without a network or a clock.
 
-struct SemanticVersion {
-    uint32_t major{}, minor{}, patch{};
-    auto operator<=>(const SemanticVersion&) const = default;
-};
+#include "ReleaseVersion.h"
+using SemanticVersion = release_updates::Version;
 
-// Accepts "0.17.2", "v0.17.2" and this project's own release-tag spelling
-// "dlss5-video-player-v0.17.2". Exactly three numeric components and no
-// leftover text: "0.18.0-beta.1" and "0.18.0+1" are not releases we offer.
+// Accepts published two/three-component tags, including numbered betas.
 std::optional<SemanticVersion> ParseSemanticVersion(std::string_view text);
 std::wstring FormatSemanticVersion(SemanticVersion version);
 
