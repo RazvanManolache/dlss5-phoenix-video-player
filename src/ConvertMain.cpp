@@ -1,4 +1,4 @@
-// dlss5-convert.exe: the console front end for DLSSVideoPlayer.exe --render
+// phoenix-convert.exe: the console front end for PhoenixVideoPlayer.exe --render
 // and --probe. What it decides is ConvertCommandLine.h; this is the part that
 // touches the system - finding files, running the player, relaying its output
 // and Ctrl+C, and writing the summary.
@@ -380,10 +380,10 @@ int wmain(int argc, wchar_t** argv)
     const Options options = Parse(arguments);
     switch (options.mode) {
         case Mode::Help: Out().Line(Usage()); return kExitOk;
-        case Mode::Version: Out().Line(L"dlss5-convert " + utf8_text::ToWide(DLSS_VIDEO_PLAYER_VERSION)); return kExitOk;
+        case Mode::Version: Out().Line(L"phoenix-convert " + utf8_text::ToWide(DLSS_VIDEO_PLAYER_VERSION)); return kExitOk;
         case Mode::BadArguments:
             Err().Line(L"error: " + options.error);
-            Err().Line(L"Run dlss5-convert --help for the options.");
+            Err().Line(L"Run phoenix-convert --help for the options.");
             return kExitBadArguments;
         default: break;
     }
@@ -392,7 +392,7 @@ int wmain(int argc, wchar_t** argv)
     std::error_code error;
     if (!fs::is_regular_file(player, error)) {
         Err().Line(L"error: the player was not found at " + player.wstring() +
-                   L". dlss5-convert runs DLSSVideoPlayer.exe from its own folder.");
+                   L". phoenix-convert runs PhoenixVideoPlayer.exe from its own folder.");
         return kExitFailed;
     }
     SetConsoleCtrlHandler(OnConsoleControl, TRUE);

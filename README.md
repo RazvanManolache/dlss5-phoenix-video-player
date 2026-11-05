@@ -1,6 +1,6 @@
 # Phoenix Video Player
 
-[Download Windows x64 v1.0-beta](https://github.com/RazvanManolache/dlss5-phoenix-video-player/releases/tag/v1.0-beta) Â· [Build instructions](docs/BUILDING.md)
+[Download Windows x64 v1.0.0](https://github.com/RazvanManolache/dlss5-phoenix-video-player/releases/tag/v1.0.0) Â· [Build instructions](docs/BUILDING.md)
 
 Native Windows player sharing Phoenix models and processing with DLSS Everything.
 

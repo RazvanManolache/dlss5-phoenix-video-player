@@ -13,7 +13,7 @@
 
 #include "RenderCliContract.h"
 
-// `dlss5-convert`: the console front end for DLSSVideoPlayer.exe's --render
+// `phoenix-convert`: the console front end for PhoenixVideoPlayer.exe's --render
 // and --probe (ConvertMain.cpp).
 //
 // The player is a Windows program, so a shell does not wait for it, does not
@@ -21,7 +21,7 @@
 // right incantation (USAGE.md). This is a console program that does, and it
 // adds what converting more than one file needs: folders, wildcards, an output
 // folder, skipping what is already converted, one summary and one exit code.
-// Every render is still DLSSVideoPlayer.exe --render, so there is one
+// Every render is still PhoenixVideoPlayer.exe --render, so there is one
 // conversion pipeline and one set of refusals, whichever way it is started.
 //
 // Pure: what the command line asks for, where each output goes, and what the
@@ -48,7 +48,7 @@ struct Options {
     std::wstring format;   // --format: mkv, mp4, gif, png or jpg, lower case
     std::wstring suffix{L"-dlss"};
     std::wstring report;   // --report: a JSON summary written here
-    std::wstring player;   // --player: the DLSSVideoPlayer.exe to run
+    std::wstring player;   // --player: the PhoenixVideoPlayer.exe to run
     bool overwrite{};
     bool recursive{};
     bool failFast{};
@@ -294,11 +294,11 @@ inline int BatchExitCode(std::span<const Outcome> outcomes)
 inline std::wstring Usage()
 {
     return
-        L"Usage: dlss5-convert <file|folder|wildcard>... [options]\n"
-        L"       dlss5-convert probe <file> [--json] [--capabilities]\n"
+        L"Usage: phoenix-convert <file|folder|wildcard>... [options]\n"
+        L"       phoenix-convert probe <file> [--json] [--capabilities]\n"
         L"\n"
         L"Converts videos, animations and photos with the DLSS 5 Video Player's export\n"
-        L"pipeline (DLSSVideoPlayer.exe --render), waits for each, and shows progress.\n"
+        L"pipeline (PhoenixVideoPlayer.exe --render), waits for each, and shows progress.\n"
         L"\n"
         L"What to render (as the player's Export with DLSS stages):\n"
         L"  --stages LIST          sr, nr and/or fg, comma-separated. Default: nr.\n"

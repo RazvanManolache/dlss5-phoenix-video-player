@@ -100,6 +100,6 @@ The source publication itself does not rerun GPU/player benchmarks. Historical
 development claims in the README describe the original checked environment and
 are not fresh-machine or all-GPU qualification.
 
-The 1.0 Beta release uses numeric Windows resource version `1.0.0` and Git tag
-`v1.0-beta`. The maintained packager binds this explicitly with
-`--release --release-tag v1.0-beta`; it verifies the tag resolves to the packaged commit.
+The 1.0 release uses numeric Windows resource version `1.0.0` and Git tag
+`v1.0.0`. The maintained packager binds this explicitly with
+`--release --release-tag v1.0.0`; it verifies the tag resolves to the packaged commit.

@@ -14,7 +14,7 @@
 #include <string>
 #include <string_view>
 
-// `DLSSVideoPlayer.exe --render <input> ...`: the "Export with DLSS stages"
+// `PhoenixVideoPlayer.exe --render <input> ...`: the "Export with DLSS stages"
 // pipeline without the window. It exists for batch work and for the benchmark
 // harness, which both want the same file the dialog writes without driving a
 // GUI - issue #64 asks for exactly the upscale -> interpolate -> enhance chain
@@ -409,7 +409,7 @@ inline std::wstring ProgressLine(uint32_t pass, uint32_t passes, std::wstring_vi
 inline std::wstring Usage()
 {
     return
-        L"Usage: DLSSVideoPlayer.exe --render <input> [options]\n"
+        L"Usage: PhoenixVideoPlayer.exe --render <input> [options]\n"
         L"\n"
         L"Runs Export with DLSS stages without opening the player, and writes one file.\n"
         L"\n"
@@ -453,7 +453,7 @@ inline std::wstring Usage()
         L"  --quiet            Print only the final line.\n"
         L"  --help             Print this and exit.\n"
         L"\n"
-        L"       DLSSVideoPlayer.exe --probe <input> [--json] [--capabilities]\n"
+        L"       PhoenixVideoPlayer.exe --probe <input> [--json] [--capabilities]\n"
         L"\n"
         L"Prints what the source is and which stages this machine can run on it,\n"
         L"without rendering. --capabilities also measures frame generation's rate\n"

@@ -168,7 +168,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='player-package-', dir=ROOT / 'build') as temporary:
         stage = Path(temporary) / 'PhoenixVideoPlayer'
         stage.mkdir()
-        for name in ['PhoenixVideoPlayer.exe', 'phoenix-media.exe', 'media-helpers.json']:
+        for name in ['PhoenixVideoPlayer.exe', 'phoenix-media.exe', 'phoenix-convert.exe', 'media-helpers.json']:
             shutil.copy2(build / name, stage / name)
         for tool in helpers['tools']:
             if tool['name'] not in {'ffmpeg.exe','ffprobe.exe','yt-dlp.exe','deno.exe'} or sha(build / tool['name']) != tool['sha256']:

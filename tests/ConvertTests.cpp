@@ -1,7 +1,7 @@
 // dlss5-convert: the planner (ConvertCommandLine.h) on its own, and the real
-// dlss5-convert.exe driving this executable as a stand-in player.
+// phoenix-convert.exe driving this executable as a stand-in player.
 //
-//   ConvertTests.exe <directory holding dlss5-convert.exe>
+//   ConvertTests.exe <directory holding phoenix-convert.exe>
 //
 // Run with --render or --probe, this executable is the player: it records the
 // command line it was given and answers by the input's name - "refuse" is
@@ -156,7 +156,7 @@ std::vector<std::wstring> OptionsNamedIn(std::wstring_view text)
     return names;
 }
 
-// dlss5-convert runs `DLSSVideoPlayer.exe --render` once per file, so the two
+// dlss5-convert runs `PhoenixVideoPlayer.exe --render` once per file, so the two
 // parsers have to agree on what --render takes and what its exit codes mean.
 // render_cli is the one table both read; this holds each parser to it, so an
 // option added to the player without its forwarding - or the other way round -
@@ -271,7 +271,7 @@ struct Result {
     std::string output;
 };
 
-// Runs dlss5-convert.exe with this executable as its player, stdout and
+// Runs phoenix-convert.exe with this executable as its player, stdout and
 // stderr captured together.
 Result RunConvert(const fs::path& convert, std::vector<std::wstring> arguments, DWORD extraFlags = 0,
                   const std::function<void(DWORD)>& whileRunning = {})
@@ -424,9 +424,9 @@ int wmain(int argc, wchar_t** argv)
     render_contract_test();
     wchar_t self[MAX_PATH]{};
     GetModuleFileNameW(nullptr, self, MAX_PATH);
-    const fs::path convert = (argc > 1 ? fs::path(argv[1]) : fs::path(self).parent_path()) / L"dlss5-convert.exe";
+    const fs::path convert = (argc > 1 ? fs::path(argv[1]) : fs::path(self).parent_path()) / L"phoenix-convert.exe";
     if (fs::exists(convert)) front_end_test(convert);
-    else { std::cerr << "dlss5-convert.exe was not found beside the tests.\n"; ++test_support::failure_count; }
+    else { std::cerr << "phoenix-convert.exe was not found beside the tests.\n"; ++test_support::failure_count; }
     if (test_support::failure_count) return 1;
     std::cout << "ConvertTests passed.\n";
     return 0;

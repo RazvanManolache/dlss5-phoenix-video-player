@@ -645,7 +645,7 @@ void model_store_digest_tracks_root_contents_and_names_its_fallback_test()
     CHECK(contentsJson.find("\"fallback\":\"\"") != std::string::npos);
 }
 
-// NeuralWorker.exe decides the guides and the cut classification, so a worker
+// PhoenixMediaWorker.exe decides the guides and the cut classification, so a worker
 // rebuilt with different logic is a different renderer and must not be handed
 // the previous one's renders. It is hashed into the runtime digest for that
 // reason, and deliberately not lock-pinned: the lock is the vendor stack, and
@@ -915,8 +915,8 @@ void hashed_runtime_set_covers_the_worker_and_the_lock_set_does_not_test()
     const auto pinned = LockPinnedRuntimeFileNames();
     CHECK_EQ(size_t{13}, hashed.size());
     CHECK_EQ(size_t{12}, pinned.size());
-    CHECK(std::ranges::find(hashed, std::wstring_view(L"NeuralWorker.exe")) != hashed.end());
-    CHECK(std::ranges::find(pinned, std::wstring_view(L"NeuralWorker.exe")) == pinned.end());
+    CHECK(std::ranges::find(hashed, std::wstring_view(L"PhoenixMediaWorker.exe")) != hashed.end());
+    CHECK(std::ranges::find(pinned, std::wstring_view(L"PhoenixMediaWorker.exe")) == pinned.end());
     for (const std::wstring_view name : pinned)
         CHECK(std::ranges::find(hashed, name) != hashed.end());
 
@@ -924,7 +924,7 @@ void hashed_runtime_set_covers_the_worker_and_the_lock_set_does_not_test()
     for (const std::wstring_view name : hashed) WriteBytes(fixture.Path() / name, "staged-module");
     const auto staged = BuildRuntimeDigest(fixture.Path(), hashed);
     CHECK(staged.has_value());
-    WriteBytes(fixture.Path() / L"NeuralWorker.exe", "rebuilt-worker");
+    WriteBytes(fixture.Path() / L"PhoenixMediaWorker.exe", "rebuilt-worker");
     const auto rebuilt = BuildRuntimeDigest(fixture.Path(), hashed);
     CHECK(rebuilt.has_value());
     CHECK(staged != rebuilt);
@@ -932,7 +932,7 @@ void hashed_runtime_set_covers_the_worker_and_the_lock_set_does_not_test()
     // reports as an incomplete runtime rather than rendering against a stack
     // it cannot name.
     std::error_code error;
-    CHECK(std::filesystem::remove(fixture.Path() / L"NeuralWorker.exe", error));
+    CHECK(std::filesystem::remove(fixture.Path() / L"PhoenixMediaWorker.exe", error));
     CHECK(!BuildRuntimeDigest(fixture.Path(), hashed).has_value());
 }
 
