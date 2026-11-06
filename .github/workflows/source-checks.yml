@@ -17,32 +17,32 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.1.0
-        with:
-          python-version: '3.12'
-      - name: Reject tracked models, runtime binaries and generated files
-        run: |
-          $files = @(git ls-files)
-          if ($LASTEXITCODE) { throw 'Cannot inspect tracked files.' }
-          $bad = @($files | Where-Object {
-            $_ -match '(^|/)(build[^/]*|artifacts|Payload|__pycache__)/' -or
-            $_ -match '\.(dll|exe|pdb|obj|lib|exp|pyc|zip|7z|rar|mp4|mkv|mov|npy|npz|onnx|safetensors)$'
-          })
-          if ($bad.Count) { throw ('External/generated payload tracked: ' + ($bad -join ', ')) }
-      - name: Check package source identity rules
-        run: ./tests/PackageSourceIdentity.ps1 -Tools (Join-Path $PWD tools)
-      - name: Check hardware-report validation rules without hardware
-        run: ./tests/HardwareTestReport.ps1 -Tools (Join-Path $PWD tools)
-      - name: Check failed helper staging preserves existing files
-        run: |
-          New-Item -ItemType Directory -Force build | Out-Null
-          python tests/test_media_helper_staging.py
-          if ($LASTEXITCODE) { throw 'Helper staging checks failed.' }
-      - name: Check package updates preserve local recipes
-        run: |
-          python tests/test_package_updates.py
-          if ($LASTEXITCODE) { throw 'Package update checks failed.' }
+    - uses: actions/checkout@v7.0.1
+    - uses: actions/setup-python@v7.1.0
+      with:
+        python-version: '3.12'
+    - name: Reject tracked models, runtime binaries and generated files
+      run: |
+        $files = @(git ls-files)
+        if ($LASTEXITCODE) { throw 'Cannot inspect tracked files.' }
+        $bad = @($files | Where-Object {
+          $_ -match '(^|/)(build[^/]*|artifacts|Payload|__pycache__)/' -or
+          $_ -match '\.(dll|exe|pdb|obj|lib|exp|pyc|zip|7z|rar|mp4|mkv|mov|npy|npz|onnx|safetensors)$'
+        })
+        if ($bad.Count) { throw ('External/generated payload tracked: ' + ($bad -join ', ')) }
+    - name: Check package source identity rules
+      run: ./tests/PackageSourceIdentity.ps1 -Tools (Join-Path $PWD tools)
+    - name: Check hardware-report validation rules without hardware
+      run: ./tests/HardwareTestReport.ps1 -Tools (Join-Path $PWD tools)
+    - name: Check failed helper staging preserves existing files
+      run: |
+        New-Item -ItemType Directory -Force build | Out-Null
+        python tests/test_media_helper_staging.py
+        if ($LASTEXITCODE) { throw 'Helper staging checks failed.' }
+    - name: Check package updates preserve local recipes
+      run: |
+        python tests/test_package_updates.py
+        if ($LASTEXITCODE) { throw 'Package update checks failed.' }
 
   windows-compile:
     runs-on: windows-2022
@@ -51,49 +51,57 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v7.0.1
-      - name: Check out pinned public DLSS SDK
-        uses: actions/checkout@v7.0.1
-        with:
-          repository: NVIDIA/DLSS
-          ref: a291cc7d2cc642a51566f3dfd5376f635cd1b284
-          path: external/DLSS
-          persist-credentials: false
-      - name: Check out matching Phoenix source headers
-        uses: actions/checkout@v7.0.1
-        with:
-          repository: RazvanManolache/dlss5-phoenix-addon
-          ref: dfc0fc03b05ec3615b018f11f7bc7e8eee744ef7
-          path: external/phoenix
-          persist-credentials: false
-      - name: Configure Windows x64 compile without private runtime inputs
-        run: >-
-          cmake -S . -B build/ci -G "Visual Studio 17 2022" -A x64
-          -DPHOENIX_SOURCE=external/phoenix -DBUILD_TESTING=OFF
-          -DPHOENIX_MEDIA_HELPERS=OFF -DDLSS_VIDEO_PLAYER_HARDWARE_TESTS=OFF
-      - name: Compile player and command-line tools
-        run: cmake --build build/ci --config Release --target DLSSVideoPlayer PhoenixMediaCli dlss5-convert --parallel 4
-      - name: Stage compiled binaries
-        run: |
-          New-Item -ItemType Directory -Force build/ci-artifact/neural-runtime | Out-Null
-          Copy-Item -LiteralPath build/ci/Release/PhoenixVideoPlayer.exe, build/ci/Release/phoenix-media.exe, build/ci/Release/phoenix-convert.exe -Destination build/ci-artifact
-          Copy-Item -LiteralPath build/ci/Release/neural-runtime/PhoenixMediaWorker.exe -Destination build/ci-artifact/neural-runtime
-          Copy-Item -LiteralPath LICENSE, THIRD_PARTY.md -Destination build/ci-artifact
-          @'
-          Phoenix Video Player - Windows x64 compile output
+    - uses: actions/checkout@v7.0.1
+    - name: Check out pinned public DLSS SDK
+      uses: actions/checkout@v7.0.1
+      with:
+        repository: NVIDIA/DLSS
+        ref: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+        path: external/DLSS
+        persist-credentials: false
+    - name: Check out matching Phoenix source headers
+      uses: actions/checkout@v7.0.1
+      with:
+        repository: RazvanManolache/dlss5-phoenix-addon
+        ref: dfc0fc03b05ec3615b018f11f7bc7e8eee744ef7
+        path: external/phoenix
+        persist-credentials: false
+    - name: Configure Windows x64 compile without private runtime inputs
+      run: >-
+        cmake -S . -B build/ci -G "Visual Studio 17 2022" -A x64
+        -DPHOENIX_SOURCE=external/phoenix -DBUILD_TESTING=OFF
+        -DPHOENIX_MEDIA_HELPERS=OFF -DDLSS_VIDEO_PLAYER_HARDWARE_TESTS=OFF
+    - name: Compile player and command-line tools
+      run: cmake --build build/ci --config Release --target DLSSVideoPlayer PhoenixMediaCli dlss5-convert --parallel 4
+    - name: Stage compiled binaries
+      run: |
+        New-Item -ItemType Directory -Force build/ci-artifact/neural-runtime | Out-Null
+        Copy-Item -LiteralPath build/ci/Release/PhoenixVideoPlayer.exe, build/ci/Release/phoenix-media.exe, build/ci/Release/phoenix-convert.exe -Destination build/ci-artifact
+        Copy-Item -LiteralPath build/ci/Release/neural-runtime/PhoenixMediaWorker.exe -Destination build/ci-artifact/neural-runtime
+        Copy-Item -LiteralPath LICENSE, THIRD_PARTY.md -Destination build/ci-artifact
+        @'
+        Phoenix Video Player - Windows x64 compile output
 
-          These executables prove the public source compiles on GitHub.
-          This is not the complete player distribution: media helpers, NVIDIA
-          feature DLLs, Phoenix runtime/kernels and models are not included.
-          See docs/BUILDING.md in the source repository for complete packaging.
-          GitHub hosted builds do not verify GPU enhancement or media playback.
-          '@ | Set-Content -LiteralPath build/ci-artifact/README.txt
-          git rev-parse HEAD | Set-Content -LiteralPath build/ci-artifact/SOURCE_COMMIT.txt
-          if ($LASTEXITCODE) { throw 'Cannot record the source commit.' }
-      - name: Upload compiled Windows binaries
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: PhoenixVideoPlayer-windows-x64-compile-only
-          path: build/ci-artifact/
-          if-no-files-found: error
-          retention-days: 14
+        These executables prove the public source compiles on GitHub.
+        This is not the complete player distribution: media helpers, NVIDIA
+        feature DLLs, Phoenix runtime/kernels and models are not included.
+        See docs/BUILDING.md in the source repository for complete packaging.
+        GitHub hosted builds do not verify GPU enhancement or media playback.
+        '@ | Set-Content -LiteralPath build/ci-artifact/README.txt
+        git rev-parse HEAD | Set-Content -LiteralPath build/ci-artifact/SOURCE_COMMIT.txt
+        if ($LASTEXITCODE) { throw 'Cannot record the source commit.' }
+    - name: Upload compiled Windows binaries
+      uses: actions/github-script@v9
+      with:
+        script: |
+          const publish = require('./.github/scripts/publish-build.cjs');
+          await publish({github, context, core, glob, exec});
+      env:
+        BUILD_NAME: PhoenixVideoPlayer-windows-x64-compile-only
+        BUILD_PATHS: build/ci-artifact/
+        BUILD_HIDDEN: 'false'
+        BUILD_MISSING: error
+      if: (success()) && success() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.event_name != 'pull_request'
+    permissions:
+      contents: write
+
