@@ -1,4 +1,4 @@
-name: Source and packaging contracts
+name: Windows compile and source contracts
 
 on:
   push:
@@ -43,3 +43,57 @@ jobs:
         run: |
           python tests/test_package_updates.py
           if ($LASTEXITCODE) { throw 'Package update checks failed.' }
+
+  windows-compile:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out pinned public DLSS SDK
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA/DLSS
+          ref: a291cc7d2cc642a51566f3dfd5376f635cd1b284
+          path: external/DLSS
+          persist-credentials: false
+      - name: Check out matching Phoenix source headers
+        uses: actions/checkout@v4
+        with:
+          repository: RazvanManolache/dlss5-phoenix-addon
+          ref: dfc0fc03b05ec3615b018f11f7bc7e8eee744ef7
+          path: external/phoenix
+          persist-credentials: false
+      - name: Configure Windows x64 compile without private runtime inputs
+        run: >-
+          cmake -S . -B build/ci -G "Visual Studio 17 2022" -A x64
+          -DPHOENIX_SOURCE=external/phoenix -DBUILD_TESTING=OFF
+          -DPHOENIX_MEDIA_HELPERS=OFF -DDLSS_VIDEO_PLAYER_HARDWARE_TESTS=OFF
+      - name: Compile player and command-line tools
+        run: cmake --build build/ci --config Release --target DLSSVideoPlayer PhoenixMediaCli dlss5-convert --parallel 4
+      - name: Stage compiled binaries
+        run: |
+          New-Item -ItemType Directory -Force build/ci-artifact/neural-runtime | Out-Null
+          Copy-Item -LiteralPath build/ci/Release/PhoenixVideoPlayer.exe, build/ci/Release/phoenix-media.exe, build/ci/Release/dlss5-convert.exe -Destination build/ci-artifact
+          Copy-Item -LiteralPath build/ci/Release/neural-runtime/NeuralWorker.exe -Destination build/ci-artifact/neural-runtime
+          Copy-Item -LiteralPath LICENSE, THIRD_PARTY.md -Destination build/ci-artifact
+          @'
+          Phoenix Video Player - Windows x64 compile output
+
+          These executables prove the public source compiles on GitHub.
+          This is not the complete player distribution: media helpers, NVIDIA
+          feature DLLs, Phoenix runtime/kernels and models are not included.
+          See docs/BUILDING.md in the source repository for complete packaging.
+          GitHub hosted builds do not verify GPU enhancement or media playback.
+          '@ | Set-Content -LiteralPath build/ci-artifact/README.txt
+          git rev-parse HEAD | Set-Content -LiteralPath build/ci-artifact/SOURCE_COMMIT.txt
+          if ($LASTEXITCODE) { throw 'Cannot record the source commit.' }
+      - name: Upload compiled Windows binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhoenixVideoPlayer-windows-x64-compile-only
+          path: build/ci-artifact/
+          if-no-files-found: error
+          retention-days: 14

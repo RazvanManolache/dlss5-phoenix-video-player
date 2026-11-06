@@ -227,3 +227,11 @@ dependency notices and their historical scope are explained in
 ## Update notice
 
 A newer published version adds a clickable **Update available** entry to the menu. It opens this project’s GitHub releases. Background checks include numbered beta releases and respect the existing update-check setting and daily cache. Offline checks do not interrupt playback or install anything.
+
+## Build on GitHub
+
+Open [Actions](https://github.com/RazvanManolache/dlss5-phoenix-video-player/actions), select **Windows compile and source contracts**, then choose **Run workflow** and a branch. When the run succeeds, download its files from **Artifacts** at the bottom of the run page (GitHub sign-in required).
+
+PhoenixVideoPlayer-windows-x64-compile-only contains the compiled player and command-line executables. It is not a complete player package: media helpers, NVIDIA feature DLLs, Phoenix runtime/kernels and models must be supplied separately. See [the build guide](docs/BUILDING.md). Hosted compilation does not verify GPU enhancement or playback.
+
+Build downloads are retained for 14 days. They are development snapshots, separate from tagged releases; running this workflow does not publish a release.
