@@ -76,8 +76,8 @@ jobs:
       - name: Stage compiled binaries
         run: |
           New-Item -ItemType Directory -Force build/ci-artifact/neural-runtime | Out-Null
-          Copy-Item -LiteralPath build/ci/Release/PhoenixVideoPlayer.exe, build/ci/Release/phoenix-media.exe, build/ci/Release/dlss5-convert.exe -Destination build/ci-artifact
-          Copy-Item -LiteralPath build/ci/Release/neural-runtime/NeuralWorker.exe -Destination build/ci-artifact/neural-runtime
+          Copy-Item -LiteralPath build/ci/Release/PhoenixVideoPlayer.exe, build/ci/Release/phoenix-media.exe, build/ci/Release/phoenix-convert.exe -Destination build/ci-artifact
+          Copy-Item -LiteralPath build/ci/Release/neural-runtime/PhoenixMediaWorker.exe -Destination build/ci-artifact/neural-runtime
           Copy-Item -LiteralPath LICENSE, THIRD_PARTY.md -Destination build/ci-artifact
           @'
           Phoenix Video Player - Windows x64 compile output
